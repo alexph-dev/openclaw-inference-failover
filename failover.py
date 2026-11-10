@@ -496,6 +496,8 @@ def selfcheck():
         for k in (JOB_REQUIRED + (JOB_REQUIRED_RUN if has('last_at') else ())) if jobs else ():
             if not has(k):
                 miss.append('cli: openclaw %s: field %s' % (' '.join(CLI_JOBS), JOB_F[k]))
+        if any(dig(j, JOB_F['last'].split('.')) == 'error' for j in jobs) and not has('error'):
+            miss.append('cli: openclaw %s: field %s' % (' '.join(CLI_JOBS), JOB_F['error']))   # a failed job shows why
         refs = [r for r in (dig(j, JOB_F['model'].split('.')) for j in jobs) if isinstance(r, str)]
         if refs and not any('@' in r for r in refs):
             miss.append('cli: openclaw %s: %s carries no @account' % (' '.join(CLI_JOBS), JOB_F['model']))
