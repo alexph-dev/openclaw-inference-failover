@@ -1,5 +1,9 @@
 # openclaw-inference-failover
 
+```
+I hated that openclaw broke it on 2026.10.10 completely, so i had to workaround it myself
+```
+
 A single Python 3 script (standard library only) that keeps an OpenClaw install working when an AI account hits its
 provider usage limit. An OpenClaw command job runs it once a minute.
 
