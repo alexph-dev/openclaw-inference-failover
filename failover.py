@@ -77,6 +77,8 @@ E_PROFILE, E_PROFILE_SRC, E_USER = 'authProfileOverride', 'authProfileOverrideSo
 # Config file
 CFG_MODEL = ('agents', 'defaults', 'model')                         # {primary, fallbacks}
 CFG_ORDER = ('auth', 'order')                                       # account order per provider
+CFG_PROFILES = ('auth', 'profiles')                                 # optional: declared accounts, each with a 'mode'
+PROFILE_MODE, PAID_MODES = 'mode', ('api_key',)                     # modes billed per token, not by subscription
 CFG_LOG_FILE = ('logging', 'file')                                  # optional: Gateway log file
 CFG_AGENTS = ('agents', 'list')                                     # optional: agent definitions with 'default'
 # Gateway log (JSON lines; '1' and '2' are the logger's argument slots)
@@ -381,7 +383,8 @@ def cfg():
     m = dig(c, CFG_MODEL) or {}
     if not m.get('primary'):
         raise Shape('config %s: no %s.primary' % (CONFIG, '.'.join(CFG_MODEL)))
-    return {'primary': m['primary'], 'chain': m.get('fallbacks') or [], 'order': dig(c, CFG_ORDER) or {}}
+    paid = sorted(p for p, v in (dig(c, CFG_PROFILES) or {}).items() if isinstance(v, dict) and v.get(PROFILE_MODE) in PAID_MODES)
+    return {'primary': m['primary'], 'chain': m.get('fallbacks') or [], 'order': dig(c, CFG_ORDER) or {}, 'paid': paid}
 
 
 class Health:
@@ -425,12 +428,16 @@ class Health:
         return self.held(profile, model) or self.status(profile) in LIMITED
 
     def target(self, model, avoid=(), chain=True):
-        """First live model@account: the same model on another account, then the config fallback chain."""
+        """First live model@account: the same model on another account, then the config fallback chain. An account
+        billed per token (auth.profiles mode api_key) is a target only when auth.order lists it: work is never moved
+        onto a paid key just because the key answers."""
         for m in dict.fromkeys([model] + (list(self.conf['chain']) if chain else [])):
             prov = m.split('/')[0]
             res = self.probe(prov)
             order = [p for p in self.conf['order'].get(prov, []) if p in res] + [p for p in res if p not in self.conf['order'].get(prov, [])]
             for p in order:
+                if p in self.conf.get('paid', ()) and p not in self.conf['order'].get(prov, []):
+                    continue
                 if p not in avoid and self.alive(p, m):
                     return m + '@' + p
         return None

@@ -85,6 +85,9 @@ Requirements and limits:
   Linux with a user systemd session. Without it the chat is still moved, and the failed start is reported.
 - `openclaw cron list` returns one page of 200 jobs and has no paging option. With more jobs the script reports it
   and watches only the first page.
+- Pay-per-token accounts: an account declared in `auth.profiles` with mode `api_key` is used as a target only when
+  `auth.order` lists it for its provider. Otherwise the script skips it and goes on to the fallback models. An
+  account that is not declared in `auth.profiles` is treated as a subscription account.
 - Agent-to-agent (`a2a`) sessions are never continued.
 - Times in the journal and in `--status` are the host's local time; set `TZ` on the job (`--command-env`) if needed.
 

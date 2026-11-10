@@ -603,6 +603,18 @@ def test_edit_that_reported_a_failure_but_landed_is_adopted_as_parked():
     assert home['a']['model'] == OPUS and home['a']['parked'] == 'xai/grok-4.7@xai:x', home
 
 
+def test_pay_per_token_account_is_a_target_only_when_listed_in_auth_order():
+    probe = {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'rate_limit'}, 'xai': {'xai:x': 'ok'}}
+    profiles = {PB: {'provider': 'anthropic', 'mode': 'api_key'}, PA: {'provider': 'anthropic', 'mode': 'token'}}
+    for order, want in (({}, 'xai/grok-4.7@xai:x'), ({'anthropic': [PB]}, OPUS + '@' + PB)):
+        d = setup(JOBS, [], probe)
+        c = json.loads((d / 'cfg.json').read_text())
+        c['auth'] = {'order': order, 'profiles': profiles}
+        (d / 'cfg.json').write_text(json.dumps(c))
+        rc, err, j = go(d)
+        assert {r['to'] for r in kinds(j, 'job_move')} == {want}, (order, j)
+
+
 def test_agent_to_agent_sessions_are_not_chats():
     assert F.CHAT_RE.match('agent:main:telegram:direct:1') and F.CHAT_RE.match('agent:x:slack:channel:c1')
     assert not F.CHAT_RE.match('agent:main:a2a:direct:peer') and not F.CHAT_RE.match('agent:main:cron:j:run:s')
