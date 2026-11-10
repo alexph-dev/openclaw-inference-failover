@@ -615,6 +615,23 @@ def test_pay_per_token_account_is_a_target_only_when_listed_in_auth_order():
         assert {r['to'] for r in kinds(j, 'job_move')} == {want}, (order, j)
 
 
+def test_landed_edit_of_a_job_already_on_a_fallback_keeps_its_way_home():
+    SOL = 'openai/gpt-6.1-sol'
+    d = setup({'a': (SOL, 'openai:default', 'trusted')}, [], {'anthropic': DEAD, 'openai': {'openai:default': 'rate_limit', 'openai:b': 'ok'}})
+    (d / 'st').mkdir()
+    (d / 'st' / 'state.json').write_text(json.dumps({'started': 0, 'probed_at': 0, 'home': {
+        'a': {'model': OPUS, 'parked': SOL + '@openai:default', 'at': 0, 'wait': 0}}}))
+    fake(d, edit_result='rc=1 gateway timeout')                        # reported as failed, applied all the same
+    rc, err, j = go(d)
+    assert rc == 1 and 'rebind of job' in err and binding(d, 'a') == SOL + '@openai:b', (err, binding(d, 'a'))
+    fake(d, edit_result='ok')
+    rc, err, j = go(d)
+    s = json.loads((d / 'st' / 'state.json').read_text())
+    assert s['home']['a']['model'] == OPUS and s['home']['a']['parked'] == SOL + '@openai:b', s['home']
+    assert rc == 0 and not err and not s.get('unsure') and 'rebind:a' not in s['problems'], (rc, err, s)
+    assert len([r for r in kinds(j, 'job_move') if r['result'] == 'ok']) == 1, j
+
+
 def test_agent_to_agent_sessions_are_not_chats():
     assert F.CHAT_RE.match('agent:main:telegram:direct:1') and F.CHAT_RE.match('agent:x:slack:channel:c1')
     assert not F.CHAT_RE.match('agent:main:a2a:direct:peer') and not F.CHAT_RE.match('agent:main:cron:j:run:s')

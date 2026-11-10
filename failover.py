@@ -709,8 +709,12 @@ def jobs_pass(conf, jobs, health, state, t0, out):
         if jid in jobs and jobs[jid]['model'] == u['tgt']:
             journal('job_move', job=jid, name=jobs[jid]['name'][:60], frm=u['frm'], to=u['tgt'], result='ok',
                     note='the edit reported a failure but was applied')
-            if MODEL(u['tgt']) != u['own'] and jid not in home:
-                park(state, 'home', jid, u['own'], u['tgt'])
+            if MODEL(u['tgt']) != u['own']:
+                park(state, 'home', jid, u['own'], u['tgt'])   # also when it was parked elsewhere before: new place
+            else:
+                home.pop(jid, None)
+            out['moved'].append((jid[:8], u['tgt']))            # counts as done: the pass state is not rolled back
+            state.get('problems', {}).pop('rebind:' + jid, None)   # the failure reported last pass did not happen
     todo = []
     for jid, j in jobs.items():
         if not (j['enabled'] and j['profile']):
@@ -1191,9 +1195,8 @@ def main():
     try:
         ok = surface_ok(state, out, cfg_err)
     except Deadline:
-        ok = False
-        prob(out, 'slow', 'self-check cut off after %d s because OpenClaw answers slowly; nothing was changed'
-             % PASS_HARD_S)
+        ok = False             # a slow Gateway right after an update: a problem only once it lasts DOWN_MS
+        down(state, out, 'self-check cut off after %d s' % PASS_HARD_S)
     if not ok or conf is None:
         signal.alarm(0)
         return finish(state, out, {'providers': set()}, {}, Health(conf or {}, {}))
@@ -1251,6 +1254,7 @@ def surface_ok(state, out, shape_error=None):
         if not shape_error and sc.get('version') == ver and not sc.get('missing'):
             return True
         missing = selfcheck() or ([shape_error] if shape_error else [])
+        state.pop('down_since', None)      # the self-check got its answers, so OpenClaw is up
     except Unreachable as e:
         down(state, out, e)
         return False
