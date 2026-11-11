@@ -428,17 +428,20 @@ class Health:
         return self.held(profile, model) or self.status(profile) in LIMITED
 
     def target(self, model, avoid=(), chain=True):
-        """First live model@account: the same model on another account, then the config fallback chain. An account
-        billed per token (auth.profiles mode api_key) is a target only when auth.order lists it: work is never moved
-        onto a paid key just because the key answers."""
+        """First live model@account: the same model on another account, then the config fallback chain. avoid is the
+        account this model just failed on, and it is skipped for this model only: a later model may use that account,
+        because a limit on one model is not a limit on the next. An account billed per token (auth.profiles mode
+        api_key) is a target only when auth.order lists it: work is never moved onto a paid key just because the key
+        answers."""
         for m in dict.fromkeys([model] + (list(self.conf['chain']) if chain else [])):
+            blocked = avoid if m == model else ()
             prov = m.split('/')[0]
             res = self.probe(prov)
             order = [p for p in self.conf['order'].get(prov, []) if p in res] + [p for p in res if p not in self.conf['order'].get(prov, [])]
             for p in order:
                 if p in self.conf.get('paid', ()) and p not in self.conf['order'].get(prov, []):
                     continue
-                if p not in avoid and self.alive(p, m):
+                if p not in blocked and self.alive(p, m):
                     return m + '@' + p
         return None
 

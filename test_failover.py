@@ -224,6 +224,18 @@ def test_stalled_pinned_chat_moves_aborts_and_continues():
     assert len(kinds(go(d)[2], 'chat_recover')) == 1                  # handled once
 
 
+def test_model_limit_does_not_block_the_same_account_for_the_next_model():
+    # The account the stalled model ran on still answers. Other accounts of that model are out, and the first
+    # fallback model is served by the same account. It must be used. Skipping the account for every later model
+    # lands on Sol even though Opus on that account is fine.
+    d = setup(log=[req(K, 'R4'), stall(FABLE, 'R4')],
+              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'},
+                     'xai': {'xai:x': 'unknown'}, 'openai': {'openai:default': 'ok'}},
+              sessions={K: {'key': K, 'hasActiveRun': True, 'lastRunId': 'R4'}}, entries={K: PIN})
+    r, = kinds(go(d)[2], 'chat_recover')
+    assert r['to'] == OPUS + '@' + PB, r
+
+
 def test_failed_chat_all_accounts_dead_goes_down_the_chain():
     ses = {K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'R2', 'status': 'failed'}}
     d = setup(log=[req(K, 'R2'), end('R2')], probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}}, sessions=ses, entries={K: PIN})
