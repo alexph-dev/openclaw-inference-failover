@@ -105,7 +105,7 @@ def setup(jobs=None, receipts=(), probe=None, sessions=None, entries=None, log=(
     (d / 'logs').mkdir()
     (d / 'logs' / 'openclaw-2026-01-01.log').write_text(''.join(json.dumps(x) + '\n' for x in log))
     (d / 'cfg.json').write_text(json.dumps({'agents': {'defaults': {'model': {'primary': OPUS, 'fallbacks': [
-        'xai/grok-4.7', OPUS, 'openai/gpt-6.1-sol']}}}, 'auth': {'order': {'anthropic': [PB, PA, PC], 'openai': ['openai:default']}}}))
+        'xai/grok-4.7', OPUS, 'openai/gpt-6.1-sol']}}}, 'auth': {'order': {'anthropic': [PB, PA, PC], 'openai': ['openai:default', OA, 'openai:b'], 'xai': ['xai:x']}}}))
     fake(d, probe=probe or {}, sessions=sessions or {}, entries=entries or {})
     receipt(d, receipts)
     return d
@@ -265,9 +265,12 @@ def test_model_limit_does_not_block_the_same_account_for_the_next_model():
 def test_failed_chat_all_accounts_dead_goes_down_the_chain():
     ses = {K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'R2', 'status': 'failed'}}
     d = setup(log=[req(K, 'R2'), end('R2')], probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}}, sessions=ses, entries={K: PIN})
-    r, = kinds(go(d)[2], 'chat_recover')
+    j = go(d)[2]
+    r, = kinds(j, 'chat_recover')
     assert (r['why'], r['to'], r['abort'], r['continue']) == ('failed', 'xai/grok-4.7@xai:x', 'not needed', 'started'), r
     assert 'note' not in r                                            # the script itself sends nothing to a chat
+    m, = kinds(j, 'chat_move')                                        # moved once, by the pass or by the event
+    assert m['to'] == 'xai/grok-4.7@xai:x', m
 
 
 def test_unpinned_stalled_chat_applies_healthy_target_before_continuation():
@@ -278,11 +281,15 @@ def test_unpinned_stalled_chat_applies_healthy_target_before_continuation():
 
 
 def test_user_already_wrote_again():
+    # The newer message wins over the continuation, but the pinned chat still leaves the dead account, so that
+    # message does not fail on it too.
     ses = {K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'R4', 'status': 'failed'}}
     d = setup(log=[req(K, 'R4'), end('R4')], probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}}, sessions=ses, entries={K: PIN})
     fake(d, queued={K: True})
-    r, = kinds(go(d)[2], 'chat_recover')
-    assert r['continue'] == 'user already wrote'
+    j = go(d)[2]
+    drop, = kinds(j, 'event_drop')
+    assert (drop['run'], drop['why']) == ('R4', 'the user already wrote') and not kinds(j, 'chat_recover'), j
+    assert [m['to'] for m in kinds(j, 'chat_move')] == ['xai/grok-4.7@xai:x'], j
 
 
 def test_stalled_cron_run_is_aborted_not_continued():
@@ -298,16 +305,20 @@ def test_stalled_cron_run_is_aborted_not_continued():
     a, = kinds(j, 'cron_stall_abort')
     assert a['run'] == '26cafcf4' and a['result'] == 'ok' and not kinds(j, 'chat_recover'), j
     assert binding(d, '00000000-0000-4000-8000-00000000000a') == OPUS + '@' + PB
+    held = json.loads((d / 'st' / 'state.json').read_text())['limited']
+    assert held[OPUS + '@' + PA] > ms() + 40 * 3600_000, held        # until the time the provider named: no cap
 
 
 def test_chat_cases_left_alone():
     d = setup(log=[req(K, 'R5'), end('R5')], probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}},
               sessions={K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'R9', 'status': 'done'}}, entries={K: PIN})
-    assert not kinds(go(d)[2], 'chat_recover')                        # a newer turn already ran
+    j = go(d)[2]
+    assert not kinds(j, 'chat_recover') and kinds(j, 'event_drop')[0]['why'] == 'a newer run took over', j
     later = line({'runId': 'R6', 'milestone': 'tool_execution_started'}, 'agent turn milestone', ago=10)
     d = setup(log=[req(K, 'R6'), end('R6'), later], probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}},
               sessions={K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'R6', 'status': 'failed'}}, entries={K: PIN})
-    assert not kinds(go(d)[2], 'chat_recover')                        # rotated past the limit, failed for another reason
+    j = go(d)[2]
+    assert not kinds(j, 'chat_recover') and 'last word' in kinds(j, 'event_drop')[0]['why'], j   # went on after the limit
     d = setup(log=[req(K, 'R7', 3600), end('R7', 3600)], probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}},
               sessions={K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'R7', 'status': 'failed'}}, entries={K: PIN})
     rc, err, j = go(d)
@@ -359,14 +370,22 @@ def test_job_parked_on_a_fallback_model_returns_to_its_own_model():
     assert not json.loads((d / 'st' / 'state.json').read_text())['home']
 
 
-def test_lost_run_of_an_infrequent_job_is_rerun_once_after_the_move():
-    # Daily jobs that failed on the route error would otherwise wait a day for their next run.
-    d = setup(JOBS, [('a', 'error', ERR, 120), ('b', 'error', ERR, 60)], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}},
-              sched={'a': ('cron', 20 * 3600), 'b': ('every', 600)})
-    go(d)
-    j = go(d)[2]
-    assert [r['job'] for r in kinds(j, 'job_rerun')] == ['a'], kinds(j, 'job_rerun')    # b runs again in 10 min anyway
-    assert len(kinds(go(d)[2], 'job_rerun')) == 1
+def test_job_that_lost_a_run_to_a_limit_is_moved_and_never_rerun():
+    # Daily or frequent, overdue, lost long ago, or after it had started: the job is rebound and its next scheduled
+    # run uses the new binding. The watchdog never runs a job itself and reports nothing for the lost run.
+    mid = line({'provider': 'anthropic', 'model': 'claude-opus-5-5', 'status': 429},
+               'Model request failed sessionKey="agent:main:cron:a:run:s1" runId="RA" requestId="x" requestNumber=5', ago=100)
+    for receipts, sched in (([('a', 'error', ERR, 120), ('b', 'error', ERR, 60)], {'a': ('cron', 20 * 3600), 'b': ('every', 600)}),
+                            ([('a', 'error', ERR, 50 * 60)], {'a': ('cron', 20 * 3600)}),
+                            ([('a', 'error', ERR, 120)], {'a': ('cron', -120)}),
+                            ([('a', 'error', "429 rate_limit_error: This request would exceed your account's rate limit", 120)],
+                             {'a': ('cron', 20 * 3600)})):
+        d = setup(JOBS, receipts, {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}}, sched=sched, log=[mid])
+        rc1, err1, _ = go(d)
+        rc2, err2, j = go(d, True)
+        assert binding(d, 'a') == OPUS + '@' + PB and not kinds(j, 'job_rerun'), j
+        assert rc1 == rc2 == 0 and not err1 + err2, (err1, err2)
+        assert not [c for c in calls(d) if c.split()[:2] == ['cron', 'run']], calls(d)   # no job is run
 
 
 STALL_JOB = '00000000-0000-4000-8000-00000000000a'
@@ -385,17 +404,23 @@ def test_stall_while_the_probe_still_says_ok_moves_the_job():
               sessions={STALL_KEY: {'key': STALL_KEY, 'hasActiveRun': True}}, sched={STALL_JOB: ('cron', 20 * 3600)})
     rc, err, j = go(d)
     assert binding(d, STALL_JOB) == OPUS + '@' + PB and len(kinds(j, 'cron_stall_abort')) == 1, j
-    assert len(kinds(go(d)[2], 'job_rerun')) == 1                     # stalled on its first request: safe to run again
-    go(d, True)
-    assert binding(d, STALL_JOB) == OPUS + '@' + PB                 # the account stays held for this model: no bounce back
+    held = json.loads((d / 'st' / 'state.json').read_text())['limited']
+    assert list(held) == [OPUS + '@' + PA] and held[OPUS + '@' + PA] > ms() + 40 * 3600_000, held   # this model only
+    j = go(d, True)[2]
+    assert binding(d, STALL_JOB) == OPUS + '@' + PB and not kinds(j, 'job_rerun')   # held: no bounce back, no rerun
 
 
-def test_stall_in_the_middle_of_a_run_is_aborted_and_reported_not_rerun():
-    d = setup({STALL_JOB: (OPUS, PA, 'trusted')}, log=stall_log(7), probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'ok'}},
-              sessions={STALL_KEY: {'key': STALL_KEY, 'hasActiveRun': True}}, sched={STALL_JOB: ('cron', 20 * 3600)})
-    rc, err, j = go(d)
-    assert rc == 1 and 'may have acted already' in err and len(kinds(j, 'cron_stall_abort')) == 1
-    assert not kinds(go(d)[2], 'job_rerun')
+def test_stalled_cron_run_is_aborted_and_never_rerun():
+    # Wherever the run stalled, it is aborted so it does not sleep for hours; the job only gets its new binding, and
+    # the next scheduled run uses it. Nothing replays the aborted run, and nothing is reported for it.
+    for n in (1, 7):
+        d = setup({STALL_JOB: (OPUS, PA, 'trusted')}, log=stall_log(n), probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'ok'}},
+                  sessions={STALL_KEY: {'key': STALL_KEY, 'hasActiveRun': True}}, sched={STALL_JOB: ('cron', 20 * 3600)})
+        rc1, err1, _ = go(d)
+        rc2, err2, j = go(d, True)
+        assert rc1 == rc2 == 0 and len(kinds(j, 'cron_stall_abort')) == 1, (err1, err2, j)
+        assert binding(d, STALL_JOB) == OPUS + '@' + PB and not kinds(j, 'job_rerun')
+        assert not [c for c in calls(d) if c.split()[:2] == ['cron', 'run']], calls(d)   # no job is run
 
 
 def test_stalled_one_shot_job_is_moved_but_never_aborted():
@@ -473,24 +498,9 @@ def test_cron_run_that_failed_on_a_limit_is_never_continued_like_a_chat():
                                     'deliveryContext': {'to': 'telegram:-1001'}}})
     rc, err, j = go(d)
     assert not kinds(j, 'chat_recover') and 'R9' not in json.loads((d / 'st' / 'state.json').read_text())['pending']
-
-
-def test_lost_run_that_got_past_its_first_request_is_reported_not_rerun():
-    mid = line({'provider': 'anthropic', 'model': 'claude-opus-5-5', 'status': 429},
-               'Model request failed sessionKey="agent:main:cron:a:run:s1" runId="RA" requestId="x" requestNumber=5', ago=100)
-    d = setup(JOBS, [('a', 'error', ERR, 120)], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}},
-              sched={'a': ('cron', 20 * 3600), 'b': ('cron', 20 * 3600)}, log=[mid])
-    go(d)
-    rc, err, j = go(d)
-    assert not kinds(j, 'job_rerun') and rc == 1 and 'may have acted already' in err, (err, j)
-
-
-def test_lost_run_moved_late_is_reported_not_rerun():
-    d = setup(JOBS, [('a', 'error', ERR, 50 * 60)], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}},
-              sched={'a': ('cron', 20 * 3600), 'b': ('cron', 20 * 3600)})
-    go(d)
-    rc, err, j = go(d)
-    assert not kinds(j, 'job_rerun') and rc == 1 and 'not rerun automatically' in err, (err, j)
+    drop, = kinds(j, 'event_drop')
+    assert drop['run'] == 'R9' and 'not rerun' in drop['why'], drop       # the reason is journaled
+    assert binding(d, STALL_JOB) == 'xai/grok-4.7@xai:x'
 
 
 def test_limit_wave_never_fails_three_passes_in_a_row():
@@ -532,13 +542,6 @@ def test_second_park_within_a_day_waits_before_going_home():
     assert binding(d, 'b') == OPUS + '@' + PA and binding(d, 'a') == 'xai/grok-4.7@xai:x'
 
 
-def test_overdue_job_is_left_to_the_scheduler():
-    d = setup(JOBS, [('a', 'error', ERR, 120)], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}},
-              sched={'a': ('cron', -120), 'b': ('cron', 20 * 3600)})
-    go(d)
-    assert not kinds(go(d)[2], 'job_rerun')
-
-
 def test_slow_gateway_pass_is_cut_off_and_saved_before_the_job_timeout():
     d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
     fake(d, slow_probe=5)
@@ -558,15 +561,6 @@ def test_prompt_edit_of_a_parked_job_does_not_cancel_the_return():
     fake(d, probe={'anthropic': {PB: 'rate_limit', PA: 'ok', PC: 'rate_limit'}, 'xai': {'xai:x': 'ok'}})
     go(d, True)
     assert binding(d, 'a') == OPUS + '@' + PA and binding(d, 'b') == OPUS + '@' + PA
-
-
-def test_run_that_died_on_a_rate_limit_after_starting_is_reported_not_rerun():
-    # Only the route error is raised before a run does anything; a 429 can come after it already posted.
-    d = setup(JOBS, [('a', 'error', "429 rate_limit_error: This request would exceed your account's rate limit", 120)],
-              {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}}, sched={'a': ('cron', 20 * 3600), 'b': ('cron', 20 * 3600)})
-    rc1, err1, _ = go(d)
-    rc2, err2, j = go(d)
-    assert not kinds(j, 'job_rerun') and 'after it had started' in err1 + err2, (err1, err2)
 
 
 def test_a_change_that_cannot_finish_before_the_deadline_is_not_started():
@@ -641,16 +635,21 @@ def test_edit_that_reported_a_failure_but_landed_is_adopted_as_parked():
     assert home['a']['model'] == OPUS and home['a']['parked'] == 'xai/grok-4.7@xai:x', home
 
 
-def test_pay_per_token_account_is_a_target_only_when_listed_in_auth_order():
+def test_only_accounts_listed_in_auth_order_are_targets():
+    # An account the probe reports but auth.order does not list is never chosen, however it is billed; a provider
+    # without an auth.order entry yields no target at all, not a guessed account.
     probe = {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'rate_limit'}, 'xai': {'xai:x': 'ok'}}
-    profiles = {PB: {'provider': 'anthropic', 'mode': 'api_key'}, PA: {'provider': 'anthropic', 'mode': 'token'}}
-    for order, want in (({}, 'xai/grok-4.7@xai:x'), ({'anthropic': [PB]}, OPUS + '@' + PB)):
+    for order, want in (({'anthropic': [PA], 'xai': ['xai:x']}, {'xai/grok-4.7@xai:x'}),
+                        ({'anthropic': [PA, PB], 'xai': ['xai:x']}, {OPUS + '@' + PB}),
+                        ({'anthropic': [PA]}, set())):
         d = setup(JOBS, [], probe)
         c = json.loads((d / 'cfg.json').read_text())
-        c['auth'] = {'order': order, 'profiles': profiles}
+        c['auth'] = {'order': order, 'profiles': {PB: {'provider': 'anthropic', 'mode': 'token'}}}
         (d / 'cfg.json').write_text(json.dumps(c))
         rc, err, j = go(d)
-        assert {r['to'] for r in kinds(j, 'job_move')} == {want}, (order, j)
+        assert {r['to'] for r in kinds(j, 'job_move')} == want, (order, j)
+        if not want:
+            assert rc == 1 and 'no live account' in err, err
 
 
 def test_landed_edit_of_a_job_already_on_a_fallback_keeps_its_way_home():
@@ -678,10 +677,6 @@ def test_agent_to_agent_sessions_are_not_chats():
 WEB = 'agent:main:dashboard:00000000-0000-4000-8000-000000000001'
 
 
-def timeout_line(run='timeout-run', session_id='session-1', ago=40):
-    return line('embedded run timeout: runId=%s sessionId=%s timeoutMs=899999' % (run, session_id), ago=ago)
-
-
 def test_main_and_webchat_stalls_continue_locally_without_a_delivery_route():
     for key in ('agent:main:main', WEB):
         d = setup(log=[req(key, 'human-run'), stall(FABLE, 'human-run')],
@@ -692,50 +687,20 @@ def test_main_and_webchat_stalls_continue_locally_without_a_delivery_route():
         assert len(kinds(go(d)[2], 'chat_recover')) == 1
 
 
-def test_timeout_without_provider_error_resolves_session_and_preserves_healthy_route():
+def test_runtime_timeout_is_neither_continued_nor_held():
+    # A turn that merely timed out was not stopped by a limit: no continuation, no hold, no move.
     e = dict(PIN, sessionId='session-1', lastRunId='timeout-run', status='timeout')
-    d = setup(log=[timeout_line()], probe={'anthropic': {PA: 'ok', PB: 'ok'}},
-              sessions={WEB: {'hasActiveRun': False}}, entries={WEB: e})
-    r, = kinds(go(d)[2], 'chat_recover')
-    assert (r['why'], r['to'], r['abort'], r['continue']) == ('timeout', FABLE + '@' + PB, 'not needed', 'started'), r
+    d = setup(log=[line('embedded run timeout: runId=timeout-run sessionId=session-1 timeoutMs=899999')],
+              probe={'anthropic': {PA: 'ok', PB: 'ok'}}, sessions={WEB: {'hasActiveRun': False}}, entries={WEB: e})
+    (d / 'st').mkdir()                                                # a timeout event an older version left pending
+    (d / 'st' / 'state.json').write_text(json.dumps({'started': 0, 'pending': {'timeout-run': {
+        'kind': 'timeout', 't': ms() - 40_000, 'until': ms() + 3600_000, 'session': 'session-1'}}}))
+    j = go(d, True)[2]
     state = json.loads((d / 'st' / 'state.json').read_text())
-    assert not state['limited'], state
-    assert len(kinds(go(d)[2], 'chat_recover')) == 1
-
-
-def test_timeout_terminal_receipt_must_match_and_no_new_input_or_later_progress():
-    for changes, queued, extra in [({'status': 'aborted'}, False, []),
-                                   ({'status': 'done'}, False, []),
-                                   ({'lastRunId': 'newer-run'}, False, []),
-                                   ({'lastInteractionAt': ms()}, False, []),
-                                   ({}, True, []),
-                                   ({}, False, [line({'runId': 'timeout-run', 'milestone': 'tool_execution_started'}, ago=5)]),
-                                   ({}, False, [line('embedded run aborted runId=timeout-run', ago=5)])]:
-        e = dict(PIN, sessionId='session-1', lastRunId='timeout-run', status='timeout', **{})
-        e.update(changes)
-        d = setup(log=[timeout_line()] + extra, probe={'anthropic': {PB: 'ok'}},
-                  sessions={WEB: {'hasActiveRun': False}}, entries={WEB: e})
-        fake(d, queued={WEB: queued})
-        assert not [r for r in kinds(go(d)[2], 'chat_recover') if r.get('patch')], (changes, queued, extra)
-        assert not json.loads((d / 'st' / 'state.json').read_text())['limited']
-
-
-
-def test_normal_timeout_cleanup_is_not_an_intentional_abort():
-    for extra, recover in [('embedded run abort still streaming: runId=timeout-run', True),
-                           ('chat.abort requested runId=timeout-run', False)]:
-        d = setup(log=[timeout_line(), line(extra, ago=5)], probe={'anthropic': {PB: 'ok'}},
-                  sessions={WEB: {'hasActiveRun': False}},
-                  entries={WEB: dict(PIN, sessionId='session-1', lastRunId='timeout-run', status='timeout')})
-        assert bool([r for r in kinds(go(d)[2], 'chat_recover') if r.get('patch')]) == recover
-
-
-def test_tool_timeout_is_not_a_runtime_timeout_and_old_runtime_timeout_is_not_replayed():
-    for event in [line('exec tool timeout after 30s runId=timeout-run'), timeout_line(ago=3600)]:
-        d = setup(log=[event], probe={'anthropic': {PB: 'ok'}},
-                  sessions={WEB: {'hasActiveRun': False}},
-                  entries={WEB: dict(PIN, sessionId='session-1', lastRunId='timeout-run', status='timeout')})
-        assert not kinds(go(d)[2], 'chat_recover')
+    assert not kinds(j, 'chat_recover') and not kinds(j, 'chat_move'), j
+    assert not state['pending'] and not state['limited'] and not state.get('continued'), state
+    drop, = kinds(j, 'event_drop')                                    # dropped, with the reason journaled
+    assert drop['run'] == 'timeout-run' and 'older version' in drop['why'], drop
 
 
 def test_worker_dashboard_and_internal_keys_are_not_human_chats():
@@ -755,30 +720,28 @@ def test_worker_dashboard_and_internal_keys_are_not_human_chats():
     assert F.human_chat(WEB, {'placement': None, 'spawnDepth': None})
 
 
-def test_timeout_session_resolver_reads_database_and_rejects_ambiguous_or_wrong_run():
+def test_session_id_resolver_reads_the_database_and_never_guesses():
     d = setup()
     db = d / 'oc/agents/main/agent/openclaw-agent.sqlite'
     c = sqlite3.connect(db)
-    e = {'sessionId': 'sid', 'lastRunId': 'run'}
-    c.execute('insert into session_nodes values(?,?)', (WEB, json.dumps(e)))
+    c.execute('insert into session_nodes values(?,?)', (WEB, json.dumps({'sessionId': 'sid', 'lastRunId': 'run'})))
     c.commit()
     with patch.object(F, 'FAKE', None), patch.dict(os.environ, OCF_AGENT_DB='file:%s?mode=ro' % db):
-        assert F.key_for_session('sid', 'run') == WEB
-        assert F.key_for_session('sid', 'old') is None
-        c.execute('insert into session_nodes values(?,?)', ('agent:main:main', json.dumps(e)))
+        assert F.key_for_session('sid') == WEB and F.key_for_session('other') is None
+        c.execute('insert into session_nodes values(?,?)', ('agent:main:main', json.dumps({'sessionId': 'sid'})))
         c.commit()
-        assert F.key_for_session('sid', 'run') is None
+        assert F.key_for_session('sid') is None                        # two sessions claim it: no guess
     c.close()
 
 
-def recovery_fixture(kind='stall'):
+def recovery_fixture():
     run = 'original-run'
     e = dict(PIN, sessionId='sid', activeWriterRunId=run, lifecycleRevision='revision-before-abort')
-    s = {'hasActiveRun': kind == 'stall', 'lastRunId': run, 'status': 'timeout' if kind == 'timeout' else 'failed'}
-    p = {'kind': kind, 't': ms() - 40_000, 'until': ms() + 3600_000, 'model': FABLE}
+    s = {'hasActiveRun': True, 'lastRunId': run}
+    p = {'kind': 'stall', 't': ms() - 40_000, 'until': ms() + 3600_000, 'model': FABLE}
     state = {'handled': {}, 'pending': {run: p}}
-    health = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'paid': []})
-    out = {'problems': [], 'chats': [], 'no_target': []}
+    health = F.Health({'primary': OPUS, 'chain': [], 'order': {}})
+    out = {'problems': [], 'chats': [], 'continued': [], 'no_target': []}
     return run, e, s, p, state, health, out
 
 
@@ -818,34 +781,42 @@ def test_abort_is_exact_and_precedes_patch_and_partial_failure_stays_pending():
 
 
 @offline
-def test_abort_no_active_run_never_patches_or_continues():
+def test_abort_answer_without_our_run_changes_nothing_and_leaves_the_log_to_decide():
+    # sessions.abort answered that no such run was active: it ended meanwhile. Nothing is patched or continued now,
+    # and the event is not marked handled: the next pass reads the run's log.
     run, e, s, p, state, health, out = recovery_fixture()
     with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
             patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', return_value=s), \
             patch.object(F, 'log_lines', return_value=[]), patch.object(health, 'target', return_value=FABLE + '@' + PA), \
             patch.object(F, 'gw', return_value=({'status': 'no-active-run', 'abortedRunId': None}, '')) as mutate, \
             patch.object(F, 'continue_turn') as send:
-        assert F.recover_chat(state, health, WEB, s, run, p, out)
+        assert not F.recover_chat(state, health, WEB, s, run, p, out)
+        assert not F.recover_chat(state, health, WEB, s, run, p, out)   # the row still says active: wait, no second abort
         assert mutate.call_count == 1 and mutate.call_args.args[0] == F.RPC_ABORT
         send.assert_not_called()
+        assert not p.get('aborted') and run not in state['handled']
 
 
 @offline
-def test_abort_accepted_before_status_is_stored_stays_pending():
-    # The abort RPC succeeded, but the session row is not 'killed' yet. Marking it handled here drops the move.
-    run, e, s, p, state, health, out = recovery_fixture()
-    unsettled = {'hasActiveRun': False, 'lastRunId': run, 'status': 'running'}
-    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
-            patch.object(F, 'entry', return_value=(e, False)), \
-            patch.object(F, 'session', side_effect=[s, unsettled]), \
-            patch.object(F, 'log_lines', return_value=[]), patch.object(F, 'save'), \
-            patch.object(health, 'target', return_value=FABLE + '@' + PA), \
-            patch.object(F, 'gw', return_value=({'status': 'aborted', 'abortedRunId': run}, '')) as mutate, \
-            patch.object(F, 'continue_turn') as send:
-        assert not F.recover_chat(state, health, WEB, s, run, p, out)
-        assert [c.args[0] for c in mutate.call_args_list] == [F.RPC_ABORT]
-        send.assert_not_called()
-        assert p['aborted'] and run not in state['handled'] and run in state['pending']
+def test_abort_accepted_before_a_status_is_stored_still_moves_and_continues():
+    # Our abort stopped the run, but the session row shows no terminal status word yet ('running', or none at all).
+    # The status word decides nothing: the run is over and our abort ended it, so the chat is moved and continued.
+    for status in ('running', None):
+        run, e, s, p, state, health, out = recovery_fixture()
+        unsettled = {'hasActiveRun': False, 'lastRunId': run}
+        if status:
+            unsettled['status'] = status
+        with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+                patch.object(F, 'entry', return_value=(e, False)), \
+                patch.object(F, 'session', side_effect=[s, unsettled, unsettled]), \
+                patch.object(F, 'log_lines', return_value=[]), patch.object(F, 'save'), \
+                patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+                patch.object(F, 'gw', return_value=({'status': 'aborted', 'abortedRunId': run}, '')) as mutate, \
+                patch.object(F, 'continue_turn', return_value=('started', None)) as send:
+            assert F.recover_chat(state, health, WEB, s, run, p, out)
+            assert [c.args[0] for c in mutate.call_args_list] == [F.RPC_ABORT, F.RPC_PATCH]
+            send.assert_called_once()
+            assert p['aborted'] and run in state['handled'], status
 
 
 @offline
@@ -885,13 +856,15 @@ def test_abort_intent_recovers_lost_receipt_and_process_interruption_once():
 
 
 @offline
-def test_abort_receipt_without_our_exact_intent_or_with_newer_choice_is_untouched():
+def test_stopped_run_without_our_exact_intent_or_with_newer_choice_is_untouched():
+    # A run stopped from the Control UI is not a limit death, and an abort intent that is not exactly ours does not
+    # make it one. A newer model choice or user turn wins too.
+    stop = line('sessions.abort requested: actor=openclaw-control-ui session=%s runId=original-run' % WEB, ago=5)
     for change in ('manual', 'session', 'run', 'key', 'model', 'input'):
         run, e, s, p, state, health, out = recovery_fixture()
         state['run_key'] = {run: WEB}
         stopped = dict(s, hasActiveRun=False, status='aborted')
-        p.update(session='sid', selection=[e.get(f) for f in
-                 (F.E_MODEL, F.E_PROVIDER, F.E_MODEL_SRC, F.E_PROFILE, F.E_PROFILE_SRC)])
+        p.update(session='sid', ref=FABLE + '@' + PB)
         if change != 'manual':
             p['abort_intent'] = {'key': WEB, 'session': 'sid', 'run': run}
         if change in ('session', 'run', 'key'):
@@ -901,12 +874,29 @@ def test_abort_receipt_without_our_exact_intent_or_with_newer_choice_is_untouche
         if change == 'input':
             e['lastInteractionAt'] = ms()
         with patch.object(F, 'entry', return_value=(e, False)), \
-                patch.object(F, 'session', return_value=stopped), patch.object(F, 'log_lines', return_value=[]), \
+                patch.object(F, 'session', return_value=stopped), patch.object(F, 'log_lines', return_value=[stop]), \
                 patch.object(F, 'gw') as mutate, patch.object(F, 'continue_turn') as send:
             F.stalls_and_chats(state, health, {}, out)
             mutate.assert_not_called()
             send.assert_not_called()
-            assert run not in state['pending']
+            assert run not in state['pending'] and run not in state['handled'], change
+
+
+@offline
+def test_a_stopped_run_with_no_hand_stop_and_no_progress_is_a_limit_death():
+    # No abort intent of ours and no status word to go by: the limit was the run's last word, so it is continued.
+    run, e, s, p, state, health, out = recovery_fixture()
+    state['run_key'] = {run: WEB}
+    stopped = {'hasActiveRun': False, 'lastRunId': run}
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+            patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', return_value=stopped), \
+            patch.object(F, 'log_lines', return_value=[]), patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+            patch.object(F, 'gw', return_value=({'ok': True}, '')) as mutate, \
+            patch.object(F, 'continue_turn', return_value=('started', None)) as send:
+        F.stalls_and_chats(state, health, {}, out)
+        assert [c.args[0] for c in mutate.call_args_list] == [F.RPC_PATCH]
+        send.assert_called_once()
+        assert run in state['handled'] and run not in state['pending'] and health.held(PB, FABLE)
 
 
 def test_continuation_prompt_reconciles_side_effects_and_local_route_and_launch_identity():
@@ -915,15 +905,15 @@ def test_continuation_prompt_reconciles_side_effects_and_local_route_and_launch_
         calls.append(argv)
         return 0, '', ''
     with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), patch.object(F, 'run', side_effect=launch):
-        first = F.continue_turn(WEB, 'test-model', True, 'timeout', 'interrupted-run')
-        assert F.continue_turn(WEB, 'test-model', True, 'timeout', 'interrupted-run') == first
-        F.continue_turn(K, 'test-model', True, 'failed', 'another-run')
+        first = F.continue_turn(WEB, 'test-model', True, 'interrupted-run')
+        assert F.continue_turn(WEB, 'test-model', True, 'interrupted-run') == first
+        F.continue_turn(K, 'test-model', True, 'another-run')
     local, external = calls[0], calls[2]
     assert '--deliver' not in local and '--deliver' in external
     assert local[local.index('--session-key') + 1] == WEB
     assert not any(flag in local for flag in ('--reply-to', '--reply-channel', '--to'))
     prompt = local[local.index('--message') + 1]
-    assert 'interrupted-run' in prompt and 'runtime timeout' in prompt and 'usage limit' not in prompt
+    assert 'interrupted-run' in prompt and 'usage limit' in prompt and 'timeout' not in prompt
     assert 'reconcile completed tool actions and delivery receipts' in prompt
     assert 'Do not replay the entire request' in prompt and 'Verify uncertain side effects' in prompt
     assert 'RemainAfterExit=yes' in local and '--no-block' in local
@@ -932,7 +922,7 @@ def test_continuation_prompt_reconciles_side_effects_and_local_route_and_launch_
 def test_uncertain_continuation_launch_adopts_existing_deterministic_unit():
     with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
             patch.object(F, 'run', side_effect=[(1, '', 'transport lost'), (0, 'loaded\n', '')]):
-        result, unit = F.continue_turn(WEB, 'test-model', False, 'timeout', 'interrupted-run')
+        result, unit = F.continue_turn(WEB, 'test-model', False, 'interrupted-run')
         assert result == 'started' and unit.startswith('ocf-continue-')
 
 
@@ -967,17 +957,18 @@ def test_unpinned_default_fallback_returns_to_primary_even_when_override_was_abs
 @offline
 def test_partial_recovery_retry_never_holds_the_new_healthy_target_or_loses_failed_launch():
     run, e, s, p, state, health, out = recovery_fixture()
-    p.update(aborted=True, profile=PB, own=FABLE, patch_target=FABLE + '@' + PA,
-             selection=[e.get(f) for f in (F.E_MODEL, F.E_PROVIDER, F.E_MODEL_SRC, F.E_PROFILE, F.E_PROFILE_SRC)])
+    p.update(aborted=True, profile=PB, ref=FABLE + '@' + PB)
+    state['chat_moved'] = {WEB: {'to': FABLE + '@' + PA, 't': ms()}}   # last pass moved it, then the launch failed
     e['authProfileOverride'] = PA
     s.update(hasActiveRun=False, status='aborted')
+    health.cache['anthropic'] = {PA: 'ok', PB: 'rate_limit'}
     with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
             patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', return_value=s), \
-            patch.object(F, 'log_lines', return_value=[]), patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+            patch.object(F, 'log_lines', return_value=[]), \
             patch.object(F, 'gw', return_value=({'ok': True}, '')) as mutate, \
             patch.object(F, 'continue_turn', return_value=('rc=1 launch failed', None)):
         assert not F.recover_chat(state, health, WEB, s, run, p, out)
-        assert mutate.call_count == 1 and mutate.call_args.args[0] == F.RPC_PATCH
+        mutate.assert_not_called()                                    # already on the live target: no second patch
         assert health.held(PB, FABLE) and not health.held(PA, FABLE)
         assert run not in state['handled'] and run in state['pending']
 
@@ -1019,30 +1010,99 @@ def test_stall_aborted_before_the_pass_is_moved_and_continued_without_another_ab
     assert len(kinds(go(d)[2], 'chat_recover')) == 1                  # handled once
 
 
-def test_stall_an_older_version_marked_handled_without_moving_it_is_recovered_next_pass():
-    # State left by a pass that misread 'killed': run in handled, nothing journaled, the log already read.
+def test_pinned_chat_an_older_version_left_on_a_dead_account_is_moved_without_reopening_its_event():
+    # An older version marked the run handled without moving the chat. Nothing reconstructs that death any more: the
+    # pinned chat is moved by the next pass because its model@account is probed out. The old turn is not continued.
     log = [req(K, 'D2'), end('D2'), stall(FABLE, 'D2', delay=313935000)] + aborted_lines('D2')
-    for proof in (False, True):
-        d = setup(log=log, probe=ONE_LIVE, sessions={K: killed('D2')}, entries={K: PIN})
-        f = d / 'logs' / 'openclaw-2026-01-01.log'
-        (d / 'st').mkdir()
-        (d / 'st' / 'state.json').write_text(json.dumps({
-            'started': 0, 'handled': {'D2': ms() - 30_000, 'OTHER': ms() - 60_000},
-            'offsets': {str(f): f.stat().st_size}, 'run_key': {'D2': K}}))
-        if proof:                                                     # the journal shows a completed recovery
-            (d / 'st' / 'journal.jsonl').write_text(json.dumps({
-                'kind': 'chat_recover', 'run': 'D2', 'frm': FABLE + '@' + PB, 'to': FABLE + '@' + PA,
-                'patch': 'ok', 'continue': 'started'}) + '\n')
-        j = go(d)[2]
-        state = json.loads((d / 'st' / 'state.json').read_text())
-        assert all(isinstance(h, dict) for h in state['handled'].values()), state['handled']
-        if proof:
-            assert len(kinds(j, 'chat_recover')) == 1 and not kinds(j, 'chat_reopen'), j    # only the old line
-            continue
-        r, = kinds(j, 'chat_recover')
-        assert (r['run'], r['to'], r['patch'], r['abort'], r['continue']) == \
-            ('D2', FABLE + '@' + PA, 'ok', 'not needed', 'started'), r
-        assert len(kinds(go(d)[2], 'chat_recover')) == 1
+    d = setup(log=log, probe=ONE_LIVE, sessions={K: killed('D2')}, entries={K: PIN})
+    f = d / 'logs' / 'openclaw-2026-01-01.log'
+    (d / 'st').mkdir()
+    (d / 'st' / 'state.json').write_text(json.dumps({
+        'started': 0, 'handled': {'D2': ms() - 30_000, 'OTHER': ms() - 60_000},
+        'offsets': {str(f): f.stat().st_size}, 'run_key': {'D2': K}}))
+    j = go(d)[2]
+    m, = kinds(j, 'chat_move')
+    assert (m['session'], m['frm'], m['to'], m['result']) == (K, FABLE + '@' + PB, FABLE + '@' + PA, 'ok'), m
+    assert not kinds(j, 'chat_recover') and not kinds(j, 'chat_reopen'), j
+    assert len(kinds(go(d, True)[2], 'chat_move')) == 1                # the pin now points at a live account
+
+
+def test_pinned_chat_is_moved_each_pass_like_a_job_without_any_run_event():
+    # No log line at all: a pinned chat whose model@account is probed out, or held, moves to the next live target.
+    d = setup(probe=ONE_LIVE, entries={K: PIN})
+    j = go(d, True)[2]
+    m, = kinds(j, 'chat_move')
+    assert (m['frm'], m['to'], m['result']) == (FABLE + '@' + PB, FABLE + '@' + PA, 'ok'), m
+    assert not kinds(j, 'chat_recover') and not kinds(j, 'event_drop'), j
+    assert len(kinds(go(d, True)[2], 'chat_move')) == 1                # once: the pin points at a live account now
+    d = setup(probe={'anthropic': {PB: 'ok', PA: 'ok', PC: 'ok'}}, entries={K: PIN})
+    (d / 'st').mkdir()
+    (d / 'st' / 'state.json').write_text(json.dumps({'started': 0, 'limited': {FABLE + '@' + PB: ms() + 3600_000}}))
+    m, = kinds(go(d, True)[2], 'chat_move')
+    assert (m['to'], m['why']) == (FABLE + '@' + PA, 'held'), m       # every probe says ok: the hold decides
+    # Left alone: a chat with a run in progress, a chat whose account OpenClaw chose itself, a worker session.
+    auto = dict(PIN, modelOverrideSource='auto', authProfileOverrideSource='auto')
+    for sessions, entries in (({K: {'hasActiveRun': True}}, {K: PIN}), ({}, {K: auto}), ({WEB: {'spawnDepth': 1}}, {WEB: PIN})):
+        d = setup(probe=ONE_LIVE, sessions=sessions, entries=entries)
+        assert not kinds(go(d, True)[2], 'chat_move'), (sessions, entries)
+
+
+@offline
+def test_a_limit_is_held_for_one_model_on_one_account_and_an_ok_probe_never_clears_it():
+    health = F.Health({'primary': OPUS, 'chain': [OPUS], 'order': {'anthropic': [PB, PA]}},
+                      {FABLE + '@' + PB: ms() + 10 * 3600_000})
+    health.cache['anthropic'] = {PB: 'ok', PA: 'ok'}                  # the probe (of another model) says both answer
+    assert health.alive(PB, OPUS) and not health.alive(PB, FABLE) and health.dead(PB, FABLE)
+    assert health.target(FABLE) == FABLE + '@' + PA
+    health.hold(PA, ms() + 3600_000, FABLE)
+    assert health.target(FABLE) == OPUS + '@' + PB                    # Fable is out on both; Opus on PB is not
+
+
+def test_work_does_not_go_back_to_a_model_still_inside_its_own_wait():
+    # Every account answers its probe, but Opus is held on all of them until the time its provider named, longer than
+    # any former cap: the parked job and chat stay on the fallback. A Fable hold does not keep Opus off an account,
+    # and a whole-account hold left by an older version is dropped.
+    grok = {'providerOverride': 'xai', 'modelOverride': 'grok-4.7', 'modelOverrideSource': 'user',
+            'authProfileOverride': 'xai:x', 'authProfileOverrideSource': 'user'}
+    d = setup({'a': ('xai/grok-4.7', 'xai:x', 'trusted')}, [], {'anthropic': {PB: 'ok', PA: 'ok', PC: 'ok'}, 'xai': {'xai:x': 'ok'}},
+              entries={K: grok})
+    later = ms() + 20 * 3600_000
+    parked = {'model': OPUS, 'parked': 'xai/grok-4.7@xai:x', 'at': 0, 'wait': 0}
+    (d / 'st').mkdir()
+    (d / 'st' / 'state.json').write_text(json.dumps({'started': 0, 'home': {'a': parked}, 'chat_home': {K: parked},
+        'limited': {OPUS + '@' + PB: later, OPUS + '@' + PA: later, OPUS + '@' + PC: later, PA: later}}))
+    j = go(d, True)[2]
+    assert binding(d, 'a') == 'xai/grok-4.7@xai:x' and not kinds(j, 'chat_return') and not kinds(j, 'job_move'), j
+    s = json.loads((d / 'st' / 'state.json').read_text())
+    assert sorted(s['limited']) == sorted([OPUS + '@' + PB, OPUS + '@' + PA, OPUS + '@' + PC]), s['limited']
+    s['limited'] = {OPUS + '@' + PB: later, FABLE + '@' + PA: later}
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    j = go(d, True)[2]
+    assert binding(d, 'a') == OPUS + '@' + PA, j                      # Opus on PB is held; a Fable hold is not an Opus hold
+    r, = kinds(j, 'chat_return')
+    assert r['to'] == OPUS + '@' + PA, r
+
+
+def test_the_log_alone_decides_a_limit_death_whatever_the_status_word_says():
+    # The status word after a limit death differs by build and path ('failed', 'killed', 'aborted' or none). It neither
+    # allows nor blocks a continuation; the run's log does. Every dropped event is journaled with its reason.
+    for status in (None, 'failed', 'killed', 'aborted', 'running'):
+        for went_on in (False, True):
+            ses = {'key': K, 'hasActiveRun': False, 'lastRunId': 'L1'}
+            if status:
+                ses['status'] = status
+            later = [line({'runId': 'L1', 'milestone': 'tool_execution_started'}, 'agent turn milestone', ago=10)] if went_on else []
+            d = setup(log=[req(K, 'L1'), end('L1')] + later, probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}},
+                      sessions={K: ses}, entries={K: PIN})
+            j = go(d)[2]
+            state = json.loads((d / 'st' / 'state.json').read_text())
+            assert 'L1' not in state['pending'], (status, went_on)
+            if went_on:
+                drop, = kinds(j, 'event_drop')
+                assert not kinds(j, 'chat_recover') and drop['run'] == 'L1' and 'last word' in drop['why'], (status, j)
+            else:
+                r, = kinds(j, 'chat_recover')
+                assert r['continue'] == 'started' and 'L1' in state['handled'], (status, r)
 
 
 def test_stall_that_woke_up_or_was_stopped_by_a_person_is_left_alone():
@@ -1059,6 +1119,9 @@ def test_stall_that_woke_up_or_was_stopped_by_a_person_is_left_alone():
         j = go(d)[2]
         state = json.loads((d / 'st' / 'state.json').read_text())
         assert not kinds(j, 'chat_recover') and 'D3' not in state['pending'] and not state['limited'], (status, j)
+        assert [r['run'] for r in kinds(j, 'event_drop')] == ['D3'], j                 # dropped with its reason
+        # The pinned chat still leaves its probed-out account once idle; it is moved, not continued.
+        assert [m['to'] for m in kinds(j, 'chat_move')] == ([] if active else [FABLE + '@' + PA]), (status, j)
 
 
 def test_check_reports_a_turn_killed_after_a_limit_that_is_still_unanswered():
