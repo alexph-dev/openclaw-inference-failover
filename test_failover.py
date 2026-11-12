@@ -1167,6 +1167,31 @@ def test_stall_being_stopped_by_someone_else_during_the_probe_waits_for_its_end(
         assert run not in state['handled']
 
 
+
+def test_strict_chat_changes_account_but_never_model_and_its_failed_turn_waits():
+    strict = {'OCF_STRICT_CHATS': 'agent:main:other:direct:x, ' + K}
+    # Another account of its own model is live: an account-only move, like any pinned chat.
+    d = setup(probe=ONE_LIVE, entries={K: PIN})
+    m, = kinds(go(d, True, env=strict)[2], 'chat_move')
+    assert m['to'] == FABLE + '@' + PA, m
+    # Every account of its model is out while other models are live: no move, no continuation, no problem raised.
+    ses = {K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'R2', 'status': 'failed'}}
+    d = setup(log=[req(K, 'R2'), end('R2')], probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}, 'openai': {'openai:default': 'ok'}},
+              sessions=ses, entries={K: PIN})
+    for _ in range(2):
+        rc, err, j = go(d, True, env=strict)
+        assert not kinds(j, 'chat_move') and not kinds(j, 'chat_recover') and not kinds(j, 'event_drop'), j
+        assert rc == 0 and 'no live account' not in err, err
+    # Another account of its own model comes back: the waiting turn is continued there, with no model-change line.
+    fake(d, probe={'anthropic': {PB: 'rate_limit', PA: 'ok', PC: 'rate_limit'}})
+    r, = kinds(go(d, True, env=strict)[2], 'chat_recover')
+    assert (r['to'], r['continue']) == (FABLE + '@' + PA, 'started'), r
+    # Without the setting the same chat goes down the chain as before.
+    d = setup(log=[req(K, 'R2'), end('R2')], probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}}, sessions=ses, entries={K: PIN})
+    r, = kinds(go(d)[2], 'chat_recover')
+    assert r['to'] == 'xai/grok-4.7@xai:x', r
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:
