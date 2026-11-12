@@ -720,6 +720,16 @@ def test_timeout_terminal_receipt_must_match_and_no_new_input_or_later_progress(
         assert not json.loads((d / 'st' / 'state.json').read_text())['limited']
 
 
+
+def test_normal_timeout_cleanup_is_not_an_intentional_abort():
+    for extra, recover in [('embedded run abort still streaming: runId=timeout-run', True),
+                           ('chat.abort requested runId=timeout-run', False)]:
+        d = setup(log=[timeout_line(), line(extra, ago=5)], probe={'anthropic': {PB: 'ok'}},
+                  sessions={WEB: {'hasActiveRun': False}},
+                  entries={WEB: dict(PIN, sessionId='session-1', lastRunId='timeout-run', status='timeout')})
+        assert bool([r for r in kinds(go(d)[2], 'chat_recover') if r.get('patch')]) == recover
+
+
 def test_tool_timeout_is_not_a_runtime_timeout_and_old_runtime_timeout_is_not_replayed():
     for event in [line('exec tool timeout after 30s runId=timeout-run'), timeout_line(ago=3600)]:
         d = setup(log=[event], probe={'anthropic': {PB: 'ok'}},
@@ -763,7 +773,7 @@ def test_timeout_session_resolver_reads_database_and_rejects_ambiguous_or_wrong_
 
 def recovery_fixture(kind='stall'):
     run = 'original-run'
-    e = dict(PIN, sessionId='sid', activeWriterRunId=run)
+    e = dict(PIN, sessionId='sid', activeWriterRunId=run, lifecycleRevision='revision-before-abort')
     s = {'hasActiveRun': kind == 'stall', 'lastRunId': run, 'status': 'timeout' if kind == 'timeout' else 'failed'}
     p = {'kind': kind, 't': ms() - 40_000, 'until': ms() + 3600_000, 'model': FABLE}
     state = {'handled': {}, 'pending': {run: p}}
@@ -792,14 +802,18 @@ def test_new_input_or_model_choice_during_probe_prevents_all_mutation():
 def test_abort_is_exact_and_precedes_patch_and_partial_failure_stays_pending():
     run, e, s, p, state, health, out = recovery_fixture()
     stopped = {'hasActiveRun': False, 'lastRunId': run, 'status': 'aborted'}
+    post_abort = dict(e, lifecycleRevision='revision-after-abort')
     with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
-            patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', side_effect=[s, stopped]), \
+            patch.object(F, 'entry', side_effect=[(e, False), (e, False), (post_abort, False)]), \
+            patch.object(F, 'session', side_effect=[s, stopped]), \
             patch.object(F, 'log_lines', return_value=[]), patch.object(F, 'save'), \
             patch.object(health, 'target', return_value=FABLE + '@' + PA), \
             patch.object(F, 'gw', side_effect=[({'status': 'aborted', 'abortedRunId': run}, ''), (None, 'patch failed')]) as mutate:
         assert not F.recover_chat(state, health, WEB, s, run, p, out)
         assert [c.args[0] for c in mutate.call_args_list] == [F.RPC_ABORT, F.RPC_PATCH]
         assert mutate.call_args_list[0].args[1] == {'key': WEB, 'runId': run}
+        assert mutate.call_args_list[1].args[1]['expectedSessionId'] == 'sid'
+        assert mutate.call_args_list[1].args[1]['expectedLifecycleRevision'] == 'revision-after-abort'
         assert p['aborted'] and run not in state['handled'] and run in state['pending']
 
 
@@ -814,6 +828,68 @@ def test_abort_no_active_run_never_patches_or_continues():
         assert F.recover_chat(state, health, WEB, s, run, p, out)
         assert mutate.call_count == 1 and mutate.call_args.args[0] == F.RPC_ABORT
         send.assert_not_called()
+
+
+
+@offline
+def test_abort_intent_recovers_lost_receipt_and_process_interruption_once():
+    for interrupted in (False, True):
+        run, e, s, p, state, health, out = recovery_fixture()
+        state['run_key'] = {run: WEB}
+        stopped = dict(s, hasActiveRun=False, status='aborted')
+        def abort(rpc, args, timeout):
+            assert rpc == F.RPC_ABORT
+            durable = json.loads(F.STATE.read_text())['pending'][run]
+            assert durable['abort_intent'] == {'key': WEB, 'session': 'sid', 'run': run}
+            assert not durable.get('aborted')
+            if interrupted:
+                raise SystemExit('process stopped after accepted abort')
+            return None, 'lost transport receipt'
+        with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+                patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', return_value=s), \
+                patch.object(F, 'log_lines', return_value=[]), \
+                patch.object(health, 'target', return_value=FABLE + '@' + PA), patch.object(F, 'gw', side_effect=abort):
+            try:
+                assert not F.recover_chat(state, health, WEB, s, run, p, out)
+            except SystemExit:
+                assert interrupted
+        state = json.loads(F.STATE.read_text())  # real restart: only the pre-RPC state survived
+        with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+                patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', return_value=stopped), \
+                patch.object(F, 'log_lines', return_value=[]), \
+                patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+                patch.object(F, 'gw', return_value=({'ok': True}, '')) as mutate, \
+                patch.object(F, 'continue_turn', return_value=('started', None)) as send:
+            F.stalls_and_chats(state, health, {}, out)
+            F.stalls_and_chats(state, health, {}, out)
+            send.assert_called_once()
+            assert [c.args[0] for c in mutate.call_args_list] == [F.RPC_PATCH]
+            assert run in state['handled'] and run not in state['pending']
+
+
+@offline
+def test_abort_receipt_without_our_exact_intent_or_with_newer_choice_is_untouched():
+    for change in ('manual', 'session', 'run', 'key', 'model', 'input'):
+        run, e, s, p, state, health, out = recovery_fixture()
+        state['run_key'] = {run: WEB}
+        stopped = dict(s, hasActiveRun=False, status='aborted')
+        p.update(session='sid', selection=[e.get(f) for f in
+                 (F.E_MODEL, F.E_PROVIDER, F.E_MODEL_SRC, F.E_PROFILE, F.E_PROFILE_SRC)])
+        if change != 'manual':
+            p['abort_intent'] = {'key': WEB, 'session': 'sid', 'run': run}
+        if change in ('session', 'run', 'key'):
+            p['abort_intent'][change] = 'unrelated'
+        if change == 'model':
+            e['modelOverride'] = 'new-user-model'
+        if change == 'input':
+            e['lastInteractionAt'] = ms()
+        with patch.object(F, 'entry', return_value=(e, False)), \
+                patch.object(F, 'session', return_value=stopped), patch.object(F, 'log_lines', return_value=[]), \
+                patch.object(F, 'gw') as mutate, patch.object(F, 'continue_turn') as send:
+            F.stalls_and_chats(state, health, {}, out)
+            mutate.assert_not_called()
+            send.assert_not_called()
+            assert run not in state['pending']
 
 
 def test_continuation_prompt_reconciles_side_effects_and_local_route_and_launch_identity():

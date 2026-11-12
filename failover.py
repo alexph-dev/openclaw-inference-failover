@@ -937,6 +937,18 @@ def newer_input(s, e, queued, t):
                          and d[S_INTERACTION] > t + 2000 for d in (s, e))
 
 
+def reconcile_chat_abort(state, key, s, e, run_id, p):
+    """Adopt a lost abort receipt only for our durable exact-session/run intent."""
+    intent = p.get('abort_intent') or {}
+    sid = s.get(S_ID) or e.get(S_ID)
+    last, status = terminal_state(s, e)
+    if (p['kind'] == 'stall' and not p.get('aborted') and intent.get('session') and
+            intent == {'key': key, 'session': sid, 'run': run_id} and
+            not s.get(S_ACTIVE) and last == run_id and status == S_ABORTED):
+        p['aborted'] = True
+        save(state)
+
+
 def candidate_current(key, s, e, queued, run_id, p):
     if not s or not human_chat(key, s, e) or newer_input(s, e, queued, p['t']):
         return False
@@ -975,7 +987,7 @@ def died_on_timeout(run_id, t):
                 (ts_ms(rec) > t + 2000 and (one.get(L_MILESTONE) or one.get(L_EVENT) == EV_END))):
             return False
         if ts_ms(rec) >= t and any(isinstance(rec.get(slot), str) and
-                re.search(r'\babort(?:ed|ing| requested)?\b', rec[slot], re.I) for slot in (L1, L2)):
+                re.search(r'\b(?:chat\.abort requested|embedded run aborted)\b', rec[slot], re.I) for slot in (L1, L2)):
             return False
     return True
 
@@ -1048,6 +1060,7 @@ def recover_chat(state, health, key, s, run_id, p, out):
     if newer_input(s, e, queued, p['t']):
         journal('chat_recover', session=key, run=run_id, why=p['kind'], **{'continue': 'user already wrote'})
         return True
+    reconcile_chat_abort(state, key, s, e, run_id, p)
     if not candidate_current(key, s, e, queued, run_id, p):
         return True
     if not p.get('session') and (s.get(S_ID) or e.get(S_ID)):
@@ -1082,6 +1095,8 @@ def recover_chat(state, health, key, s, run_id, p, out):
     p.setdefault('selection', selection(e))
     res = {'patch': 'not needed', 'abort': 'not needed'}
     if p['kind'] == 'stall' and not p.get('aborted'):
+        p['abort_intent'] = {'key': key, 'session': p.get('session'), 'run': run_id}
+        save(state)                       # write-ahead intent survives a lost RPC receipt or process exit
         d, err = ({A_ABORTED_RUN: run_id, S_STATUS: S_ABORTED}, '') if (FAKE is not None or not APPLY) else \
             gw(RPC_ABORT, ABORT_ARGS(key, run_id), 30)
         if d and (d.get(A_ABORTED_RUN) != run_id or d.get(S_STATUS) != S_ABORTED):
@@ -1102,7 +1117,12 @@ def recover_chat(state, health, key, s, run_id, p, out):
         # Bind the target even for a default-model session: abort alone can select the exhausted default again.
         p['patch_target'] = tgt
         save(state)
-        d, err = (1, '') if (FAKE is not None or not APPLY) else gw(RPC_PATCH, PATCH_ARGS(key, tgt), 60)
+        patch_args = PATCH_ARGS(key, tgt)
+        # Conditional mutation rejects an intervening reset/new turn after our fresh read.
+        for source, guard in ((S_ID, 'expectedSessionId'), ('lifecycleRevision', 'expectedLifecycleRevision')):
+            if latest_e.get(source):
+                patch_args[guard] = latest_e[source]
+        d, err = (1, '') if (FAKE is not None or not APPLY) else gw(RPC_PATCH, patch_args, 60)
         res['patch'] = ('ok' if APPLY else 'dry-run') if d else err
     if res['patch'] not in ('ok', 'dry-run', 'not needed') or res['abort'] not in ('ok', 'dry-run', 'not needed'):
         prob(out, 'chat_recover:' + run_id, 'chat %s: recovery failed %s' % (key[-40:], json.dumps(res)[:200]))
@@ -1248,6 +1268,8 @@ def stalls_and_chats(state, health, jobs, out):
             pend.pop(r, None)
             continue
         if p['kind'] == 'stall':
+            if CHAT_RE.match(key):
+                reconcile_chat_abort(state, key, s, e, r, p)
             if not p.get('aborted') and (not s.get(S_ACTIVE) or any(ts_ms(x) > p['t'] + 5000 for x in log_lines(r))):
                 pend.pop(r, None)                      # woke up, ended or was aborted
                 continue

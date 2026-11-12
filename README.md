@@ -95,8 +95,10 @@ Requirements and limits:
 - Cron, agent-to-agent (`a2a`), subagent and worker sessions are not continued as human chats. Dashboard keys also
   require a worker-metadata check; a remotely placed or spawned worker is not a browser conversation.
 - Before mutation, recovery refreshes the exact run, queued/newer input and model selection after account probes.
-  A live stall is aborted by exact run ID before a model patch. A deterministic retained systemd unit reconciles
-  uncertain continuation launches. These checks use the installed runtime's surfaces, not an atomic cross-RPC lock.
+  A live stall records exact session/run abort intent durably before aborting; retries reconcile only its matching
+  terminal receipt. Model patches pass fresh session/lifecycle preconditions when available. A deterministic retained
+  systemd unit reconciles uncertain continuation launches. The final read and CLI continuation admission are separate:
+  these checks are not an atomic cross-RPC lock, so a newer user turn can still arrive in that interval.
 - A temporarily selected fallback model returns to its original model only while the session is idle, its input
   queue is empty, and the watchdog still owns the selection. Selecting the configured primary clears its model
   override in OpenClaw, including when the original session inherited that default.
