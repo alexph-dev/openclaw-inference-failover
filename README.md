@@ -61,6 +61,7 @@ provider, in that order, and then the entries of `agents.defaults.model.fallback
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
 | Model, fallbacks, account order (the only targets) | config file (`~/.openclaw/openclaw.json`) |
 | Chats' pinned model/account and queued input | internal: tables `session_nodes` and `session_pending_inputs` in each agent database (read-only) |
+| The recorded account of a job whose `payload.model` names no account | internal: table `cron_jobs` (`inferenceBinding.profileId`) in `state/openclaw.sqlite` (read-only); `cron list` does not show it |
 | Stalls and failed turns | internal: Gateway log lines (`/tmp/openclaw*/openclaw-*.log`) |
 
 Everything that depends on the OpenClaw version (CLI arguments, JSON field names, RPC names, table and column names,

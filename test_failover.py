@@ -1192,6 +1192,32 @@ def test_strict_chat_changes_account_but_never_model_and_its_failed_turn_waits()
     assert r['to'] == 'xai/grok-4.7@xai:x', r
 
 
+
+def test_job_bound_to_an_account_without_naming_it_moves_too():
+    # payload.model names only the model; the account is recorded in the job's binding, which cron list does not show.
+    d = setup({'u': (OPUS, PA, 'trusted'), 'a': (OPUS, PB, 'trusted')},
+              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
+    c = sqlite3.connect(d / 'state.sqlite')
+    j = json.loads(c.execute("select job_json from cron_jobs where job_id='u'").fetchone()[0])
+    j['payload']['model'] = OPUS                                      # no '@account'
+    c.execute("update cron_jobs set job_json=? where job_id='u'", (json.dumps(j),))
+    c.commit()
+    c.close()
+    m, = kinds(go(d, True)[2], 'job_move')
+    assert (m['job'], m['frm'], m['to']) == ('u', OPUS + '@' + PA, OPUS + '@' + PB), m
+    # Two limit failures in a row of such a job, while the probe still says ok: held and moved, no crash.
+    d = setup({'u': (OPUS, PA, 'trusted'), 'a': (OPUS, PB, 'trusted')}, [('u', 'error', ERR, 120), ('u', 'error', ERR, 60)],
+              {'anthropic': {PB: 'ok', PA: 'ok', PC: 'ok'}})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute("update cron_jobs set job_json=json_set(job_json, '$.payload.model', ?) where job_id='u'", (OPUS,))
+    c.commit()
+    c.close()
+    rc, err, j = go(d, True)
+    assert 'Traceback' not in err, err
+    m, = kinds(j, 'job_move')
+    assert (m['job'], m['to']) == ('u', OPUS + '@' + PB), (err, j)
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:
