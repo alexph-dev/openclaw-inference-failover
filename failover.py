@@ -24,7 +24,7 @@ Run once a minute by an OpenClaw command job.
   failover.py --status   open problems, held accounts, work parked on a fallback model (JSON)
 State and journal: ~/.local/state/openclaw-inference-failover (OCF_STATE overrides).
 """
-import calendar, fcntl, glob, json, os, pathlib, re, signal, sqlite3, subprocess, sys, time
+import calendar, fcntl, glob, hashlib, json, os, pathlib, re, signal, sqlite3, subprocess, sys, time
 
 # =====================================================================================================================
 # OPENCLAW SURFACE. Everything that depends on the installed OpenClaw version is named here and only here; the rest of
@@ -39,7 +39,7 @@ CLI_RUNS = ['cron', 'runs', '--all', '--status', 'error', '--sort', 'desc', '--l
             '--timeout', '60000']                                   # recent failed runs, newest first (200 = cap)
 CLI_EDIT = lambda jid, ref: ['cron', 'edit', jid, '--model', ref, '--timeout', '120000']   # rebind a job to model@account
 CLI_RUN = lambda jid: ['cron', 'run', jid]                          # run a job once now
-CLI_AGENT = lambda key, msg: ['agent', '--session-key', key, '--message', msg, '--deliver', '--timeout', '3600']  # continue a chat
+CLI_AGENT = lambda key, msg, deliver=True: ['agent', '--session-key', key, '--message', msg] + (['--deliver'] if deliver else []) + ['--timeout', '3600']  # continue on the stored route, or locally
 CLI_CALL = lambda method, params, ms: ['gateway', 'call', method, '--params', json.dumps(params), '--json', '--timeout', str(ms)]  # one RPC
 # JSON fields of the CLI answers ('a.b' = nested)
 JOBS_LIST, RUNS_LIST = 'jobs', 'entries'                            # top-level lists of cron list / cron runs
@@ -67,6 +67,12 @@ S_ROOT = 'session'                                                  # sessions.d
 S_ACTIVE, S_STATUS, S_LAST_RUN = 'hasActiveRun', 'status', 'lastRunId'          # run state of a session
 S_DELIVERY, S_TO, S_MODEL, S_PROVIDER = 'deliveryContext', 'lastTo', 'model', 'modelProvider'
 S_FAILED = 'failed'                                                 # session status after a failed turn
+S_TIMEOUT, S_ID = 'timeout', 'sessionId'                             # explicit runtime timeout; persisted session id
+S_WRITER, S_LIFECYCLE, S_ACTIVE_IDS = 'activeWriterRunId', 'lifecycleRunId', 'activeRunIds'
+S_INTERACTION, S_ABORTED, A_ABORTED_RUN = 'lastInteractionAt', 'aborted', 'abortedRunId'
+S_PLACEMENT, S_BACKGROUND, S_DEPTH = 'placement', 'isBackground', 'spawnDepth'
+P_PROVIDER, P_ENV, WORKER_PROVIDER, WORKER_ENV = 'providerId', 'environmentId', 'device', 'worker:'
+WORKER_FIELDS = ('spawnedCwd', 'worktree', 'spawnedBy')               # worker/subagent metadata (also on dashboard keys)
 # Agent databases (chat model/account selection and queued input: no CLI or RPC exposes them)
 AGENT_DB_PATH = 'agents/{agent}/agent/openclaw-agent.sqlite'        # under the OpenClaw state dir
 T_NODES, C_NODE_KEY, C_NODE_ENTRY = 'session_nodes', 'session_key', 'entry_json'           # session entry per key
@@ -91,13 +97,16 @@ L_EVENT, L_RUN, L_ERROR, L_REASON, L_STATUS, L_DONE, L_MILESTONE = 'event', 'run
 LIMITED = ('rate_limit', 'billing')                                 # failoverReason values that mean a usage limit
 RETRY_RE = re.compile(r'transient same-model retry \d+/\d+ for (\S+) reason=rate_limit: delayMs=(\d+) '
                       r'runId="([^"]+)" sessionId="([^"]*)"')      # a run sleeping out a same-model rate-limit wait
+TIMEOUT_ANCHOR = 'embedded run timeout:'
+TIMEOUT_RE = re.compile(r'embedded run timeout: runId=([^\s]+) sessionId=([^\s]+) timeoutMs=(\d+)')
 REQ_RE = re.compile(r'Model request failed sessionKey="([^"]+)" runId="([^"]+)"')   # a failed model request -> session
 REQ_N_RE = re.compile(r'requestNumber=(\d+)')                       # how far into the run that request was
 KEY_RE = re.compile(r'sessionKey[=:\s\\"]+(agent:[^"\\\s,]+)')         # session key inside any log line
-ANCHORS = ('transient same-model retry', 'Model request failed', EV_END)   # log anchors the self-check looks for
+ANCHORS = ('transient same-model retry', 'Model request failed', EV_END, TIMEOUT_ANCHOR)   # self-check anchors
 ANCHOR_DIRS = ('dist', 'node_modules/@openclaw/ai/dist')            # where the anchors live in the package
 # Session keys
-CHAT_RE = re.compile(r'^agent:[^:]+:(?!a2a:)[^:]+:(group|direct|channel):')  # a chat session with people (not agent-to-agent)
+CHAT_RE = re.compile(r'^agent:[^:]+:(?:main$|dashboard:[^:]+$|(?!a2a:|cron:|subagent:|worker:)[^:]+:(?:group|direct|channel):)')  # human keys; metadata is checked too
+LOCAL_CHAT_RE = re.compile(r'^agent:[^:]+:(?:main$|dashboard:[^:]+$)')
 GROUP_RE = re.compile(r'^agent:[^:]+:[^:]+:(group|channel):')        # a chat session that is a group or channel
 CRON_RE = re.compile(r'^agent:[^:]+:cron:([0-9a-f-]{36}):run:')      # a cron run session -> job id
 CRON_KEY = ':cron:%s:run:'                                          # log needle for one job's runs
@@ -335,7 +344,7 @@ def log_lines(needle):
 
 def scan_logs(state):
     """New complete log lines since the last pass -> stalls, failed turns, run->session keys, providers seen limited."""
-    ev = {'stalls': [], 'failed': {}, 'run_key': {}, 'run_req': {}, 'providers': set()}
+    ev = {'stalls': [], 'failed': {}, 'timeouts': [], 'run_key': {}, 'run_req': {}, 'providers': set()}
     offs = state.setdefault('offsets', {})
     files = log_files()
     for f in files:
@@ -347,13 +356,18 @@ def scan_logs(state):
         chunk = chunk[:chunk.rfind(b'\n') + 1]       # a half-written last line is read next pass
         offs[f] = start + len(chunk)
         for raw in chunk.split(b'\n'):
-            if not any(x.encode() in raw for x in LIMITED + (ANCHORS[1],)):
+            if not any(x.encode() in raw for x in LIMITED + (ANCHORS[1], TIMEOUT_ANCHOR)):
                 continue
             try:
                 rec = json.loads(raw)
             except Exception:
                 continue
             one, two, t = rec.get(L1), rec.get(L2), ts_ms(rec)
+            for text in (one, two):
+                timeout = TIMEOUT_RE.search(text) if isinstance(text, str) else None
+                if timeout:
+                    ev['timeouts'].append({'run': timeout.group(1), 'session': timeout.group(2), 't': t})
+                    break
             m = REQ_RE.search(two) if isinstance(two, str) else None
             if m and isinstance(one, dict):
                 ev['run_key'][m.group(2)] = m.group(1)
@@ -366,7 +380,7 @@ def scan_logs(state):
                 if r and int(r.group(2)) >= STALL_MS:
                     k = KEY_RE.search(one)
                     ev['stalls'].append({'model': r.group(1), 'delay': int(r.group(2)), 'run': r.group(3), 't': t,
-                                         'key': k.group(1) if k else None})
+                                         'key': k.group(1) if k else None, 'session': r.group(4)})
                     ev['providers'].add(r.group(1).split('/')[0])
             elif isinstance(one, dict) and one.get(L_EVENT) == EV_END and one.get(L_ERROR) \
                     and one.get(L_REASON) in LIMITED:
@@ -868,6 +882,77 @@ def entry(key):
     return (json.loads(r[0]) if r and r[0] else {}), q > 0
 
 
+def key_for_session(session_id, run_id=None):
+    """A timeout may name only sessionId. Resolve it read-only, and never guess between matching rows."""
+    if not session_id:
+        return None
+    matches = set()
+    if FAKE is not None:
+        rows = FAKE.get('entries', {}).items()
+        matches.update(k for k, e in rows if e.get(S_ID) == session_id
+                       and (run_id is None or e.get(S_LAST_RUN) == run_id))
+    else:
+        uris = [os.environ['OCF_AGENT_DB']] if os.environ.get('OCF_AGENT_DB') else [
+            agent_db('agent:%s:main' % aid) for aid in agent_ids()]
+        for uri in uris:
+            with sqlite3.connect(uri, uri=True) as c:
+                for key, raw in c.execute('select %s,%s from %s' % (C_NODE_KEY, C_NODE_ENTRY, T_NODES)):
+                    e = json.loads(raw or '{}')
+                    if e.get(S_ID) == session_id and (run_id is None or e.get(S_LAST_RUN) == run_id):
+                        matches.add(key)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def human_chat(key, s=None, e=None):
+    """Human main/WebChat/channel session, not an internal worker reusing a dashboard key."""
+    if not CHAT_RE.match(key):
+        return False
+    for data in (s or {}, e or {}):
+        placement = data.get(S_PLACEMENT) or {}
+        if any(data.get(f) for f in WORKER_FIELDS) or (data.get(S_DEPTH) or 0) > 0 \
+                or data.get(S_BACKGROUND) or placement.get(P_PROVIDER) == WORKER_PROVIDER \
+                or str(placement.get(P_ENV, '')).startswith(WORKER_ENV):
+            return False
+    return True
+
+
+def terminal_state(s, e):
+    """Describe omits lastRunId on some builds; entry_json is the persisted terminal receipt."""
+    return s.get(S_LAST_RUN) or e.get(S_LAST_RUN), s.get(S_STATUS) or e.get(S_STATUS)
+
+
+def active_run(s, e, run_id):
+    if not s.get(S_ACTIVE):
+        return False
+    for field in (S_WRITER, S_LIFECYCLE):
+        ids = [d[field] for d in (e, s) if d.get(field)]
+        if ids:
+            return all(r == run_id for r in ids)
+    return run_id in (s.get(S_ACTIVE_IDS) or [])
+
+
+def newer_input(s, e, queued, t):
+    # lastInteractionAt also catches a user turn consumed since the failure (no longer queued).
+    return queued or any(isinstance(d.get(S_INTERACTION), (int, float))
+                         and d[S_INTERACTION] > t + 2000 for d in (s, e))
+
+
+def candidate_current(key, s, e, queued, run_id, p):
+    if not s or not human_chat(key, s, e) or newer_input(s, e, queued, p['t']):
+        return False
+    if p.get('session') and (s.get(S_ID) or e.get(S_ID)) != p['session']:
+        return False                     # same key, different session incarnation
+    last, status = terminal_state(s, e)
+    if p['kind'] == 'stall':
+        if p.get('aborted'):
+            return not s.get(S_ACTIVE) and last == run_id and status == S_ABORTED
+        return active_run(s, e, run_id) and not any(ts_ms(x) > p['t'] + 5000 for x in log_lines(run_id))
+    if s.get(S_ACTIVE) or last != run_id:
+        return False
+    return (status == S_TIMEOUT and died_on_timeout(run_id, p['t'])) if p['kind'] == 'timeout' else \
+        (status == S_FAILED and died_on_limit(run_id, p['t']))
+
+
 def died_on_limit(run_id, t):
     """The limit was the run's last word: no later progress and no completed outcome after it."""
     for rec in log_lines(run_id):
@@ -882,28 +967,51 @@ def died_on_limit(run_id, t):
     return True
 
 
+def died_on_timeout(run_id, t):
+    """Only the explicit timeout is recoverable, never an intentional abort or later healthy progress."""
+    for rec in log_lines(run_id):
+        one = rec.get(L1)
+        if isinstance(one, dict) and (one.get(L_STATUS) == L_DONE or
+                (ts_ms(rec) > t + 2000 and (one.get(L_MILESTONE) or one.get(L_EVENT) == EV_END))):
+            return False
+        if ts_ms(rec) >= t and any(isinstance(rec.get(slot), str) and
+                re.search(r'\babort(?:ed|ing| requested)?\b', rec[slot], re.I) for slot in (L1, L2)):
+            return False
+    return True
+
+
 def has_chat(key, s):
-    """The session delivers to a chat: a group/channel key, or a stored delivery route."""
+    """Local WebChat needs no external delivery route; channel chats keep their stored route."""
     dc = s.get(S_DELIVERY) or {}
-    return bool(GROUP_RE.match(key) or dc.get('to') or s.get(S_TO))
+    return bool(LOCAL_CHAT_RE.match(key) or GROUP_RE.match(key) or dc.get('to') or s.get(S_TO))
 
 
-def continue_turn(key, model, moved):
+def continue_turn(key, model, moved, reason='failed', run_id=''):
     """Starts the continuation as its own user unit; returns (result, unit). No --reply-to: an explicit target drops
     the session's topic/thread, the session's own stored route keeps it. When the model changed, the agent itself
     opens its reply with one line in the chat's language (this script sends nothing to a chat)."""
     tell = ('Start your reply with one short line, in the language this chat uses, saying that the AI account hit its '
             'usage limit and this chat now runs on %s; then answer. If nothing is unanswered, reply exactly NO_REPLY and '
             'nothing else, without that line.' % model) if moved else 'If nothing is unanswered, reply exactly NO_REPLY. Do not mention this note.'
-    msg = ('[Inference failover, automatic] Your previous turn in this chat was cut off by a provider usage limit '
-           'before you answered. This session now runs on %s. Continue that turn now: answer the latest unanswered '
-           'request in this chat as if it had just arrived, in the usual language and format of this chat. %s'
-           % (model, tell))
+    cause = 'a runtime timeout' if reason == 'timeout' else 'a provider usage limit'
+    if reason == 'timeout':
+        tell = 'If nothing is unanswered, reply exactly NO_REPLY. Do not mention this note.'
+    msg = ('[Inference failover, automatic] The turn with run ID %s in this chat was interrupted by %s. '
+           'This session now runs on %s. Review the transcript and reconcile completed tool actions and delivery '
+           'receipts with current state before acting. Continue only the unfinished part of that interrupted '
+           'request, in the usual language and format of this chat. Do not replay the entire request or repeat '
+           'completed actions, sends, payments or writes. Verify uncertain side effects before retrying them. '
+           'Respect intentional stops and any newer user instruction. %s' % (run_id, cause, model, tell))
     if not APPLY or FAKE is not None:
         return ('dry-run' if not APPLY else 'started'), None
-    unit = 'ocf-continue-%d' % NOW()
-    argv = ['systemd-run', '--user', '--quiet', '--unit', unit, '-p', 'MemoryMax=2G', 'openclaw'] + CLI_AGENT(key, msg)
+    unit = 'ocf-continue-' + hashlib.sha256((key + ':' + run_id).encode()).hexdigest()[:24]
+    # Retain a completed unit until handled state is durable. A retry after a lost launch receipt cannot run twice.
+    argv = ['systemd-run', '--user', '--quiet', '--unit', unit, '-p', 'MemoryMax=2G',
+            '-p', 'Type=oneshot', '-p', 'RemainAfterExit=yes', '--no-block', 'openclaw'] + CLI_AGENT(
+        key, msg, deliver=not LOCAL_CHAT_RE.match(key))
     rc, out, err = run(argv, 20)
+    if rc != 0 and run(['systemctl', '--user', 'show', unit, '-p', 'LoadState', '--value'], 15)[1].strip() == 'loaded':
+        return 'started', unit             # reconcile an already accepted deterministic launch
     return ('started', unit) if rc == 0 else ('rc=%s %s' % (rc, (err or out).strip()[-200:]), None)
 
 
@@ -914,11 +1022,15 @@ def continued_check(state, out):
         st = FAKE.get('units', {}).get(unit, 'inactive') if FAKE is not None else \
             (run(['systemctl', '--user', 'is-active', unit], 15)[1].strip() or 'inactive')
         if st in ('active', 'activating'):
-            continue
+            sub = '' if FAKE is not None else run(['systemctl', '--user', 'show', unit, '-p', 'SubState', '--value'], 15)[1].strip()
+            if sub != 'exited':
+                continue
+            if APPLY:
+                run(['systemctl', '--user', 'stop', unit], 15)
         c.pop(unit)
         if st == 'failed':
             prob(out, 'continue:' + unit, 'chat %s: the continued turn failed (journalctl --user -u %s)' % (key[-40:], unit))
-            if FAKE is None:
+            if FAKE is None and APPLY:
                 run(['systemctl', '--user', 'reset-failed', unit], 15)
 
 
@@ -931,57 +1043,116 @@ def recover_chat(state, health, key, s, run_id, p, out):
              % (key[-40:], len(hits) + 1))
         return True
     e, queued = entry(key)
-    model = p.get('model') or '%s/%s' % (s.get(S_PROVIDER), s.get(S_MODEL))
-    cur = e.get(E_PROFILE)
-    if cur:        # the account this turn ran on is out for this model, whatever a probe of another model says
+    if not human_chat(key, s, e):
+        return True
+    if newer_input(s, e, queued, p['t']):
+        journal('chat_recover', session=key, run=run_id, why=p['kind'], **{'continue': 'user already wrote'})
+        return True
+    if not candidate_current(key, s, e, queued, run_id, p):
+        return True
+    if not p.get('session') and (s.get(S_ID) or e.get(S_ID)):
+        p['session'] = s.get(S_ID) or e.get(S_ID)
+    selection = lambda data: [data.get(f) for f in (E_MODEL, E_PROVIDER, E_MODEL_SRC, E_PROFILE, E_PROFILE_SRC)]
+    current_ref = ('%s/%s' % (e.get(E_PROVIDER), e[E_MODEL]) if e.get(E_MODEL) else health.conf['primary']) + '@' + str(e.get(E_PROFILE))
+    if p.get('selection') is not None and selection(e) != p['selection'] and current_ref != p.get('patch_target'):
+        return True                       # a user selection made between retry passes wins too
+    selected = '%s/%s' % (e.get(E_PROVIDER) or s.get(S_PROVIDER), e[E_MODEL]) if e.get(E_MODEL) else health.conf['primary']
+    model = p.get('model') or ('%s/%s' % (s[S_PROVIDER], s[S_MODEL])
+                             if s.get(S_PROVIDER) and s.get(S_MODEL) else selected)
+    if 'profile' not in p:
+        p['profile'] = e.get(E_PROFILE)
+    cur = p['profile']                     # don't attribute the old limit to a successfully patched target on retry
+    if cur and p['kind'] != 'timeout':   # timeout is not evidence of an account usage limit
         health.hold(cur, min(p['until'], NOW() + HOLD_MAX_MS) if p['kind'] == 'stall' else NOW() + HOLD_MS, model)
     home = state.setdefault('chat_home', {})
-    own = home.get(key, {}).get('model', model)
-    pinned = (e.get(E_MODEL_SRC) == E_USER and bool(e.get(E_MODEL))) or e.get(E_PROFILE_SRC) == E_USER
-    tgt = health.target(own, avoid=(cur,) if cur else ())
+    own = p.get('own') or home.get(key, {}).get('model', selected)
+    tgt = (model + '@' + cur if p['kind'] == 'timeout' and cur and health.alive(cur, model)
+           else health.target(model if p['kind'] == 'timeout' else own,
+                              avoid=(cur,) if cur and p['kind'] != 'timeout' else ()))
     if not tgt:
         out['no_target'].append((key[-40:], own))
         return False                       # stays pending; the next minute asks again
+    # Probes can take minutes. Refresh both the exact run and user selection before any mutation.
+    latest = session(key) or {}
+    latest_e, queued = entry(key)
+    if not candidate_current(key, latest, latest_e, queued, run_id, p) or selection(latest_e) != selection(e):
+        journal('chat_skip', session=key, run=run_id, why='newer input, run or selection')
+        return True
+    p['own'], p['model'] = own, model
+    p.setdefault('selection', selection(e))
     res = {'patch': 'not needed', 'abort': 'not needed'}
-    if pinned:                             # an unpinned session rotates by itself once the stuck run is gone
+    if p['kind'] == 'stall' and not p.get('aborted'):
+        d, err = ({A_ABORTED_RUN: run_id, S_STATUS: S_ABORTED}, '') if (FAKE is not None or not APPLY) else \
+            gw(RPC_ABORT, ABORT_ARGS(key, run_id), 30)
+        if d and (d.get(A_ABORTED_RUN) != run_id or d.get(S_STATUS) != S_ABORTED):
+            journal('chat_skip', session=key, run=run_id, why='run no longer active at abort')
+            return True
+        res['abort'] = ('ok' if APPLY else 'dry-run') if d else err
+        if d:
+            p['aborted'] = True
+            save(state)
+            if FAKE is None and APPLY:
+                latest = session(key) or {}
+                latest_e, queued = entry(key)
+                if latest.get(S_ACTIVE):
+                    return False          # abort accepted; wait for old execution to settle
+                if not candidate_current(key, latest, latest_e, queued, run_id, p) or selection(latest_e) != selection(e):
+                    return True
+    if res['abort'] in ('ok', 'dry-run', 'not needed'):
+        # Bind the target even for a default-model session: abort alone can select the exhausted default again.
+        p['patch_target'] = tgt
+        save(state)
         d, err = (1, '') if (FAKE is not None or not APPLY) else gw(RPC_PATCH, PATCH_ARGS(key, tgt), 60)
         res['patch'] = ('ok' if APPLY else 'dry-run') if d else err
-    if p['kind'] == 'stall':
-        d, err = (1, '') if (FAKE is not None or not APPLY) else gw(RPC_ABORT, ABORT_ARGS(key, run_id), 30)
-        res['abort'] = ('ok' if APPLY else 'dry-run') if d else err
     if res['patch'] not in ('ok', 'dry-run', 'not needed') or res['abort'] not in ('ok', 'dry-run', 'not needed'):
         prob(out, 'chat_recover:' + run_id, 'chat %s: recovery failed %s' % (key[-40:], json.dumps(res)[:200]))
         journal('chat_recover', session=key, run=run_id, why=p['kind'], to=tgt, **res)
-        return True
-    if pinned and MODEL(tgt) != own:
-        park(state, 'chat_home', key, own, tgt)        # a fallback model is temporary: chats_home moves it back
-    elif pinned:
+        return False                      # retain pending and an accepted abort receipt across partial failure
+    if MODEL(tgt) != own:
+        if home.get(key, {}).get('parked') != tgt:
+            park(state, 'chat_home', key, own, tgt)    # a fallback model is temporary: chats_home moves it back
+    else:
         home.pop(key, None)
-    state['handled'][run_id] = NOW()
-    state['chat_hits'][key] = hits + [NOW()]
-    save(state)                            # before anything is sent: a pass killed below must not send twice
+    save(state)                            # preserve parking/abort state before launch
+    # Re-read after patch/abort, which can take time. A user arriving during recovery wins.
+    latest = session(key) or {}
+    latest_e, queued = entry(key)
+    latest_run, _ = terminal_state(latest, latest_e)
+    changed = newer_input(latest, latest_e, queued, p['t']) or not human_chat(key, latest, latest_e)
+    if p['kind'] != 'stall' and (latest.get(S_ACTIVE) or latest_run != run_id):
+        changed = True
+    if p['kind'] == 'stall' and FAKE is None and APPLY and not candidate_current(key, latest, latest_e, queued, run_id, p):
+        changed = True
     chat = has_chat(key, s)
     short = MODEL(tgt).split('/')[-1]
-    if queued or not chat:
-        res['continue'] = 'user already wrote' if queued else 'no chat'
+    if changed or not chat:
+        res['continue'] = 'user already wrote' if changed else 'no chat'
     else:
-        res['continue'], unit = continue_turn(key, short, MODEL(tgt) != model)   # the line is asked only for a new model
+        res['continue'], unit = continue_turn(key, short, MODEL(tgt) != model, p['kind'], run_id)
         if unit:
             state.setdefault('continued', {})[unit] = key
         if res['continue'] not in ('started', 'dry-run'):
             prob(out, 'continue:' + run_id, 'chat %s: could not start the continued turn: %s' % (key[-40:], res['continue'][:120]))
+            journal('chat_recover', session=key, run=run_id, why=p['kind'], to=tgt, **res)
+            return False
+    state['handled'][run_id] = NOW()
+    state['chat_hits'][key] = hits + [NOW()]
+    save(state)
     journal('chat_recover', session=key, run=run_id, why=p['kind'], frm=model + '@' + str(cur), to=tgt, **res)
     out['chats'].append((key[-40:], tgt))
     return True
 
 
 def chats_home(state, health, conf, out):
-    """A pinned chat parked on a fallback model goes back to its own model once an account of it answers."""
+    """A chat parked on a fallback model goes home, without disturbing active work or new input."""
     home = state.setdefault('chat_home', {})
     for key, h in list(home.items()):
         if not fits(60):
             break
-        e, _ = entry(key)
+        e, queued = entry(key)
+        s = session(key) or {}
+        if not s or not human_chat(key, s, e) or s.get(S_ACTIVE) or queued:
+            continue
         # sessions.patch to the config's primary model stores no modelOverride at all (it clears the field)
         cur = '%s/%s' % (e.get(E_PROVIDER), e.get(E_MODEL)) if e.get(E_MODEL) else conf['primary']
         if '%s@%s' % (cur, e.get(E_PROFILE)) != h['parked']:
@@ -990,6 +1161,10 @@ def chats_home(state, health, conf, out):
         tgt = health.target(h['model'], chain=False) if ripe(h) else None
         if not tgt:
             continue
+        fresh = session(key) or {}
+        fresh_e, queued = entry(key)
+        if not fresh or fresh.get(S_ACTIVE) or queued or fresh_e != e or not human_chat(key, fresh, fresh_e):
+            continue                      # a user choice or new run during the probe wins
         d, err = (1, '') if (FAKE is not None or not APPLY) else gw(RPC_PATCH, PATCH_ARGS(key, tgt), 60)
         journal('chat_return', session=key, frm=h['parked'], to=tgt, result='ok' if d else err)
         if d:
@@ -999,7 +1174,7 @@ def chats_home(state, health, conf, out):
             prob(out, 'chat_return:' + key, 'chat %s: could not move back to %s: %s' % (key[-40:], tgt, err[:120]))
 
 
-def key_of(rk, r):
+def key_of(rk, r, session_id=None, terminal=False):
     if not rk.get(r):
         for rec in log_lines(r):
             m = REQ_RE.search(rec.get(L2)) if isinstance(rec.get(L2), str) else None
@@ -1007,6 +1182,10 @@ def key_of(rk, r):
             if k:
                 rk[r] = k
                 break
+        if not rk.get(r) and session_id:
+            key = key_for_session(session_id, r if terminal else None)
+            if key:
+                rk[r] = key
     return rk.get(r)
 
 
@@ -1019,14 +1198,20 @@ def note_events(state, ev, jobs, health):
     for st in ev['stalls']:
         if st['key']:
             rk.setdefault(st['run'], st['key'])
-        pend[st['run']] = {'kind': 'stall', 't': st['t'], 'until': st['t'] + st['delay'], 'model': st['model']}
-        m = CRON_RE.match(key_of(rk, st['run']) or '')
+        pend[st['run']] = {'kind': 'stall', 't': st['t'], 'until': st['t'] + st['delay'], 'model': st['model'],
+                           'session_hint': st.get('session')}
+        m = CRON_RE.match(key_of(rk, st['run'], st.get('session')) or '')
         j = jobs.get(m.group(1)) if m else None
         if j and j['profile'] and j['since'] < st['t']:
             health.hold(j['profile'], min(st['t'] + st['delay'], NOW() + HOLD_MAX_MS), st['model'])
     for r, f in ev['failed'].items():
         if (pend.get(r) or {}).get('kind') != 'stall' and NOW() - f['t'] < FRESH_MS:
             pend[r] = {'kind': 'failed', 't': f['t'], 'until': f['t'] + WAIT_MS, 'model': f['model']}
+    for timeout in ev.get('timeouts', []):
+        if NOW() - timeout['t'] < FRESH_MS:
+            # A terminal timeout supersedes a previous rate-limit sleep, without inventing a quota hold.
+            pend[timeout['run']] = {'kind': 'timeout', 't': timeout['t'], 'until': timeout['t'] + WAIT_MS,
+                                    'session': timeout['session']}
 
 
 def stalls_and_chats(state, health, jobs, out):
@@ -1036,7 +1221,9 @@ def stalls_and_chats(state, health, jobs, out):
     for r, p in list(pend.items()):
         if late():
             break
-        key = key_of(rk, r)
+        key = key_of(rk, r, p.get('session') or p.get('session_hint'), p['kind'] == 'timeout')
+        if not key and r not in handled and NOW() <= p['until']:
+            continue                      # log may precede the terminal DB commit; resolve again next pass
         if r in handled or not key or not (CHAT_RE.match(key) or (CRON_RE.match(key) and p['kind'] == 'stall')):
             pend.pop(r, None)              # a cron run that FAILED on a limit is handled through its receipts
             continue
@@ -1054,8 +1241,14 @@ def stalls_and_chats(state, health, jobs, out):
         if not s:
             pend.pop(r, None)
             continue
+        e, queued = entry(key)
+        if CHAT_RE.match(key) and (not human_chat(key, s, e) or newer_input(s, e, queued, p['t'])):
+            if queued:
+                journal('chat_recover', session=key, run=r, why=p['kind'], **{'continue': 'user already wrote'})
+            pend.pop(r, None)
+            continue
         if p['kind'] == 'stall':
-            if not s.get(S_ACTIVE) or any(ts_ms(x) > p['t'] + 5000 for x in log_lines(r)):
+            if not p.get('aborted') and (not s.get(S_ACTIVE) or any(ts_ms(x) > p['t'] + 5000 for x in log_lines(r))):
                 pend.pop(r, None)                      # woke up, ended or was aborted
                 continue
             if CRON_RE.match(key):
@@ -1082,7 +1275,7 @@ def stalls_and_chats(state, health, jobs, out):
         else:
             if s.get(S_ACTIVE) or NOW() - p['t'] < 20_000:
                 continue                               # still rotating accounts; look again next minute
-            if s.get(S_LAST_RUN) != r or s.get(S_STATUS) != S_FAILED or not died_on_limit(r, p['t']):
+            if not candidate_current(key, s, e, queued, r, p):
                 pend.pop(r, None)                      # answered, a newer turn ran, or it failed for another reason
                 continue
         if recover_chat(state, health, key, s, r, p, out):
@@ -1124,7 +1317,8 @@ def check(state, out, jobs=None):
             s = session(key) or {}
         except RuntimeError:
             continue
-        if s.get(S_LAST_RUN) == r and s.get(S_STATUS) == S_FAILED and died_on_limit(r, t):
+        e, _ = entry(key)
+        if human_chat(key, s, e) and terminal_state(s, e) == (r, S_FAILED) and died_on_limit(r, t):
             prob(out, 'unanswered:' + r, 'chat %s: turn failed on a limit at %s UTC and is still unanswered'
                  % (key[-40:], time.strftime('%H:%M', time.gmtime(t / 1000))))
 
