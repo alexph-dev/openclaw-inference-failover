@@ -21,6 +21,10 @@ fixed, and delete the whole script when all of them are.
 - **Chats.** A chat turn that failed because every account of its pinned model was out is moved the same way and
   continued, unless the user already wrote again. The script sends nothing to a chat itself: the continuation prompt
   asks the agent to open its reply with one line, in the chat's own language, saying the chat moved to another model.
+- **WebChat and runtime timeouts.** Human main/dashboard sessions are included even without an external delivery
+  route. A confirmed embedded-run timeout can continue the unfinished work on the same healthy model/account; it is
+  not treated as a quota failure. The continuation identifies the interrupted run and reconciles completed actions
+  and uncertain side effects before doing more work, rather than replaying the request.
 - **Problems** it cannot fix (no live account anywhere, a run that may have acted before it died, a missing OpenClaw
   surface) fail the job run with the reason on stderr on two passes in a row, then stay quiet while open. It never
   fails every minute, so the scheduler does not disable it.
@@ -38,7 +42,7 @@ fixed, and delete the whole script when all of them are.
 | Job list, bindings, last-run state | documented CLI: `openclaw cron list --all --json` |
 | Failed runs and their errors | documented CLI: `openclaw cron runs --all --status error --limit 200 --json` (only when a job is in a fresh error streak) |
 | Rebinding and rerunning a job | documented CLI: `openclaw cron edit <id> --model`, `openclaw cron run <id>` |
-| Continuing a chat | documented CLI: `openclaw agent --session-key ... --deliver` |
+| Continuing a chat | documented CLI: `openclaw agent --session-key ...` (`--deliver` only for external chats) |
 | Account status | Gateway RPC `models.probe` |
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
 | Model, fallbacks, account order | config file (`~/.openclaw/openclaw.json`) |
@@ -88,7 +92,14 @@ Requirements and limits:
 - Pay-per-token accounts: an account declared in `auth.profiles` with mode `api_key` is used as a target only when
   `auth.order` lists it for its provider. Otherwise the script skips it and goes on to the fallback models. An
   account that is not declared in `auth.profiles` is treated as a subscription account.
-- Agent-to-agent (`a2a`) sessions are never continued.
+- Cron, agent-to-agent (`a2a`), subagent and worker sessions are not continued as human chats. Dashboard keys also
+  require a worker-metadata check; a remotely placed or spawned worker is not a browser conversation.
+- Before mutation, recovery refreshes the exact run, queued/newer input and model selection after account probes.
+  A live stall is aborted by exact run ID before a model patch. A deterministic retained systemd unit reconciles
+  uncertain continuation launches. These checks use the installed runtime's surfaces, not an atomic cross-RPC lock.
+- A temporarily selected fallback model returns to its original model only while the session is idle, its input
+  queue is empty, and the watchdog still owns the selection. Selecting the configured primary clears its model
+  override in OpenClaw, including when the original session inherited that default.
 - Times in the journal and in `--status` are the host's local time; set `TZ` on the job (`--command-env`) if needed.
 
 ## Use
@@ -109,6 +120,8 @@ Remove the job (`openclaw cron list` shows its id, then `openclaw cron rm <id>`)
 
 ## Status
 
-Tested with OpenClaw 2026.10.10. A temporary workaround: remove each part as its upstream issue is fixed.
+Original surface: OpenClaw 2026.10.10; human-session timeout and exact-run recovery receipts were checked against
+2026.11.3. Run the self-check on the executing install. A temporary workaround: remove each part as its upstream issue
+is fixed.
 
 License: MIT.

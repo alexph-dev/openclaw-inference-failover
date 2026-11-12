@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
 """Fixture tests for failover.py: no Gateway, no real edits, no messages.
 Run: python3 test_failover.py"""
-import json, os, pathlib, sqlite3, subprocess, sys, tempfile, time
+import functools, json, os, pathlib, sqlite3, subprocess, sys, tempfile, time
+from unittest.mock import patch
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
 import failover as F                                                  # names of the OpenClaw surface only
+
+
+def offline(test):
+    """Unit tests that mock APPLY must never write to the operator's actual state/journal."""
+    @functools.wraps(test)
+    def wrapped():
+        with tempfile.TemporaryDirectory(prefix='ocf-unit-') as tmp:
+            d = pathlib.Path(tmp)
+            with patch.object(F, 'SDIR', d), patch.object(F, 'STATE', d / 'state.json'), \
+                    patch.object(F, 'JOURNAL', d / 'journal.jsonl'):
+                return test()
+    return wrapped
 ERR = 'Automation candidate is incompatible with its recorded inference account and route.'
 OPUS, FABLE = 'anthropic/claude-opus-5-5', 'anthropic/claude-fable-5-2'
 PA, PB, PC = 'anthropic:a', 'anthropic:b', 'anthropic:c'
@@ -54,6 +67,19 @@ else:
 
 
 def setup(jobs=None, receipts=(), probe=None, sessions=None, entries=None, log=(), edited_ago=3600, sched=None):
+    sessions, entries = dict(sessions or {}), dict(entries or {})
+    for key in entries:
+        sessions.setdefault(key, {'key': key, 'hasActiveRun': False})
+    # Real active session entries expose the writer run even when describe omits activeRunIds/lastRunId.
+    for rec in log:
+        two, one = rec.get('2'), rec.get('1')
+        request = F.REQ_RE.search(two) if isinstance(two, str) else None
+        retry = F.RETRY_RE.search(one) if isinstance(one, str) else None
+        key_match = F.KEY_RE.search(one) if isinstance(one, str) else None
+        key, run = (request.group(1), request.group(2)) if request else \
+            (key_match.group(1), retry.group(3)) if retry and key_match else (None, None)
+        if key in sessions and sessions[key].get('hasActiveRun'):
+            entries[key] = dict(entries.get(key, {}), activeWriterRunId=run)
     d = pathlib.Path(tempfile.mkdtemp(prefix='ocf-test-'))
     c = sqlite3.connect(d / 'state.sqlite')
     c.execute('create table cron_jobs(job_id, job_json, enabled, state_json, updated_at)')
@@ -244,11 +270,11 @@ def test_failed_chat_all_accounts_dead_goes_down_the_chain():
     assert 'note' not in r                                            # the script itself sends nothing to a chat
 
 
-def test_unpinned_stalled_chat_is_only_aborted_and_continued():
+def test_unpinned_stalled_chat_applies_healthy_target_before_continuation():
     d = setup(log=[req(K, 'R3'), stall(OPUS, 'R3')], probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'ok'}},
               sessions={K: {'key': K, 'hasActiveRun': True}}, entries={K: {'authProfileOverride': PA, 'authProfileOverrideSource': 'auto'}})
     r, = kinds(go(d)[2], 'chat_recover')
-    assert (r['patch'], r['abort'], r['continue']) == ('not needed', 'ok', 'started'), r
+    assert (r['patch'], r['abort'], r['continue']) == ('ok', 'ok', 'started'), r
 
 
 def test_user_already_wrote_again():
@@ -647,6 +673,226 @@ def test_landed_edit_of_a_job_already_on_a_fallback_keeps_its_way_home():
 def test_agent_to_agent_sessions_are_not_chats():
     assert F.CHAT_RE.match('agent:main:telegram:direct:1') and F.CHAT_RE.match('agent:x:slack:channel:c1')
     assert not F.CHAT_RE.match('agent:main:a2a:direct:peer') and not F.CHAT_RE.match('agent:main:cron:j:run:s')
+
+
+WEB = 'agent:main:dashboard:00000000-0000-4000-8000-000000000001'
+
+
+def timeout_line(run='timeout-run', session_id='session-1', ago=40):
+    return line('embedded run timeout: runId=%s sessionId=%s timeoutMs=899999' % (run, session_id), ago=ago)
+
+
+def test_main_and_webchat_stalls_continue_locally_without_a_delivery_route():
+    for key in ('agent:main:main', WEB):
+        d = setup(log=[req(key, 'human-run'), stall(FABLE, 'human-run')],
+                  probe={'anthropic': {PB: 'rate_limit', PA: 'ok'}},
+                  sessions={key: {'key': key, 'hasActiveRun': True}}, entries={key: PIN})
+        r, = kinds(go(d)[2], 'chat_recover')
+        assert (r['patch'], r['abort'], r['continue'], r['to']) == ('ok', 'ok', 'started', FABLE + '@' + PA), r
+        assert len(kinds(go(d)[2], 'chat_recover')) == 1
+
+
+def test_timeout_without_provider_error_resolves_session_and_preserves_healthy_route():
+    e = dict(PIN, sessionId='session-1', lastRunId='timeout-run', status='timeout')
+    d = setup(log=[timeout_line()], probe={'anthropic': {PA: 'ok', PB: 'ok'}},
+              sessions={WEB: {'hasActiveRun': False}}, entries={WEB: e})
+    r, = kinds(go(d)[2], 'chat_recover')
+    assert (r['why'], r['to'], r['abort'], r['continue']) == ('timeout', FABLE + '@' + PB, 'not needed', 'started'), r
+    state = json.loads((d / 'st' / 'state.json').read_text())
+    assert not state['limited'], state
+    assert len(kinds(go(d)[2], 'chat_recover')) == 1
+
+
+def test_timeout_terminal_receipt_must_match_and_no_new_input_or_later_progress():
+    for changes, queued, extra in [({'status': 'aborted'}, False, []),
+                                   ({'status': 'done'}, False, []),
+                                   ({'lastRunId': 'newer-run'}, False, []),
+                                   ({'lastInteractionAt': ms()}, False, []),
+                                   ({}, True, []),
+                                   ({}, False, [line({'runId': 'timeout-run', 'milestone': 'tool_execution_started'}, ago=5)]),
+                                   ({}, False, [line('embedded run aborted runId=timeout-run', ago=5)])]:
+        e = dict(PIN, sessionId='session-1', lastRunId='timeout-run', status='timeout', **{})
+        e.update(changes)
+        d = setup(log=[timeout_line()] + extra, probe={'anthropic': {PB: 'ok'}},
+                  sessions={WEB: {'hasActiveRun': False}}, entries={WEB: e})
+        fake(d, queued={WEB: queued})
+        assert not [r for r in kinds(go(d)[2], 'chat_recover') if r.get('patch')], (changes, queued, extra)
+        assert not json.loads((d / 'st' / 'state.json').read_text())['limited']
+
+
+def test_tool_timeout_is_not_a_runtime_timeout_and_old_runtime_timeout_is_not_replayed():
+    for event in [line('exec tool timeout after 30s runId=timeout-run'), timeout_line(ago=3600)]:
+        d = setup(log=[event], probe={'anthropic': {PB: 'ok'}},
+                  sessions={WEB: {'hasActiveRun': False}},
+                  entries={WEB: dict(PIN, sessionId='session-1', lastRunId='timeout-run', status='timeout')})
+        assert not kinds(go(d)[2], 'chat_recover')
+
+
+def test_worker_dashboard_and_internal_keys_are_not_human_chats():
+    for key in ('agent:main:cron:x:run:y', 'agent:main:a2a:direct:peer',
+                'agent:main:subagent:worker', 'agent:main:worker:direct:peer', 'agent:main:heartbeat'):
+        assert not F.human_chat(key), key
+    for metadata in ({'spawnedCwd': '/worktrees/worker'}, {'worktree': {'id': 'worker'}},
+                     {'placement': {'providerId': 'device'}}, {'placement': {'environmentId': 'worker:worker'}},
+                     {'spawnedBy': 'agent:main:main'}, {'spawnDepth': 1}, {'isBackground': True}):
+        assert not F.human_chat(WEB, metadata)
+        assert not F.human_chat(WEB, {}, metadata)
+        d = setup(log=[req(WEB, 'worker-run'), stall(FABLE, 'worker-run')],
+                  probe={'anthropic': {PB: 'rate_limit', PA: 'ok'}},
+                  sessions={WEB: dict(metadata, hasActiveRun=True)}, entries={WEB: PIN})
+        assert not kinds(go(d)[2], 'chat_recover'), metadata
+    assert F.human_chat(WEB, {'placement': {'state': 'local'}, 'spawnDepth': 0})
+    assert F.human_chat(WEB, {'placement': None, 'spawnDepth': None})
+
+
+def test_timeout_session_resolver_reads_database_and_rejects_ambiguous_or_wrong_run():
+    d = setup()
+    db = d / 'oc/agents/main/agent/openclaw-agent.sqlite'
+    c = sqlite3.connect(db)
+    e = {'sessionId': 'sid', 'lastRunId': 'run'}
+    c.execute('insert into session_nodes values(?,?)', (WEB, json.dumps(e)))
+    c.commit()
+    with patch.object(F, 'FAKE', None), patch.dict(os.environ, OCF_AGENT_DB='file:%s?mode=ro' % db):
+        assert F.key_for_session('sid', 'run') == WEB
+        assert F.key_for_session('sid', 'old') is None
+        c.execute('insert into session_nodes values(?,?)', ('agent:main:main', json.dumps(e)))
+        c.commit()
+        assert F.key_for_session('sid', 'run') is None
+    c.close()
+
+
+def recovery_fixture(kind='stall'):
+    run = 'original-run'
+    e = dict(PIN, sessionId='sid', activeWriterRunId=run)
+    s = {'hasActiveRun': kind == 'stall', 'lastRunId': run, 'status': 'timeout' if kind == 'timeout' else 'failed'}
+    p = {'kind': kind, 't': ms() - 40_000, 'until': ms() + 3600_000, 'model': FABLE}
+    state = {'handled': {}, 'pending': {run: p}}
+    health = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'paid': []})
+    out = {'problems': [], 'chats': [], 'no_target': []}
+    return run, e, s, p, state, health, out
+
+
+@offline
+def test_new_input_or_model_choice_during_probe_prevents_all_mutation():
+    for change in ('queued', 'new-run', 'model'):
+        run, e, s, p, state, health, out = recovery_fixture()
+        fresh_e = dict(e, modelOverride='new-model') if change == 'model' else dict(e)
+        fresh_s = dict(s, hasActiveRun=True, activeRunIds=['new-run']) if change == 'new-run' else s
+        if change == 'new-run':
+            fresh_e['activeWriterRunId'] = 'new-run'
+        with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+                patch.object(F, 'entry', side_effect=[(e, False), (fresh_e, change == 'queued')]), \
+                patch.object(F, 'session', return_value=fresh_s), patch.object(F, 'log_lines', return_value=[]), \
+                patch.object(health, 'target', return_value=FABLE + '@' + PA), patch.object(F, 'gw') as mutate:
+            assert F.recover_chat(state, health, WEB, s, run, p, out)
+            mutate.assert_not_called()
+
+
+@offline
+def test_abort_is_exact_and_precedes_patch_and_partial_failure_stays_pending():
+    run, e, s, p, state, health, out = recovery_fixture()
+    stopped = {'hasActiveRun': False, 'lastRunId': run, 'status': 'aborted'}
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+            patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', side_effect=[s, stopped]), \
+            patch.object(F, 'log_lines', return_value=[]), patch.object(F, 'save'), \
+            patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+            patch.object(F, 'gw', side_effect=[({'status': 'aborted', 'abortedRunId': run}, ''), (None, 'patch failed')]) as mutate:
+        assert not F.recover_chat(state, health, WEB, s, run, p, out)
+        assert [c.args[0] for c in mutate.call_args_list] == [F.RPC_ABORT, F.RPC_PATCH]
+        assert mutate.call_args_list[0].args[1] == {'key': WEB, 'runId': run}
+        assert p['aborted'] and run not in state['handled'] and run in state['pending']
+
+
+@offline
+def test_abort_no_active_run_never_patches_or_continues():
+    run, e, s, p, state, health, out = recovery_fixture()
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+            patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', return_value=s), \
+            patch.object(F, 'log_lines', return_value=[]), patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+            patch.object(F, 'gw', return_value=({'status': 'no-active-run', 'abortedRunId': None}, '')) as mutate, \
+            patch.object(F, 'continue_turn') as send:
+        assert F.recover_chat(state, health, WEB, s, run, p, out)
+        assert mutate.call_count == 1 and mutate.call_args.args[0] == F.RPC_ABORT
+        send.assert_not_called()
+
+
+def test_continuation_prompt_reconciles_side_effects_and_local_route_and_launch_identity():
+    calls = []
+    def launch(argv, timeout):
+        calls.append(argv)
+        return 0, '', ''
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), patch.object(F, 'run', side_effect=launch):
+        first = F.continue_turn(WEB, 'test-model', True, 'timeout', 'interrupted-run')
+        assert F.continue_turn(WEB, 'test-model', True, 'timeout', 'interrupted-run') == first
+        F.continue_turn(K, 'test-model', True, 'failed', 'another-run')
+    local, external = calls[0], calls[2]
+    assert '--deliver' not in local and '--deliver' in external
+    assert local[local.index('--session-key') + 1] == WEB
+    assert not any(flag in local for flag in ('--reply-to', '--reply-channel', '--to'))
+    prompt = local[local.index('--message') + 1]
+    assert 'interrupted-run' in prompt and 'runtime timeout' in prompt and 'usage limit' not in prompt
+    assert 'reconcile completed tool actions and delivery receipts' in prompt
+    assert 'Do not replay the entire request' in prompt and 'Verify uncertain side effects' in prompt
+    assert 'RemainAfterExit=yes' in local and '--no-block' in local
+
+
+def test_uncertain_continuation_launch_adopts_existing_deterministic_unit():
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+            patch.object(F, 'run', side_effect=[(1, '', 'transport lost'), (0, 'loaded\n', '')]):
+        result, unit = F.continue_turn(WEB, 'test-model', False, 'timeout', 'interrupted-run')
+        assert result == 'started' and unit.startswith('ocf-continue-')
+
+
+def test_chat_return_does_not_touch_active_or_queued_sessions():
+    parked = {'providerOverride': 'xai', 'modelOverride': 'grok-4.7', 'authProfileOverride': 'xai:x'}
+    for active, queued in ((True, False), (False, True)):
+        d = setup(probe={'anthropic': {PA: 'ok'}}, entries={WEB: parked},
+                  sessions={WEB: {'hasActiveRun': active}})
+        fake(d, queued={WEB: queued})
+        (d / 'st').mkdir()
+        (d / 'st/state.json').write_text(json.dumps({'chat_home': {WEB: {'model': OPUS, 'parked': 'xai/grok-4.7@xai:x'}}}))
+        assert not kinds(go(d)[2], 'chat_return')
+
+
+def test_unpinned_default_fallback_returns_to_primary_even_when_override_was_absent():
+    key = 'agent:main:main'
+    d = setup(log=[req(key, 'default-run'), stall(OPUS, 'default-run')],
+              probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}},
+              sessions={key: {'hasActiveRun': True}}, entries={key: {'authProfileOverride': PA}})
+    r, = kinds(go(d)[2], 'chat_recover')
+    assert r['to'] == 'xai/grok-4.7@xai:x' and r['patch'] == 'ok'
+    state = json.loads((d / 'st/state.json').read_text())
+    assert state['chat_home'][key]['model'] == OPUS
+    fake(d, probe={'anthropic': {PB: 'ok'}, 'xai': {'xai:x': 'ok'}},
+         sessions={key: {'hasActiveRun': False}},
+         entries={key: {'providerOverride': 'xai', 'modelOverride': 'grok-4.7', 'authProfileOverride': 'xai:x'}})
+    returned, = kinds(go(d, True)[2], 'chat_return')
+    # sessions.patch(primary@profile) clears modelOverride in OpenClaw; no permanent fallback pin remains.
+    assert returned['to'] == OPUS + '@' + PB
+
+
+@offline
+def test_partial_recovery_retry_never_holds_the_new_healthy_target_or_loses_failed_launch():
+    run, e, s, p, state, health, out = recovery_fixture()
+    p.update(aborted=True, profile=PB, own=FABLE, patch_target=FABLE + '@' + PA,
+             selection=[e.get(f) for f in (F.E_MODEL, F.E_PROVIDER, F.E_MODEL_SRC, F.E_PROFILE, F.E_PROFILE_SRC)])
+    e['authProfileOverride'] = PA
+    s.update(hasActiveRun=False, status='aborted')
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+            patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', return_value=s), \
+            patch.object(F, 'log_lines', return_value=[]), patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+            patch.object(F, 'gw', return_value=({'ok': True}, '')) as mutate, \
+            patch.object(F, 'continue_turn', return_value=('rc=1 launch failed', None)):
+        assert not F.recover_chat(state, health, WEB, s, run, p, out)
+        assert mutate.call_count == 1 and mutate.call_args.args[0] == F.RPC_PATCH
+        assert health.held(PB, FABLE) and not health.held(PA, FABLE)
+        assert run not in state['handled'] and run in state['pending']
+
+
+def test_stalled_run_identity_prefers_current_writer_over_old_lifecycle():
+    assert not F.active_run({'hasActiveRun': True}, {'activeWriterRunId': 'new', 'lifecycleRunId': 'old'}, 'old')
+    assert not F.active_run({'hasActiveRun': True}, {}, 'old')
+    assert F.active_run({'hasActiveRun': True, 'activeRunIds': ['old']}, {}, 'old')
 
 
 if __name__ == '__main__':
