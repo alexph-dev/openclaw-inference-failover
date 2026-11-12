@@ -8,7 +8,9 @@ Run once a minute by an OpenClaw command job.
          answers. A job that lost a run to the limit and is not due again within 30 min is run once after the move.
   stalls a run sleeping out a long same-model rate-limit wait is aborted; a chat is then continued; a recurring job is
          rerun as above. One-shot (at) jobs are never aborted: an abort disables them silently, their timeout is
-         retried by the scheduler on the new binding.
+         retried by the scheduler on the new binding. A stalled chat run that already ended (aborted or failed, with no
+         progress after the wait began) is a limit death too: the chat is moved and continued the same way, without an
+         abort. A run that woke up and went on, or one a person stopped in the chat, is left alone.
   chats  a chat turn that failed on a limit (all accounts of a pinned model out) is moved the same way and continued
          unless the user already wrote again. The continuation prompt asks the agent to open its reply with one line,
          in the chat's own language, saying the chat moved to another model or account.
@@ -70,6 +72,8 @@ S_FAILED = 'failed'                                                 # session st
 S_TIMEOUT, S_ID = 'timeout', 'sessionId'                             # explicit runtime timeout; persisted session id
 S_WRITER, S_LIFECYCLE, S_ACTIVE_IDS = 'activeWriterRunId', 'lifecycleRunId', 'activeRunIds'
 S_INTERACTION, S_ABORTED, A_ABORTED_RUN = 'lastInteractionAt', 'aborted', 'abortedRunId'
+S_KILLED = 'killed'                                                 # session status of an aborted run (the abort RPC answers 'aborted')
+S_STOPPED = (S_ABORTED, S_KILLED)                                   # terminal status after an abort, either wording
 S_PLACEMENT, S_BACKGROUND, S_DEPTH = 'placement', 'isBackground', 'spawnDepth'
 P_PROVIDER, P_ENV, WORKER_PROVIDER, WORKER_ENV = 'providerId', 'environmentId', 'device', 'worker:'
 WORKER_FIELDS = ('spawnedCwd', 'worktree', 'spawnedBy')               # worker/subagent metadata (also on dashboard keys)
@@ -102,6 +106,9 @@ TIMEOUT_RE = re.compile(r'embedded run timeout: runId=([^\s]+) sessionId=([^\s]+
 REQ_RE = re.compile(r'Model request failed sessionKey="([^"]+)" runId="([^"]+)"')   # a failed model request -> session
 REQ_N_RE = re.compile(r'requestNumber=(\d+)')                       # how far into the run that request was
 KEY_RE = re.compile(r'sessionKey[=:\s\\"]+(agent:[^"\\\s,]+)')         # session key inside any log line
+HAND_STOP_RE = re.compile(r'\b(?:chat\.abort requested|sessions\.abort requested: actor=(?!cli\b))')
+                                                                    # a person pressed stop (Control UI logs sessions.abort,
+                                                                    # actor=openclaw-control-ui). actor=cli is this script.
 ANCHORS = ('transient same-model retry', 'Model request failed', EV_END, TIMEOUT_ANCHOR)   # self-check anchors
 ANCHOR_DIRS = ('dist', 'node_modules/@openclaw/ai/dist')            # where the anchors live in the package
 # Session keys
@@ -944,7 +951,7 @@ def reconcile_chat_abort(state, key, s, e, run_id, p):
     last, status = terminal_state(s, e)
     if (p['kind'] == 'stall' and not p.get('aborted') and intent.get('session') and
             intent == {'key': key, 'session': sid, 'run': run_id} and
-            not s.get(S_ACTIVE) and last == run_id and status == S_ABORTED):
+            not s.get(S_ACTIVE) and last == run_id and status in S_STOPPED):
         p['aborted'] = True
         save(state)
 
@@ -954,15 +961,41 @@ def candidate_current(key, s, e, queued, run_id, p):
         return False
     if p.get('session') and (s.get(S_ID) or e.get(S_ID)) != p['session']:
         return False                     # same key, different session incarnation
-    last, status = terminal_state(s, e)
     if p['kind'] == 'stall':
-        if p.get('aborted'):
-            return not s.get(S_ACTIVE) and last == run_id and status == S_ABORTED
-        return active_run(s, e, run_id) and not any(ts_ms(x) > p['t'] + 5000 for x in log_lines(run_id))
+        return stall_state(s, e, run_id, p) in ('live', 'ended')
+    last, status = terminal_state(s, e)
     if s.get(S_ACTIVE) or last != run_id:
         return False
     return (status == S_TIMEOUT and died_on_timeout(run_id, p['t'])) if p['kind'] == 'timeout' else \
         (status == S_FAILED and died_on_limit(run_id, p['t']))
+
+
+def stall_state(s, e, run_id, p):
+    """Where a stalled chat run is now. 'live': still sleeping out the limit wait. 'ended': it ended on the limit, by
+    our abort, by another abort or by a failure, with no progress after the wait began. 'ending': it is being stopped;
+    look again next pass. None: it woke up and went on, finished, was stopped by a person, or a newer run took over."""
+    last, status = terminal_state(s, e)
+    if active_run(s, e, run_id):
+        if p.get('aborted'):
+            return 'ending'                    # our abort was accepted; the run has not settled yet
+        if not any(ts_ms(x) > p['t'] + 5000 for x in log_lines(run_id)):
+            return 'live'
+        return 'ending' if died_on_limit(run_id, p['t']) else None
+    if s.get(S_ACTIVE) or last != run_id or status not in S_STOPPED + (S_FAILED,):
+        return None                            # a newer run, or it finished (a timeout has its own event)
+    if p.get('aborted'):
+        return 'ended'
+    # Someone else's abort or a failure: the run's own lines after the wait show how it ended.
+    if not any(ts_ms(x) > p['t'] for x in log_lines(run_id)) or stopped_by_hand(run_id, p['t']) \
+            or not died_on_limit(run_id, p['t']):
+        return None
+    return 'ended'
+
+
+def stopped_by_hand(run_id, t):
+    """A person pressed stop in a chat for this run at or after t: an intentional stop, not a limit death."""
+    return any(ts_ms(x) >= t and any(isinstance(x.get(k), str) and HAND_STOP_RE.search(x[k]) for k in (L1, L2))
+               for x in log_lines(run_id))
 
 
 def died_on_limit(run_id, t):
@@ -1061,8 +1094,11 @@ def recover_chat(state, health, key, s, run_id, p, out):
         journal('chat_recover', session=key, run=run_id, why=p['kind'], **{'continue': 'user already wrote'})
         return True
     reconcile_chat_abort(state, key, s, e, run_id, p)
+    # A stalled run that is still being stopped is looked at again next pass; anything else that is not this exact
+    # turn any more is finished here.
+    stopping = lambda ses, ent: p['kind'] == 'stall' and stall_state(ses, ent, run_id, p) == 'ending'
     if not candidate_current(key, s, e, queued, run_id, p):
-        return True
+        return not stopping(s, e)
     if not p.get('session') and (s.get(S_ID) or e.get(S_ID)):
         p['session'] = s.get(S_ID) or e.get(S_ID)
     selection = lambda data: [data.get(f) for f in (E_MODEL, E_PROVIDER, E_MODEL_SRC, E_PROFILE, E_PROFILE_SRC)]
@@ -1089,12 +1125,15 @@ def recover_chat(state, health, key, s, run_id, p, out):
     latest = session(key) or {}
     latest_e, queued = entry(key)
     if not candidate_current(key, latest, latest_e, queued, run_id, p) or selection(latest_e) != selection(e):
+        if selection(latest_e) == selection(e) and stopping(latest, latest_e):
+            return False
         journal('chat_skip', session=key, run=run_id, why='newer input, run or selection')
         return True
     p['own'], p['model'] = own, model
     p.setdefault('selection', selection(e))
     res = {'patch': 'not needed', 'abort': 'not needed'}
-    if p['kind'] == 'stall' and not p.get('aborted'):
+    # Abort only a run that is still sleeping out the wait; a stall that already ended is moved and continued as is.
+    if p['kind'] == 'stall' and not p.get('aborted') and active_run(latest, latest_e, run_id):
         p['abort_intent'] = {'key': key, 'session': p.get('session'), 'run': run_id}
         save(state)                       # write-ahead intent survives a lost RPC receipt or process exit
         d, err = ({A_ABORTED_RUN: run_id, S_STATUS: S_ABORTED}, '') if (FAKE is not None or not APPLY) else \
@@ -1112,6 +1151,12 @@ def recover_chat(state, health, key, s, run_id, p, out):
                 if latest.get(S_ACTIVE):
                     return False          # abort accepted; wait for old execution to settle
                 if not candidate_current(key, latest, latest_e, queued, run_id, p) or selection(latest_e) != selection(e):
+                    # The abort landed but the stored status is not 'killed'/'aborted' yet. Leaving it pending
+                    # is what lets the next pass move the chat; marking it handled here is the drop this fixes.
+                    last, status = terminal_state(latest, latest_e)
+                    if p.get('aborted') and selection(latest_e) == selection(e) and last in (run_id, None) \
+                            and status not in S_STOPPED + (S_FAILED,):
+                        return False
                     return True
     if res['abort'] in ('ok', 'dry-run', 'not needed'):
         # Bind the target even for a default-model session: abort alone can select the exhausted default again.
@@ -1155,7 +1200,7 @@ def recover_chat(state, health, key, s, run_id, p, out):
             prob(out, 'continue:' + run_id, 'chat %s: could not start the continued turn: %s' % (key[-40:], res['continue'][:120]))
             journal('chat_recover', session=key, run=run_id, why=p['kind'], to=tgt, **res)
             return False
-    state['handled'][run_id] = NOW()
+    state['handled'][run_id] = {'t': NOW()}
     state['chat_hits'][key] = hits + [NOW()]
     save(state)
     journal('chat_recover', session=key, run=run_id, why=p['kind'], frm=model + '@' + str(cur), to=tgt, **res)
@@ -1234,8 +1279,47 @@ def note_events(state, ev, jobs, health):
                                     'session': timeout['session']}
 
 
+def reopen_old(state):
+    """handled[run] is {'t': time}, written once this script finished the run's event. Older versions wrote a bare
+    time, also for a stalled chat they skipped after misreading the status of their own abort ('killed', not
+    'aborted'), so that chat was never moved. Once per old record: a chat stall still in the current logs and in its
+    wait, with no completed chat_recover in the journal, goes back to pending and is checked like a new event (a turn
+    answered or moved since shows a newer run or input there). Every other old record is kept as finished."""
+    handled = state.setdefault('handled', {})
+    old = {r for r, h in handled.items() if not isinstance(h, dict)}
+    if not old:
+        return
+    done = set()
+    for f in (JOURNAL.with_suffix('.jsonl.1'), JOURNAL):
+        for raw in (f.read_text(errors='ignore').splitlines() if f.exists() else []):
+            try:
+                rec = json.loads(raw)
+            except Exception:
+                continue
+            if rec.get('kind') == 'chat_recover' and rec.get('frm'):     # only a completed recovery names 'frm'
+                done.add(rec.get('run'))
+    stalls = {}
+    for rec in log_lines(ANCHORS[0]):                                     # oldest first: the latest wait wins
+        m = RETRY_RE.search(rec[L1]) if isinstance(rec.get(L1), str) else None
+        if m and m.group(3) in old and m.group(3) not in done and int(m.group(2)) >= STALL_MS \
+                and ts_ms(rec) + int(m.group(2)) > NOW():
+            stalls[m.group(3)] = {'kind': 'stall', 't': ts_ms(rec), 'until': ts_ms(rec) + int(m.group(2)),
+                                  'model': m.group(1), 'session_hint': m.group(4)}
+    pend, rk = state.setdefault('pending', {}), state.setdefault('run_key', {})
+    for r, p in stalls.items():
+        key = key_of(rk, r, p['session_hint'])
+        if key and CHAT_RE.match(key):
+            handled.pop(r)
+            pend.setdefault(r, p)
+            journal('chat_reopen', session=key, run=r, why='an older version marked it handled without moving it')
+    for r in old:
+        if r in handled:
+            handled[r] = {'t': handled[r]}
+
+
 def stalls_and_chats(state, health, jobs, out):
     """Pending limit events: stalled runs (chat or cron) and chat turns that died on a limit."""
+    reopen_old(state)
     pend, handled = state.setdefault('pending', {}), state.setdefault('handled', {})
     rk, req = state.setdefault('run_key', {}), state.setdefault('run_req', {})
     for r, p in list(pend.items()):
@@ -1270,7 +1354,13 @@ def stalls_and_chats(state, health, jobs, out):
         if p['kind'] == 'stall':
             if CHAT_RE.match(key):
                 reconcile_chat_abort(state, key, s, e, r, p)
-            if not p.get('aborted') and (not s.get(S_ACTIVE) or any(ts_ms(x) > p['t'] + 5000 for x in log_lines(r))):
+                st = stall_state(s, e, r, p)
+                if st == 'ending':
+                    continue                           # being stopped: its end shows next pass
+                if st is None:
+                    pend.pop(r, None)                  # woke up, finished, stopped by a person, or a newer run
+                    continue
+            elif not p.get('aborted') and (not s.get(S_ACTIVE) or any(ts_ms(x) > p['t'] + 5000 for x in log_lines(r))):
                 pend.pop(r, None)                      # woke up, ended or was aborted
                 continue
             if CRON_RE.match(key):
@@ -1278,7 +1368,7 @@ def stalls_and_chats(state, health, jobs, out):
                 j = jobs.get(jid) or {}
                 if not fits(30):
                     continue
-                handled[r] = NOW()
+                handled[r] = {'t': NOW()}
                 pend.pop(r, None)
                 if j.get('kind') == 'at':              # an abort disables a one-shot job without a notice; its
                     journal('cron_stall_left', session=key, run=r, why='one-shot job: timeout retry runs on the new binding')
@@ -1301,7 +1391,7 @@ def stalls_and_chats(state, health, jobs, out):
                 pend.pop(r, None)                      # answered, a newer turn ran, or it failed for another reason
                 continue
         if recover_chat(state, health, key, s, r, p, out):
-            handled[r] = NOW()
+            handled[r] = {'t': NOW()}
             pend.pop(r, None)
     for d in (handled, rk, req):
         for k in list(d)[:-300]:
@@ -1340,7 +1430,9 @@ def check(state, out, jobs=None):
         except RuntimeError:
             continue
         e, _ = entry(key)
-        if human_chat(key, s, e) and terminal_state(s, e) == (r, S_FAILED) and died_on_limit(r, t):
+        last_run, status = terminal_state(s, e)
+        if human_chat(key, s, e) and last_run == r and status in S_STOPPED + (S_FAILED,) and died_on_limit(r, t) \
+                and not stopped_by_hand(r, t):
             prob(out, 'unanswered:' + r, 'chat %s: turn failed on a limit at %s UTC and is still unanswered'
                  % (key[-40:], time.strftime('%H:%M', time.gmtime(t / 1000))))
 

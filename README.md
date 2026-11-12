@@ -17,7 +17,10 @@ fixed, and delete the whole script when all of them are.
   another model is temporary: the job goes back to its own model once an account of it answers again. A job that lost
   a run to the limit before it did anything, and is not due again within 30 minutes, is run once after the move.
 - **Stalled runs.** A run that sleeps out a long same-model rate-limit wait is aborted. A chat is then continued; a
-  recurring job is rerun as above. One-shot (`at`) jobs are never aborted.
+  recurring job is rerun as above. One-shot (`at`) jobs are never aborted. A stalled chat run that already ended
+  before the pass saw it (aborted, status `killed` or `aborted`, or failed, with no progress after the wait began) is
+  a limit death too: the chat is moved and continued the same way, without an abort. A run that woke up and went on,
+  or one a person stopped in the chat, is left alone.
 - **Chats.** A chat turn that failed because every account of its pinned model was out is moved the same way and
   continued, unless the user already wrote again. The script sends nothing to a chat itself: the continuation prompt
   asks the agent to open its reply with one line, in the chat's own language, saying the chat moved to another model.
