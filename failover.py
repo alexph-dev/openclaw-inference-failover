@@ -9,6 +9,9 @@ whole account: a probe that answers ok for one model says nothing about another 
          temporary: the job goes back to its own model once an account of it is live again. A job is never rerun.
   chats  a pinned human chat (a model or account the user chose, or this script set) is moved the same way on the same
          passes, whatever its runs did.
+  strict chats  session keys listed in OCF_STRICT_CHATS (comma-separated) never change model: they move only to
+         another account of their own model. While no account of it is live the chat is left alone, and a turn that
+         died on a limit waits like any other (then is a problem); it is continued only on its own model.
   stalls a run sleeping out a long same-model rate-limit wait is aborted, and its model@account is held until the time
          the provider named. One-shot (at) jobs are never aborted: an abort disables them silently, their timeout is
          retried by the scheduler on the new binding. An aborted cron run is not replayed.
@@ -134,6 +137,7 @@ PROBE_EVERY_MS = 5 * 60_000    # accounts are asked at least this often while an
 CHECK_EVERY_MS = 30 * 60_000   # cadence of the 24 h check inside --apply passes
 FRESH_MS = 20 * 60_000         # a failed chat turn older than this when first seen is not continued
 WAIT_MS = 2 * 3600_000         # a failed chat turn waits this long for any live account, then is a problem
+STRICT = frozenset(k.strip() for k in os.environ.get('OCF_STRICT_CHATS', '').split(',') if k.strip())
 STALL_MS = 300_000             # same-model retry waits above 5 min are the #143274 stall
 PASS_SOFT_S = 200              # no new Gateway call is started after this
 PASS_HARD_S = int(os.environ.get('OCF_PASS_HARD_S', 270))   # a running call is cut off here: the job's own timeout is 300 s
@@ -1011,8 +1015,8 @@ def chat_plan(state, health, key, e, unknown_dead=False):
         home.pop(key)                      # the user chose something else since: that choice stands
     own = home.get(key, {}).get('model', model)
     needed = health.dead(acct, model) if acct else unknown_dead
-    return {'ref': ref, 'own': own, 'needed': needed,
-            'tgt': health.target(own, avoid=(acct,) if acct else ()) if needed else None}
+    return {'ref': ref, 'own': own, 'needed': needed, 'strict': key in STRICT,   # strict: its own model only
+            'tgt': health.target(own, avoid=(acct,) if acct else (), chain=key not in STRICT) if needed else None}
 
 
 def move_chat(state, key, plan, e, out, why):
@@ -1058,7 +1062,8 @@ def chats_pass(state, health, out):
                 continue
             plan = chat_plan(state, health, key, e)
             if not plan['tgt']:
-                out['no_target'].append((key[-40:], plan['own']))
+                if not plan['strict']:         # a strict chat waiting for its own model is expected, not a problem
+                    out['no_target'].append((key[-40:], plan['own']))
                 continue
             fresh, (fresh_e, _) = session(key) or {}, entry(key)   # probes take time: a new run or choice wins
         except RuntimeError:
@@ -1145,7 +1150,8 @@ def recover_chat(state, health, key, s, run_id, p, out):
         health.hold(p['profile'], p['until'] if p['kind'] == 'stall' else NOW() + HOLD_MS, p['model'])
     plan = chat_plan(state, health, key, e, unknown_dead=True)
     if plan['needed'] and not plan['tgt']:
-        out['no_target'].append((key[-40:], plan['own']))
+        if not plan['strict']:
+            out['no_target'].append((key[-40:], plan['own']))
         return False                       # stays pending and a sleeping run is not aborted; the next minute asks again
     # Probes can take minutes: read the chat again before any change. A user turn, a newer run or a choice wins.
     latest = session(key) or {}
