@@ -830,6 +830,23 @@ def test_abort_no_active_run_never_patches_or_continues():
         send.assert_not_called()
 
 
+@offline
+def test_abort_accepted_before_status_is_stored_stays_pending():
+    # The abort RPC succeeded, but the session row is not 'killed' yet. Marking it handled here drops the move.
+    run, e, s, p, state, health, out = recovery_fixture()
+    unsettled = {'hasActiveRun': False, 'lastRunId': run, 'status': 'running'}
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+            patch.object(F, 'entry', return_value=(e, False)), \
+            patch.object(F, 'session', side_effect=[s, unsettled]), \
+            patch.object(F, 'log_lines', return_value=[]), patch.object(F, 'save'), \
+            patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+            patch.object(F, 'gw', return_value=({'status': 'aborted', 'abortedRunId': run}, '')) as mutate, \
+            patch.object(F, 'continue_turn') as send:
+        assert not F.recover_chat(state, health, WEB, s, run, p, out)
+        assert [c.args[0] for c in mutate.call_args_list] == [F.RPC_ABORT]
+        send.assert_not_called()
+        assert p['aborted'] and run not in state['handled'] and run in state['pending']
+
 
 @offline
 def test_abort_intent_recovers_lost_receipt_and_process_interruption_once():
@@ -969,6 +986,122 @@ def test_stalled_run_identity_prefers_current_writer_over_old_lifecycle():
     assert not F.active_run({'hasActiveRun': True}, {'activeWriterRunId': 'new', 'lifecycleRunId': 'old'}, 'old')
     assert not F.active_run({'hasActiveRun': True}, {}, 'old')
     assert F.active_run({'hasActiveRun': True, 'activeRunIds': ['old']}, {}, 'old')
+
+
+def aborted_lines(run, key=K, ago=25, by='sessions.abort', actor='cli'):
+    """What the Gateway logs when a run is stopped: who asked for it, then the turn's lane error."""
+    return [line('%s requested: actor=%s device=d ip=i conn=c session=%s runId=%s' % (by, actor, key, run), ago=ago),
+            line({'errorName': 'AbortError', 'taskKind': 'turn', 'sessionKey': key, 'runId': run},
+                 'lane task error: lane=main durationMs=25000 error="aborted | agent run aborted"', ago=ago)]
+
+
+def killed(run):
+    """Session row after an abort: OpenClaw stores the end as 'killed' (the abort RPC itself answers 'aborted')."""
+    return {'key': K, 'hasActiveRun': False, 'lastRunId': run, 'status': 'killed', 'abortedLastRun': True}
+
+
+ONE_LIVE = {'anthropic': {PB: 'rate_limit', PA: 'ok', PC: 'rate_limit'}}
+
+
+def test_stall_aborted_before_the_pass_is_moved_and_continued_without_another_abort():
+    # Fallbacks are off for a pinned model: the run sleeps out an 87 h wait and is aborted within seconds. The pin
+    # stays on the limited model and the turn is unanswered.
+    log = [req(K, 'D1'), end('D1'), stall(FABLE, 'D1', delay=313935000)] + aborted_lines('D1')
+    d = setup(log=log, probe=ONE_LIVE, sessions={K: dict(killed('D1'), hasActiveRun=True)}, entries={K: PIN})
+    j = go(d)[2]                                                      # still stopping: wait for its end, keep it
+    assert not kinds(j, 'chat_recover') and 'D1' in json.loads((d / 'st' / 'state.json').read_text())['pending'], j
+    fake(d, sessions={K: killed('D1')})
+    r, = kinds(go(d)[2], 'chat_recover')
+    assert (r['why'], r['frm'], r['to'], r['patch'], r['abort'], r['continue']) == \
+        ('stall', FABLE + '@' + PB, FABLE + '@' + PA, 'ok', 'not needed', 'started'), r
+    state = json.loads((d / 'st' / 'state.json').read_text())
+    assert state['limited'].get(FABLE + '@' + PB, 0) > ms() and 'D1' not in state['pending'], state
+    assert len(kinds(go(d)[2], 'chat_recover')) == 1                  # handled once
+
+
+def test_stall_an_older_version_marked_handled_without_moving_it_is_recovered_next_pass():
+    # State left by a pass that misread 'killed': run in handled, nothing journaled, the log already read.
+    log = [req(K, 'D2'), end('D2'), stall(FABLE, 'D2', delay=313935000)] + aborted_lines('D2')
+    for proof in (False, True):
+        d = setup(log=log, probe=ONE_LIVE, sessions={K: killed('D2')}, entries={K: PIN})
+        f = d / 'logs' / 'openclaw-2026-01-01.log'
+        (d / 'st').mkdir()
+        (d / 'st' / 'state.json').write_text(json.dumps({
+            'started': 0, 'handled': {'D2': ms() - 30_000, 'OTHER': ms() - 60_000},
+            'offsets': {str(f): f.stat().st_size}, 'run_key': {'D2': K}}))
+        if proof:                                                     # the journal shows a completed recovery
+            (d / 'st' / 'journal.jsonl').write_text(json.dumps({
+                'kind': 'chat_recover', 'run': 'D2', 'frm': FABLE + '@' + PB, 'to': FABLE + '@' + PA,
+                'patch': 'ok', 'continue': 'started'}) + '\n')
+        j = go(d)[2]
+        state = json.loads((d / 'st' / 'state.json').read_text())
+        assert all(isinstance(h, dict) for h in state['handled'].values()), state['handled']
+        if proof:
+            assert len(kinds(j, 'chat_recover')) == 1 and not kinds(j, 'chat_reopen'), j    # only the old line
+            continue
+        r, = kinds(j, 'chat_recover')
+        assert (r['run'], r['to'], r['patch'], r['abort'], r['continue']) == \
+            ('D2', FABLE + '@' + PA, 'ok', 'not needed', 'started'), r
+        assert len(kinds(go(d)[2], 'chat_recover')) == 1
+
+
+def test_stall_that_woke_up_or_was_stopped_by_a_person_is_left_alone():
+    went_on = line({'runId': 'D3', 'milestone': 'model_call_started'}, 'agent turn milestone', ago=20)
+    done = line({'runId': 'D3', 'runStatus': 'completed', 'outcome': 'sent'}, 'recorded run outcome', ago=10)
+    for active, status, later in ((False, 'done', [went_on, done]),                   # woke up and answered
+                                  (False, 'killed', [went_on] + aborted_lines('D3', ago=10)),   # went on, then stopped
+                                  (False, 'killed', aborted_lines('D3', by='chat.abort')),     # a person pressed stop
+                                  (False, 'killed', aborted_lines('D3', actor='openclaw-control-ui')),  # Control UI Stop
+                                  (True, None, [went_on])):                           # woke up, still working
+        ses = {'key': K, 'hasActiveRun': active, 'lastRunId': 'D3', 'status': status}
+        d = setup(log=[req(K, 'D3'), end('D3'), stall(FABLE, 'D3')] + later, probe=ONE_LIVE,
+                  sessions={K: ses}, entries={K: PIN})
+        j = go(d)[2]
+        state = json.loads((d / 'st' / 'state.json').read_text())
+        assert not kinds(j, 'chat_recover') and 'D3' not in state['pending'] and not state['limited'], (status, j)
+
+
+def test_check_reports_a_turn_killed_after_a_limit_that_is_still_unanswered():
+    d = setup(log=[req(K, 'D4', 3600), end('D4', 3600)] + aborted_lines('D4', ago=3590), probe=ONE_LIVE,
+              sessions={K: killed('D4')}, entries={K: PIN})
+    rc, err, j = go(d)
+    assert not kinds(j, 'chat_recover') and rc == 1 and 'still unanswered' in err, (rc, err)
+
+
+@offline
+def test_ended_stall_is_patched_and_continued_without_an_abort_call():
+    run, e, s, p, state, health, out = recovery_fixture()
+    ended = dict(s, hasActiveRun=False, status='killed')
+    later = [line('sessions.abort requested: actor=cli session=%s runId=%s' % (WEB, run), ago=5)]
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+            patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', return_value=ended), \
+            patch.object(F, 'log_lines', return_value=later), \
+            patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+            patch.object(F, 'gw', return_value=({'ok': True}, '')) as mutate, \
+            patch.object(F, 'continue_turn', return_value=('started', None)) as send:
+        assert F.recover_chat(state, health, WEB, ended, run, p, out)
+        assert [c.args[0] for c in mutate.call_args_list] == [F.RPC_PATCH]
+        send.assert_called_once()
+        assert run in state['handled'] and health.held(PB, FABLE)
+
+
+@offline
+def test_stall_being_stopped_by_someone_else_during_the_probe_waits_for_its_end():
+    run, e, s, p, state, health, out = recovery_fixture()
+    later = [line('sessions.abort requested: actor=cli session=%s runId=%s' % (WEB, run), ago=5)]
+    seen = []
+    def lines(run_id):                                                # quiet at the first look, stopping after the probe
+        seen.append(run_id)
+        return [] if len(seen) == 1 else later
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+            patch.object(F, 'entry', return_value=(e, False)), patch.object(F, 'session', return_value=s), \
+            patch.object(F, 'log_lines', side_effect=lines), \
+            patch.object(health, 'target', return_value=FABLE + '@' + PA), \
+            patch.object(F, 'gw') as mutate, patch.object(F, 'continue_turn') as send:
+        assert F.recover_chat(state, health, WEB, s, run, p, out) is False
+        mutate.assert_not_called()
+        send.assert_not_called()
+        assert run not in state['handled']
 
 
 if __name__ == '__main__':
