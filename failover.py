@@ -53,7 +53,9 @@ LIST_MORE = 'hasMore'                                               # true when 
 JOB_F = {'id': 'id', 'enabled': 'enabled', 'name': 'name',          # per job in cron list
          'model': 'payload.model',                                  #   binding 'provider/model@account'
          'kind': 'schedule.kind', 'mode': 'scheduledToolPolicy.mode', 'next': 'state.nextRunAtMs',
-         'last': 'state.lastRunStatus', 'last_at': 'state.lastRunAtMs', 'streak': 'state.consecutiveErrors'}
+         'last': 'state.lastRunStatus', 'last_at': 'state.lastRunAtMs', 'streak': 'state.consecutiveErrors',
+         'pkind': 'payload.kind'}                                   #   'agentTurn' for AI jobs (command jobs have no account)
+AGENT_TURN = 'agentTurn'
 JOB_REQUIRED = ('id', 'enabled', 'model', 'kind', 'next', 'mode')   # fields every job list must show somewhere
 JOB_REQUIRED_RUN = ('last', 'streak')                               # and these once any job has run (shows 'last_at')
 JOB_TRUSTED = 'trusted'                                             # scheduledToolPolicy.mode of an operator job
@@ -82,6 +84,10 @@ AGENT_DB_PATH = 'agents/{agent}/agent/openclaw-agent.sqlite'        # under the 
 T_NODES, C_NODE_KEY, C_NODE_ENTRY = 'session_nodes', 'session_key', 'entry_json'           # session entry per key
 T_PENDING, C_PEND_KEY, C_PEND_STATE = 'session_pending_inputs', 'session_key', 'state'     # input waiting for a session
 PEND_QUEUED = 'queued'                                              # state of a user message not yet answered
+# Cron store (a job's recorded account when payload.model names no account: cron list does not show it)
+STATE_DB_PATH = 'state/openclaw.sqlite'                             # under the OpenClaw state dir
+T_CRON, C_CRON_ID, C_CRON_JSON = 'cron_jobs', 'job_id', 'job_json'  # one row per job
+JOB_BINDING = 'inferenceBinding.profileId'                          # the account the job is bound to
 E_MODEL, E_PROVIDER, E_MODEL_SRC = 'modelOverride', 'providerOverride', 'modelOverrideSource'   # entry_json keys
 E_PROFILE, E_PROFILE_SRC, E_USER = 'authProfileOverride', 'authProfileOverrideSource', 'user'   # 'user' = pinned by hand
 # Config file
@@ -557,6 +563,15 @@ def selfcheck():
                 c.close()
             except sqlite3.Error as e:
                 miss.append('table: agent %s database not readable (%s)' % (aid, e))
+        try:
+            c = sqlite3.connect(os.environ.get('OCF_STATE_DB') or 'file:%s?mode=ro' % (OC_DIR / STATE_DB_PATH), uri=True)
+            have = {r[1] for r in c.execute('pragma table_info(%s)' % T_CRON)}
+            c.close()
+            for col in (C_CRON_ID, C_CRON_JSON):
+                if col not in have:
+                    miss.append('table: %s.%s (cron store)' % (T_CRON, col))
+        except sqlite3.Error as e:
+            miss.append('table: cron store %s not readable (%s)' % (STATE_DB_PATH, e))
 
     def logs_ok():
         if not log_files():
@@ -607,25 +622,59 @@ def cron_errors():
     return d[RUNS_LIST]
 
 
+CRON_STORE_ERR = []                       # a failed read of the cron store this pass, raised as a problem by main
+
+
+def cron_bindings():
+    """{job id: recorded account} from the cron store, read-only, for jobs whose payload.model names no account."""
+    uri = os.environ.get('OCF_STATE_DB') or 'file:%s?mode=ro' % (OC_DIR / STATE_DB_PATH)
+    try:
+        c = sqlite3.connect(uri, uri=True)
+        try:
+            rows = c.execute('select %s, %s from %s' % (C_CRON_ID, C_CRON_JSON, T_CRON)).fetchall()
+        finally:
+            c.close()
+    except sqlite3.Error as e:            # only these jobs go unwatched; jobs naming their account and chats carry on
+        CRON_STORE_ERR.append('cron store %s not readable: %s' % (STATE_DB_PATH, str(e)[:120]))
+        return {}
+    out = {}
+    for jid, j in rows:
+        try:
+            p = dig(json.loads(j or '{}'), JOB_BINDING.split('.'))
+        except ValueError:
+            continue
+        if isinstance(p, str) and p:
+            out[jid] = p
+    return out
+
+
 def load_jobs(state):
     """Jobs with their binding (payload.model = 'provider/model@account') and per model@account the limit failures in a
     row. A failure from before the job's last rebinding belongs to the previous binding; the time of a rebinding is this
     script's own record (state 'bindings'), not the job's updated time."""
     seen, now = state.setdefault('bindings', {}), NOW()
     start = state.setdefault('started', now)   # first pass ever: history from before it was not watched by this script
-    jobs = {}
+    jobs, bound = {}, None
     for d in cron_jobs():
         f = lambda k: dig(d, JOB_F[k].split('.'))
         jid, ref = f('id'), f('model')
         if not jid:
             raise Shape('openclaw %s: a job without "%s"' % (' '.join(CLI_JOBS), JOB_F['id']))
+        profile = None
+        if ref and '@' in ref:
+            profile = PROF(ref)
+        elif ref or f('pkind') == AGENT_TURN:   # bound to an account without naming it: the cron store records it
+            bound = cron_bindings() if bound is None else bound
+            profile = bound.get(jid)
+        full = ref if ref and '@' in ref else \
+            ('%s@%s' % (MODEL(ref) if ref else cfg()['primary'], profile) if profile else ref)   # model@account
         rec = seen.get(jid)
-        if not rec or rec.get('model') != ref:   # first sight, or rebound by someone else since
+        if not rec or rec.get('model') != full:  # first sight, or rebound by someone else since (model or account)
             # t: when the job was last rebound (0 = unknown). Failures and stalls from before t, or from before this
             # script's first pass, do not count against the current binding.
-            rec = seen[jid] = {'model': ref, 't': 0 if not rec else now}
-        jobs[jid] = {'enabled': bool(f('enabled')), 'name': f('name') or '', 'model': ref,
-                     'profile': PROF(ref) if ref and '@' in ref else None, 'since': max(rec['t'], start),
+            rec = seen[jid] = {'model': full, 't': 0 if not rec else now}
+        jobs[jid] = {'enabled': bool(f('enabled')), 'name': f('name') or '', 'model': ref, 'profile': profile,
+                     'ref': full if profile else None, 'since': max(rec['t'], start),
                      'mode': f('mode'), 'next': f('next') or 0, 'kind': f('kind'),
                      'last': f('last'), 'last_at': f('last_at') or 0, 'streak_n': f('streak') or 0, 'errors': []}
     for k in [k for k in seen if k not in jobs and not jobs_partial()]:
@@ -647,7 +696,7 @@ def streaks(jobs):
     the same account are another streak: a limit on one model is not a limit on the account."""
     last_ok, ev = {}, {}
     for j in jobs.values():
-        p = j['model'] if j['profile'] else None
+        p = j['ref'] if j['profile'] else None    # model@account, also when payload.model names no account
         if not p:
             continue
         if j['last'] == 'ok' and j['last_at'] >= j['since']:
@@ -754,7 +803,7 @@ def jobs_pass(conf, jobs, health, state, t0, out):
                 park(state, 'home', jid, own, tgt)
             else:
                 home.pop(jid, None)
-            j['profile'], j['model'], j['since'] = PROF(tgt), tgt, NOW()
+            j['profile'], j['model'], j['ref'], j['since'] = PROF(tgt), tgt, tgt, NOW()
             if r == 'ok':
                 state.setdefault('bindings', {})[jid] = {'model': tgt, 't': j['since']}
             save(state)                      # a pass cut off later must still know where this job came from
@@ -1354,7 +1403,7 @@ def check(state, out, jobs=None):
     streak = streaks(jobs)
     for ref, n in streak.items():
         if n >= 2:
-            names = [j['name'][:30] for j in jobs.values() if j['enabled'] and j['model'] == ref][:3]
+            names = [j['name'][:30] for j in jobs.values() if j['enabled'] and j['ref'] == ref][:3]
             prob(out, 'streak:' + ref, 'jobs on %s keep failing on a limit after their last edit (%s)' % (ref, ', '.join(names)))
     died, keys = {}, {}
     for f in log_files():
@@ -1467,7 +1516,10 @@ def main():
         state.pop(k, None)     # an older version's rerun bookkeeping
     ev, streak, health = {'providers': set()}, {}, Health(conf, limited)
     try:
+        del CRON_STORE_ERR[:]
         jobs, streak = load_jobs(state)
+        for e in CRON_STORE_ERR[:1]:
+            prob(out, 'cron-store', e + '; jobs whose model names no account are not watched')
         if jobs_partial():
             prob(out, 'partial', 'the job list has more than one page (%d jobs shown); jobs beyond it are not watched'
                  % len(jobs))
