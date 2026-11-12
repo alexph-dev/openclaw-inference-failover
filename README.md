@@ -12,31 +12,37 @@ fixed, and delete the whole script when all of them are.
 
 ## What it does
 
-- **Cron jobs.** A job bound to an account that is out of limit is rebound to the same model on a live account, or,
-  if no account of that model is live, to the first live entry of `agents.defaults.model.fallbacks`. A move to
-  another model is temporary: the job goes back to its own model once an account of it answers again. A job that lost
-  a run to the limit before it did anything, and is not due again within 30 minutes, is run once after the move.
-- **Stalled runs.** A run that sleeps out a long same-model rate-limit wait is aborted. A chat is then continued; a
-  recurring job is rerun as above. One-shot (`at`) jobs are never aborted. A stalled chat run that already ended
-  before the pass saw it (aborted, status `killed` or `aborted`, or failed, with no progress after the wait began) is
-  a limit death too: the chat is moved and continued the same way, without an abort. A run that woke up and went on,
-  or one a person stopped in the chat, is left alone.
-- **Chats.** A chat turn that failed because every account of its pinned model was out is moved the same way and
-  continued, unless the user already wrote again. The script sends nothing to a chat itself: the continuation prompt
-  asks the agent to open its reply with one line, in the chat's own language, saying the chat moved to another model.
-- **WebChat and runtime timeouts.** Human main/dashboard sessions are included even without an external delivery
-  route. A confirmed embedded-run timeout can continue the unfinished work on the same healthy model/account; it is
-  not treated as a quota failure. The continuation identifies the interrupted run and reconciles completed actions
-  and uncertain side effects before doing more work, rather than replaying the request.
-- **Problems** it cannot fix (no live account anywhere, a run that may have acted before it died, a missing OpenClaw
-  surface) fail the job run with the reason on stderr on two passes in a row, then stay quiet while open. It never
-  fails every minute, so the scheduler does not disable it.
+A limit is always one model on one account (model@account), never a whole account: a probe that answers ok for one
+model says nothing about another model on that account. Targets are only the accounts that `auth.order` lists for a
+provider, in that order, and then the entries of `agents.defaults.model.fallbacks`.
+
+- **Cron jobs.** A job whose model@account is held or probed out is rebound to the same model on the next live account
+  of `auth.order`, or, if no account of that model is live, to the first live fallback entry. A move to another model
+  is temporary: the job goes back to its own model once an account of it is live again and not held for it. The script
+  never runs a job: the next scheduled run uses the new binding.
+- **Pinned chats.** A chat whose model or account was chosen by hand (OpenClaw applies no fallbacks to it), or that the
+  script parked on a fallback model, is moved the same way, on the same passes, whenever its model@account is held or
+  probed out. What its runs did is not consulted. A chat with a run in progress is moved once that run is over.
+- **Stalled runs.** A run that sleeps out a long same-model rate-limit wait is aborted, and that model@account is held
+  until the time the provider named. One-shot (`at`) jobs are never aborted. An aborted cron run is not replayed.
+- **Turns that died on a limit.** A human chat turn whose run died on a limit is continued on a live model@account
+  (the chat is moved first by the same rule, also when OpenClaw chose its account), unless the user already wrote
+  again or a person stopped the run (a Control UI stop or `chat.abort`). One log test decides a limit death: the limit
+  was the run's last word in the Gateway log; the session's status word is not read. A turn that merely timed out is
+  not continued. Human main/dashboard sessions are included even without an external delivery route. The script sends
+  nothing to a chat itself: the continuation prompt asks the agent to open its reply with one line, in the chat's own
+  language, saying the chat moved to another model, and to reconcile completed actions and uncertain side effects
+  before doing more work, rather than replaying the request. Every limit event the script drops is journaled
+  (`event_drop`) with the reason.
+- **Problems** it cannot fix (no live account anywhere, a missing OpenClaw surface) fail the job run with the reason on
+  stderr on two passes in a row, then stay quiet while open. It never fails every minute, so the scheduler does not
+  disable it.
 
 | Part of the script | Upstream issue it works around |
 |---|---|
-| Rebinding cron jobs to a live account (`jobs_pass`, `rerun_lost`) | [openclaw/openclaw#192009](https://github.com/openclaw/openclaw/issues/192009): a cron job stays bound to one exhausted account |
-| Moving and continuing failed chats (`recover_chat`, `chats_home`) | [openclaw/openclaw#151980](https://github.com/openclaw/openclaw/issues/151980): a chat with a user-selected model does not follow fallbacks |
-| Aborting stalled runs (`stalls_and_chats`) | [openclaw/openclaw#168101](https://github.com/openclaw/openclaw/issues/168101), [openclaw/openclaw#179962](https://github.com/openclaw/openclaw/issues/179962): a run waits for hours for the rate limit to reset |
+| Rebinding cron jobs to a live account (`jobs_pass`) | [openclaw/openclaw#192009](https://github.com/openclaw/openclaw/issues/192009): a cron job stays bound to one exhausted account |
+| Moving pinned chats and continuing turns that died on a limit (`chats_pass`, `recover_chat`, `chats_home`) | [openclaw/openclaw#151980](https://github.com/openclaw/openclaw/issues/151980): a chat with a user-selected model does not follow fallbacks |
+| Aborting stalled runs (`stalls_and_chats`, `cron_stall`) | [openclaw/openclaw#168101](https://github.com/openclaw/openclaw/issues/168101), [openclaw/openclaw#179962](https://github.com/openclaw/openclaw/issues/179962): a run waits for hours for the rate limit to reset |
 
 ## What it reads
 
@@ -44,12 +50,12 @@ fixed, and delete the whole script when all of them are.
 |---|---|
 | Job list, bindings, last-run state | documented CLI: `openclaw cron list --all --json` |
 | Failed runs and their errors | documented CLI: `openclaw cron runs --all --status error --limit 200 --json` (only when a job is in a fresh error streak) |
-| Rebinding and rerunning a job | documented CLI: `openclaw cron edit <id> --model`, `openclaw cron run <id>` |
+| Rebinding a job | documented CLI: `openclaw cron edit <id> --model` |
 | Continuing a chat | documented CLI: `openclaw agent --session-key ...` (`--deliver` only for external chats) |
 | Account status | Gateway RPC `models.probe` |
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
-| Model, fallbacks, account order | config file (`~/.openclaw/openclaw.json`) |
-| A chat's pinned model/account and queued input | internal: tables `session_nodes` and `session_pending_inputs` in each agent database (read-only) |
+| Model, fallbacks, account order (the only targets) | config file (`~/.openclaw/openclaw.json`) |
+| Chats' pinned model/account and queued input | internal: tables `session_nodes` and `session_pending_inputs` in each agent database (read-only) |
 | Stalls and failed turns | internal: Gateway log lines (`/tmp/openclaw*/openclaw-*.log`) |
 
 Everything that depends on the OpenClaw version (CLI arguments, JSON field names, RPC names, table and column names,
@@ -92,9 +98,12 @@ Requirements and limits:
   Linux with a user systemd session. Without it the chat is still moved, and the failed start is reported.
 - `openclaw cron list` returns one page of 200 jobs and has no paging option. With more jobs the script reports it
   and watches only the first page.
-- Pay-per-token accounts: an account declared in `auth.profiles` with mode `api_key` is used as a target only when
-  `auth.order` lists it for its provider. Otherwise the script skips it and goes on to the fallback models. An
-  account that is not declared in `auth.profiles` is treated as a subscription account.
+- Targets: an account is chosen only when `auth.order` lists it for its provider, whatever the probe reports about it
+  and however it is billed. A provider without an `auth.order` entry has no target; work that can go nowhere else is
+  reported as having no live account.
+- Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
+  a failure that named no time. A probe that answers ok (it tests another model) does not end a hold, and nothing
+  moves back onto a model while it is held there. `--status` lists the holds.
 - Cron, agent-to-agent (`a2a`), subagent and worker sessions are not continued as human chats. Dashboard keys also
   require a worker-metadata check; a remotely placed or spawned worker is not a browser conversation.
 - Before mutation, recovery refreshes the exact run, queued/newer input and model selection after account probes.
@@ -103,8 +112,9 @@ Requirements and limits:
   systemd unit reconciles uncertain continuation launches. The final read and CLI continuation admission are separate:
   these checks are not an atomic cross-RPC lock, so a newer user turn can still arrive in that interval.
 - A temporarily selected fallback model returns to its original model only while the session is idle, its input
-  queue is empty, and the watchdog still owns the selection. Selecting the configured primary clears its model
-  override in OpenClaw, including when the original session inherited that default.
+  queue is empty, the watchdog still owns the selection, and the original model is not held on that account. Selecting
+  the configured primary clears its model override in OpenClaw, including when the original session inherited that
+  default.
 - Times in the journal and in `--status` are the host's local time; set `TZ` on the job (`--command-env`) if needed.
 
 ## Use
@@ -113,7 +123,8 @@ Requirements and limits:
 - `failover.py --apply`: one real pass (what the job runs).
 - `failover.py --check`: self-check plus a check of the last 24 hours; prints `{"openclaw": version, "missing": [...]}`
   and exits 1 with problems.
-- `failover.py --status`: open problems, held accounts, and jobs and chats parked on a fallback model, as JSON.
+- `failover.py --status`: open problems, held model@account pairs, and jobs and chats parked on a fallback model, as
+  JSON.
 
 Tests: `python3 test_failover.py`. They use a fake `openclaw` and fixture files and never touch a Gateway.
 
@@ -125,8 +136,7 @@ Remove the job (`openclaw cron list` shows its id, then `openclaw cron rm <id>`)
 
 ## Status
 
-Original surface: OpenClaw 2026.10.10; human-session timeout and exact-run recovery receipts were checked against
-2026.11.3. Run the self-check on the executing install. A temporary workaround: remove each part as its upstream issue
-is fixed.
+Original surface: OpenClaw 2026.10.10; exact-run recovery receipts were checked against 2026.11.3. Run the self-check
+on the executing install. A temporary workaround: remove each part as its upstream issue is fixed.
 
 License: MIT.
