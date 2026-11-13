@@ -1218,6 +1218,23 @@ def test_job_bound_to_an_account_without_naming_it_moves_too():
     assert (m['job'], m['to']) == ('u', OPUS + '@' + PB), (err, j)
 
 
+
+def test_stalled_subagent_run_is_aborted_not_moved_or_continued():
+    # A subagent sleeping out a 2-day retry: its parent must get the failure now. Not continued, not moved.
+    S = 'agent:main:subagent:00000000-0000-4000-8000-000000000009'
+    d = setup(log=[req(S, 'R9'), stall(OPUS, 'R9', key=S, delay=211552000)],
+              probe={'anthropic': {PB: 'rate_limit', PA: 'rate_limit', PC: 'rate_limit'}},
+              sessions={S: {'key': S, 'hasActiveRun': True, 'lastRunId': 'R9'}},
+              entries={S: {'providerOverride': 'anthropic', 'modelOverride': 'claude-opus-5-5', 'authProfileOverride': PA}})
+    rc, err, j = go(d, True)
+    held = json.loads((d / 'st' / 'state.json').read_text())['limited']
+    assert OPUS + '@' + PA in held, held                                # its route stays out until the provider's time
+    a, = kinds(j, 'subagent_stall_abort')
+    assert a['session'] == S and a['result'] == 'ok', (err, j)
+    assert not kinds(j, 'chat_recover') and not kinds(j, 'chat_move'), j
+    assert len(kinds(go(d, True)[2], 'subagent_stall_abort')) == 1      # handled once (the journal accumulates)
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:

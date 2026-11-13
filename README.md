@@ -29,7 +29,9 @@ provider, in that order, and then the entries of `agents.defaults.model.fallback
   limit waits as any other does: it is continued only on an account of its own model, and becomes a problem if none
   is live in time. Use it for conversations that must only ever run on one model.
 - **Stalled runs.** A run that sleeps out a long same-model rate-limit wait is aborted, and that model@account is held
-  until the time the provider named. One-shot (`at`) jobs are never aborted. An aborted cron run is not replayed.
+  until the time the provider named. One-shot (`at`) jobs are never aborted. An aborted cron run is not replayed. A
+  subagent's stalled run is aborted too, so its parent sees it end as killed now instead of days later; it is not
+  moved or continued, because the parent chose its model.
 - **Turns that died on a limit.** A human chat turn whose run died on a limit is continued on a live model@account
   (the chat is moved first by the same rule, also when OpenClaw chose its account), unless the user already wrote
   again or a person stopped the run (a Control UI stop or `chat.abort`). One log test decides a limit death: the limit
