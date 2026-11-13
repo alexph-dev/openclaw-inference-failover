@@ -116,6 +116,7 @@ ANCHOR_DIRS = ('dist', 'node_modules/@openclaw/ai/dist')            # where the 
 CHAT_RE = re.compile(r'^agent:[^:]+:(?:main$|dashboard:[^:]+$|(?!a2a:|cron:|subagent:|worker:)[^:]+:(?:group|direct|channel):)')  # human keys; metadata is checked too
 LOCAL_CHAT_RE = re.compile(r'^agent:[^:]+:(?:main$|dashboard:[^:]+$)')
 GROUP_RE = re.compile(r'^agent:[^:]+:[^:]+:(group|channel):')        # a chat session that is a group or channel
+SUB_RE = re.compile(r'^agent:[^:]+:subagent:')                       # a subagent session (its parent waits for it)
 CRON_RE = re.compile(r'^agent:[^:]+:cron:([0-9a-f-]{36}):run:')      # a cron run session -> job id
 # Error wording. LIMIT_RE: OpenClaw's and the providers' own limit wording only ("quota exceeded" or "429" also appear
 # in business errors). Name and pattern are used by other scripts that import this file.
@@ -1311,7 +1312,7 @@ def note_events(state, ev, jobs, health):
     for p, key, old in new:
         if old.get('ref'):                 # the same run seen again: it was on the route noted the first time
             p.update({k: old[k] for k in ('ref', 'profile', 'session') if k in old})
-        elif key and CHAT_RE.match(key):
+        elif key and (CHAT_RE.match(key) or SUB_RE.match(key)):
             e, _ = entry(key)
             p['profile'], p['ref'] = e.get(E_PROFILE), '%s@%s' % chat_ref(health.conf, e)
 
@@ -1343,9 +1344,12 @@ def stalls_and_chats(state, health, jobs, out):
                 continue                      # log may precede the terminal DB commit; resolve again next pass
             drop_event(pend, r, p, None, 'no session found for the run')
             continue
-        cron = CRON_RE.match(key)
-        if not cron and not CHAT_RE.match(key):
-            drop_event(pend, r, p, key, 'neither a human chat nor a cron run')
+        cron, sub = CRON_RE.match(key), SUB_RE.match(key)
+        if sub and p['kind'] != 'stall':
+            drop_event(pend, r, p, key, 'a subagent run that failed on a limit: its parent sees the failure')
+            continue
+        if not cron and not sub and not CHAT_RE.match(key):
+            drop_event(pend, r, p, key, 'neither a human chat, a subagent nor a cron run')
             continue
         if cron and p['kind'] != 'stall':
             drop_event(pend, r, p, key, 'a cron run that failed on a limit: its job is rebound, not rerun')
@@ -1367,6 +1371,8 @@ def stalls_and_chats(state, health, jobs, out):
             continue
         if cron:
             cron_stall(state, jobs, key, cron.group(1), s, r, p, out)
+        elif sub:
+            sub_stall(state, health, key, s, r, p, out)
         elif recover_chat(state, health, key, s, r, p, out):
             pend.pop(r, None)
     for d in (handled, rk):
@@ -1395,6 +1401,28 @@ def cron_stall(state, jobs, key, jid, s, r, p, out):
     out['aborted'].append(key[-50:])
     if not d:
         prob(out, 'abort:' + r, 'could not abort stalled cron run %s: %s' % (key[-50:], err[:120]))
+
+
+def sub_stall(state, health, key, s, r, p, out):
+    """A subagent run sleeping out a long rate-limit wait is aborted, so its parent gets the failure now instead of
+    when the wait ends (hours or days later) and can act on it. It is not continued or moved: the parent chose its
+    model, and the model@account stays held until the time the provider named."""
+    pend, handled = state['pending'], state['handled']
+    if not s.get(S_ACTIVE) or any(ts_ms(x) > p['t'] + 5000 for x in log_lines(r)):
+        return drop_event(pend, r, p, key, 'the subagent run woke up or ended')
+    if not fits(30):
+        return
+    handled[r] = {'t': NOW()}
+    pend.pop(r, None)
+    if p.get('profile'):                   # the route it slept on stays out until the provider's time
+        health.hold(p['profile'], p['until'], p['model'])
+    d, err = ({A_ABORTED_RUN: r}, '') if (FAKE is not None or not APPLY) else gw(RPC_ABORT, ABORT_ARGS(key, r), 30)
+    if d and d.get(A_ABORTED_RUN) != r:    # it ended meanwhile: nothing was aborted
+        return journal('subagent_stall_abort', session=key, run=r, wait_ms=p['until'] - p['t'], result='no-active-run')
+    journal('subagent_stall_abort', session=key, run=r, wait_ms=p['until'] - p['t'], result='ok' if d else err)
+    out['aborted'].append(key[-50:])
+    if not d:
+        prob(out, 'abort:' + r, 'could not abort stalled subagent run %s: %s' % (key[-50:], err[:120]))
 
 
 def check(state, out, jobs=None):
