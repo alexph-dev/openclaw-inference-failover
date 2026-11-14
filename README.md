@@ -118,10 +118,15 @@ Requirements and limits:
   in the agent's saved auth store (`openclaw models status --json`, field `auth.oauth.profiles`), each once, `oauth`
   first. `models status` is run at most once per pass and only when such a provider is needed; only the profile id,
   provider and type are read, never the labels (they show masked keys and emails). If it fails, the config profiles
-  are the targets and the failure is reported as a problem. OpenClaw breaks ties by last use; this script prefers no
-  account, so that order stands. An `api_key` profile is billed per token and is a target only when `auth.order`
-  lists it. An order saved with `openclaw models auth order set` is not read: profiles it leaves out probe
-  `unknown` and are never chosen. Work that can go nowhere else is reported as having no live account.
+  are the targets and the failure is reported as a problem. A provider whose saved types disagree with the store's
+  per-type counts (a plugin credential can override the reported type) or a row whose id names another provider is
+  left out the same way. OpenClaw breaks ties by last use; this script prefers no account, so that order stands. An
+  `api_key` profile is billed per token and is a target only when `auth.order` lists it. Under an empty list
+  OpenClaw itself uses no account for unpinned work and its probe answers `unknown` for every one; the script still
+  moves pinned work onto those accounts (any order rather than stopping), and a real limit comes back as a hold from
+  the runs. Without an empty list, an order saved with `openclaw models auth order set` is not read: profiles it
+  leaves out probe `unknown` and are never chosen. Work that can go nowhere else is reported as having no live
+  account.
 - Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
   a failure that named no time. A probe that answers ok (it tests another model) does not end a hold, and nothing
   moves back onto a model while it is held there. `--status` lists the holds.

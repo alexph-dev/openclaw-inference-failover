@@ -98,6 +98,8 @@ E_PROFILE, E_PROFILE_SRC, E_USER = 'authProfileOverride', 'authProfileOverrideSo
 # auth.providers[].profiles.labels: they show masked keys and emails.
 MS_PROFILES = ('auth', 'oauth', 'profiles')                          # every profile of the agent's auth store, all types
 MS_ID, MS_PROVIDER, MS_TYPE = 'profileId', 'provider', 'type'        # per profile; type is oauth, token or api_key
+MS_COUNTS, MS_COUNT_FIELD = ('auth', 'providers'), 'profiles'      # per provider: raw store counts by type
+MS_COUNT_TYPES = {'oauth': 'oauth', 'token': 'token', 'api_key': 'apiKey'}   # type -> count field
 MS_TIMEOUT_S = 60                                                    # the command reads local files; ~8 s seen
 # Config file
 CFG_MODEL = ('agents', 'defaults', 'model')                         # {primary, fallbacks}
@@ -450,7 +452,11 @@ class Health:
         self.limited[k] = max(self.limited.get(k, 0), until)
 
     def alive(self, profile, model):
-        return self.status(profile) == 'ok' and not self.held(profile, model)
+        # Under an empty auth.order list OpenClaw's probe excludes every account ('unknown', excluded_by_auth_order),
+        # so it can prove none live. The owner's rule is to use them all in any order rather than stop: 'unknown' then
+        # counts as usable, and a real limit on the account comes back as a hold from its runs.
+        s = self.status(profile)
+        return (s == 'ok' or (s == 'unknown' and self.empty_order(profile.split(':')[0]))) and not self.held(profile, model)
 
     def dead(self, profile, model):
         return self.held(profile, model) or self.status(profile) in LIMITED
@@ -459,15 +465,24 @@ class Health:
         """True when a non-empty auth.order lists the provider's targets."""
         return bool((self.conf.get('order') or {}).get(provider))
 
+    def empty_order(self, provider):
+        """True when auth.order has the provider's key with an empty list."""
+        order = self.conf.get('order') or {}
+        return provider in order and not order[provider]
+
     def saved_store(self):
         """[(profile id, provider, type)] of the agent's saved accounts, read at most once per pass. A failed read is
         journaled and raised as a problem by finish(); the targets are then the config profiles only."""
         if self.saved is None:
             self.saved = []
+            if not fits(MS_TIMEOUT_S):       # a late pass already reports 'slow'; the config profiles serve this once
+                journal('saved_profiles_skipped', why='no time left in this pass')
+                return self.saved
             try:
-                if not fits(MS_TIMEOUT_S):
-                    raise Unreachable('no time left in this pass')
-                self.saved = saved_profiles()
+                self.saved, bad = saved_profiles()
+                if bad:
+                    self.saved_err = 'types differ from the store counts for %s' % ', '.join(bad)
+                    journal('saved_profiles_failed', error=self.saved_err)
             except (Shape, Unreachable) as e:
                 self.saved_err = quiet_error(e)
                 journal('saved_profiles_failed', error=self.saved_err)
@@ -538,13 +553,25 @@ def cli_json(argv, timeout=75):
 
 def saved_profiles():
     """[(profile id, provider, type)] of every account in the default agent's auth store, saved-only ones included.
-    Reads id, provider and type only: a profile's label shows a masked key or an email."""
+    Reads id, provider and type only: a profile's label shows a masked key or an email.
+    Returns (rows, providers whose rows were dropped). A plugin's runtime credential can override the reported type for
+    a whole provider (e.g. an API key in the environment), so a provider's rows are kept only when their types match
+    the raw store counts in auth.providers[].profiles; a row whose id prefix is not its provider is skipped, because
+    the probe of that account would ask another provider."""
     d = cli_json(CLI_MODELS(default_agent()), MS_TIMEOUT_S)
     rows = dig(d, MS_PROFILES)
     if not isinstance(rows, list) or not all(isinstance(r, dict) and all(isinstance(r.get(k), str) for k in
                                                                          (MS_ID, MS_PROVIDER, MS_TYPE)) for r in rows):
         raise Shape(MS_SHAPE_ERR)
-    return [(r[MS_ID], r[MS_PROVIDER], r[MS_TYPE]) for r in rows]
+    counts = {}
+    for p in dig(d, MS_COUNTS) or []:
+        c = p.get(MS_COUNT_FIELD) if isinstance(p, dict) else None
+        if isinstance(c, dict) and isinstance(p.get(MS_PROVIDER), str):
+            counts[p[MS_PROVIDER]] = {t: c.get(f) for t, f in MS_COUNT_TYPES.items()}
+    rows = [(r[MS_ID], r[MS_PROVIDER], r[MS_TYPE]) for r in rows]
+    bad = sorted(pv for pv in {pv for _, pv, _ in rows}
+                 if counts.get(pv) != {t: sum(1 for _, q, k in rows if q == pv and k == t) for t in MS_COUNT_TYPES})
+    return [r for r in rows if r[1] not in bad and r[0].split(':')[0] == r[1]], bad
 
 
 MS_SHAPE_ERR = 'cli: openclaw %s: no list %s of {%s, %s, %s}' % (' '.join(CLI_MODELS('<agent>')), '.'.join(MS_PROFILES),
@@ -1581,8 +1608,7 @@ def main():
         try:
             ver, missing = openclaw_version(), selfcheck()
             try:                   # optional: without it the targets are the config profiles, so it is not 'missing'
-                saved_profiles()
-                saved = 'ok'
+                saved = 'ok' if not saved_profiles()[1] else 'types differ from the store counts'
             except (Shape, Unreachable) as e:
                 saved = quiet_error(e)
                 prob(out, 'saved-profiles', 'openclaw %s could not be read: %s' % (' '.join(CLI_MODELS('<agent>')), saved))
