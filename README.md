@@ -22,7 +22,10 @@ limits). After those come the entries of
 - **Cron jobs.** A job whose model@account is held or probed out is rebound to the same model on the next live account
   of `auth.order`, or, if no account of that model is live, to the first live fallback entry. A move to another model
   is temporary: the job goes back to its own model once an account of it is live again and not held for it. The script
-  never runs a job: the next scheduled run uses the new binding.
+  never runs a job: the next scheduled run uses the new binding. Disabled jobs move too, after all other work of a
+  pass, and stay disabled, so a run started by hand (`openclaw cron run`) finds a live account. They use only what
+  the pass already learned about the accounts (no probe of their own) and at most 10 s of edits per pass; one with
+  nowhere to go is not reported, a failed edit is. A disabled one-shot (`at`) job has already run and is left alone.
 - **Pinned chats.** A chat whose model or account was chosen by hand (OpenClaw applies no fallbacks to it), or that the
   script parked on a fallback model, is moved the same way, on the same passes, whenever its model@account is held or
   probed out. What its runs did is not consulted. A chat with a run in progress is moved once that run is over.
@@ -103,7 +106,7 @@ openclaw cron add --name "inference failover" --cron "* * * * *" --exact \
 ```
 
 Jobs that the script should move must be operator jobs (`scheduledToolPolicy.mode` `trusted`); a legacy
-account-mode job on an exhausted account is reported, not moved.
+account-mode job on an exhausted account is reported, not moved (a disabled one is skipped silently).
 
 Requirements and limits:
 

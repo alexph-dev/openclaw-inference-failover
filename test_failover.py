@@ -1449,6 +1449,68 @@ def test_job_bound_to_an_account_without_naming_it_moves_too():
 
 
 
+def test_disabled_job_started_by_hand_moves_after_enabled_ones_and_is_never_a_problem():
+    # A disabled job started only by 'cron run' stayed on an exhausted account: its next manual run failed.
+    d = setup({'x': (OPUS, PA, 'trusted'), 'e': (OPUS, PA, 'trusted'), 'l': (OPUS, PA, 'account')},
+              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}}, sched={'x': ('cron', 0), 'e': ('cron', 600)})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute("update cron_jobs set enabled=0 where job_id in ('x','l')")
+    c.commit()
+    c.close()
+    rc, err, j = go(d, True)
+    assert [(m['job'], m['to']) for m in kinds(j, 'job_move')] == [('e', OPUS + '@' + PB), ('x', OPUS + '@' + PB)], j
+    assert rc == 0 and 'legacy' not in err, err                     # a disabled legacy job is skipped silently
+    c = sqlite3.connect(d / 'state.sqlite')
+    assert c.execute("select enabled from cron_jobs where job_id='x'").fetchone()[0] == 0   # still disabled
+    c.close()
+    # Nowhere to go: an enabled job is a problem, a disabled one is not.
+    dead = {'anthropic': DEAD, 'xai': {'xai:x': 'rate_limit'}, 'openai': {'openai:default': 'rate_limit'}}
+    d = setup({'x': (OPUS, PA, 'trusted')}, probe=dead)
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute("update cron_jobs set enabled=0")
+    c.commit()
+    c.close()
+    rc, err, j = go(d, True)
+    assert rc == 0 and 'no live account' not in err and not kinds(j, 'job_move'), (rc, err)
+
+
+def test_disabled_jobs_never_probe_skip_one_shots_and_keep_to_their_budget():
+    # A provider only a disabled job uses is never probed for it; a disabled one-shot is left alone.
+    d = setup({'e': (OPUS, PA, 'trusted'), 'x': ('xai/grok-4.7', 'xai:x', 'trusted'), 'o': (OPUS, PA, 'trusted')},
+              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}, 'xai': {'xai:x': 'rate_limit'}},
+              sched={'o': ('at', 0)})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute("update cron_jobs set enabled=0 where job_id in ('x','o')")
+    c.commit()
+    c.close()
+    rc, err, j = go(d, True)
+    assert [m['job'] for m in kinds(j, 'job_move')] == ['e'], j
+    assert {r['provider'] for r in kinds(j, 'probe')} == {'anthropic'}, kinds(j, 'probe')
+    assert rc == 0, err
+    # Held on a provider nobody else uses: still no probe for it, and no problem.
+    st = json.loads((d / 'st' / 'state.json').read_text())
+    st['limited'] = {'xai/grok-4.7@xai:x': ms() + 3600_000}
+    (d / 'st' / 'state.json').write_text(json.dumps(st))
+    fake(d, probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}, 'xai': {'xai:x': 'ok', 'xai:y': 'ok'}})
+    rc, err, j = go(d, True)
+    assert {r['provider'] for r in kinds(j, 'probe')} == {'anthropic'} and rc == 0, (err, kinds(j, 'probe'))
+    # Past DISABLED_BUDGET_S (here: spent at once) a disabled move waits for the next pass; an enabled one still goes.
+    d = setup({'e': (OPUS, PA, 'trusted'), 'x': (OPUS, PA, 'trusted')},
+              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute("update cron_jobs set enabled=0 where job_id='x'")
+    c.commit()
+    c.close()
+    fake(d, slow_edit=0.6)
+    rc, err, j = go(d, True, env={'OCF_DISABLED_BUDGET_S': '-1'})
+    assert [m['job'] for m in kinds(j, 'job_move')] == ['e'], j
+    assert binding(d, 'x') == OPUS + '@' + PA
+    assert not json.loads((d / 'st' / 'state.json').read_text())['retry']   # its wait does not make the next pass probe
+    rc, err, j = go(d, True)                                          # next probing pass: the disabled job moves
+    assert [m['job'] for m in kinds(j, 'job_move')] == ['e', 'x'], j   # the journal holds both passes
+    assert binding(d, 'x') == OPUS + '@' + PB
+
+
 def test_stalled_subagent_run_is_aborted_not_moved_or_continued():
     # A subagent sleeping out a 2-day retry: its parent must get the failure now. Not continued, not moved.
     S = 'agent:main:subagent:00000000-0000-4000-8000-000000000009'
