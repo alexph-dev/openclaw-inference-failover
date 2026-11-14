@@ -453,7 +453,9 @@ class Health:
         when the key exists (an empty list means none, as in OpenClaw). Otherwise the accounts OpenClaw's automatic
         selection rotates through: the provider's oauth and token (subscription) profiles in auth.profiles, oauth
         first, then config order. OpenClaw then breaks ties by last use; this script prefers no account, so config
-        order stands. Profiles only in the agent's saved store are not seen: models.probe does not report their type."""
+        order stands. Profiles only in the agent's saved store are not seen: models.probe does not report their type. An
+        order saved with 'openclaw models auth order set' is not read either; profiles it leaves out probe 'unknown',
+        so they are never chosen."""
         order = (self.conf.get('order') or {}).get(provider)
         if order is not None:
             return list(order)
@@ -475,8 +477,12 @@ class Health:
     def unknown(self):
         """True when a probe failed or timed out for a target account (accounts()): 'nothing alive' is then unproven.
         auth, no_model and format are definite answers (that account cannot be used), so an expired token does not hide
-        'nothing alive'. An account that is not a target is never chosen, so its answer does not matter."""
-        return bool(self.failed) or any(s in ('timeout', 'unknown', None) for prov, r in list(self.cache.items())
+        'nothing alive'. An account that is not a target is never chosen, so its answer does not matter. For a provider
+        without an auth.order key, 'unknown' counts as a definite answer: OpenClaw reports it for a profile that an order
+        saved with 'openclaw models auth order set' leaves out (excluded_by_auth_order), which this script cannot read."""
+        def open_(prov):
+            return ('timeout', 'unknown', None) if (self.conf.get('order') or {}).get(prov) is not None else ('timeout', None)
+        return bool(self.failed) or any(s in open_(prov) for prov, r in list(self.cache.items())
                                         for p, s in r.items() if p in self.accounts(prov))
 
 

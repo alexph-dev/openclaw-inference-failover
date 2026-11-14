@@ -114,8 +114,8 @@ Requirements and limits:
   profiles in `auth.profiles`, `oauth` first, then config order. A profile only in the agent's saved store is not a
   target: `models.probe` does not report its type. OpenClaw then breaks ties by last use; this script prefers no
   account, so config order stands. An `api_key` profile is billed per token and is a target only when `auth.order`
-  lists it. Work that can go nowhere
-  else is reported as having no live account.
+  lists it. An order saved with `openclaw models auth order set` is not read: profiles it leaves out probe
+  `unknown` and are never chosen. Work that can go nowhere else is reported as having no live account.
 - Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
   a failure that named no time. A probe that answers ok (it tests another model) does not end a hold, and nothing
   moves back onto a model while it is held there. `--status` lists the holds.
