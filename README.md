@@ -13,9 +13,10 @@ fixed, and delete the whole script when all of them are.
 ## What it does
 
 A limit is always one model on one account (model@account), never a whole account: a probe that answers ok for one
-model says nothing about another model on that account. The targets of a provider are the accounts `auth.order` lists
-for it, in that order; a provider without an `auth.order` key has the accounts OpenClaw's
-automatic selection uses (see "Targets" under Requirements and limits). After those come the entries of
+model says nothing about another model on that account. The targets of a provider are the accounts a non-empty
+`auth.order` list names for it, in that order; a provider without one (no key, or an empty list) has all its
+subscription accounts, declared in config or saved in the agent's auth store (see "Targets" under Requirements and
+limits). After those come the entries of
 `agents.defaults.model.fallbacks`.
 
 - **Cron jobs.** A job whose model@account is held or probed out is rebound to the same model on the next live account
@@ -64,6 +65,7 @@ automatic selection uses (see "Targets" under Requirements and limits). After th
 | Account status | Gateway RPC `models.probe` |
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
 | Model, fallbacks, account order and declared accounts (the targets) | config file (`~/.openclaw/openclaw.json`) |
+| Accounts saved only in the agent's auth store (targets of a provider without a non-empty `auth.order`) | documented CLI: `openclaw models status --json --agent <id>`, `auth.oauth.profiles[]` `profileId`, `provider`, `type` (only when needed) |
 | Chats' pinned model/account and queued input | internal: tables `session_nodes` and `session_pending_inputs` in each agent database (read-only) |
 | The recorded account of a job whose `payload.model` names no account | internal: table `cron_jobs` (`inferenceBinding.profileId`) in `state/openclaw.sqlite` (read-only); `cron list` does not show it |
 | Stalls and failed turns | internal: Gateway log lines (`/tmp/openclaw*/openclaw-*.log`) |
@@ -75,7 +77,9 @@ log line anchors, error wording) is in one marked section at the top of `failove
 looked up in the installed OpenClaw (CLI answers, one read-only `sessions.describe`, database schemas, a text search of
 the installed package). If anything is missing, the pass changes nothing and fails with the exact missing items (two passes in a row, then
 once a day while it stays the same, and again when the missing set changes). The same happens when a read returns an
-unexpected shape. Fix the section, and the next pass works again.
+unexpected shape. Fix the section, and the next pass works again. The one exception is `openclaw models status`
+(accounts saved only in the agent's store): if it fails or changes shape, the pass goes on with the config's accounts
+and reports the failure as a problem.
 
 When OpenClaw does not answer (a slow or restarting Gateway), the pass changes nothing and stays quiet; it becomes a
 problem only after ten minutes without an answer.
@@ -108,12 +112,14 @@ Requirements and limits:
   Linux with a user systemd session. Without it the chat is still moved, and the failed start is reported.
 - `openclaw cron list` returns one page of 200 jobs and has no paging option. With more jobs the script reports it
   and watches only the first page.
-- Targets: with an `auth.order` entry for a provider, an account is chosen only when that entry lists it, whatever
-  the probe reports about it and however it is billed; an empty list means no account, as in OpenClaw. Without the
-  key the targets are the set OpenClaw's automatic selection rotates through: the provider's `oauth` and `token`
-  profiles in `auth.profiles`, `oauth` first, then config order. A profile only in the agent's saved store is not a
-  target: `models.probe` does not report its type. OpenClaw then breaks ties by last use; this script prefers no
-  account, so config order stands. An `api_key` profile is billed per token and is a target only when `auth.order`
+- Targets: with a non-empty `auth.order` list for a provider, an account is chosen only when that list names it,
+  whatever the probe reports about it and however it is billed. Without one (no key, or an empty list) the targets are
+  every subscription account of the provider: its `oauth` and `token` profiles in `auth.profiles` (config order) and
+  in the agent's saved auth store (`openclaw models status --json`, field `auth.oauth.profiles`), each once, `oauth`
+  first. `models status` is run at most once per pass and only when such a provider is needed; only the profile id,
+  provider and type are read, never the labels (they show masked keys and emails). If it fails, the config profiles
+  are the targets and the failure is reported as a problem. OpenClaw breaks ties by last use; this script prefers no
+  account, so that order stands. An `api_key` profile is billed per token and is a target only when `auth.order`
   lists it. An order saved with `openclaw models auth order set` is not read: profiles it leaves out probe
   `unknown` and are never chosen. Work that can go nowhere else is reported as having no live account.
 - Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
@@ -136,8 +142,8 @@ Requirements and limits:
 
 - `failover.py`: dry run. Prints what a pass would do as JSON; takes no lock and writes no state.
 - `failover.py --apply`: one real pass (what the job runs).
-- `failover.py --check`: self-check plus a check of the last 24 hours; prints `{"openclaw": version, "missing": [...]}`
-  and exits 1 with problems.
+- `failover.py --check`: self-check plus a check of the last 24 hours; prints `{"openclaw": version, "missing": [...],
+  "saved_profiles": "ok" or the failure}` and exits 1 with problems.
 - `failover.py --status`: open problems, held model@account pairs, and jobs and chats parked on a fallback model, as
   JSON.
 
