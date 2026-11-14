@@ -637,7 +637,7 @@ def test_edit_that_reported_a_failure_but_landed_is_adopted_as_parked():
 
 def test_only_accounts_listed_in_auth_order_are_targets():
     # An account the probe reports but auth.order does not list is never chosen, however it is billed; a provider
-    # without an auth.order entry yields no target at all, not a guessed account.
+    # without an auth.order entry and without subscription profiles yields no target at all, not a guessed account.
     probe = {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'rate_limit'}, 'xai': {'xai:x': 'ok'}}
     for order, want in (({'anthropic': [PA], 'xai': ['xai:x']}, {'xai/grok-4.7@xai:x'}),
                         ({'anthropic': [PA, PB], 'xai': ['xai:x']}, {OPUS + '@' + PB}),
@@ -650,6 +650,51 @@ def test_only_accounts_listed_in_auth_order_are_targets():
         assert {r['to'] for r in kinds(j, 'job_move')} == want, (order, j)
         if not want:
             assert rc == 1 and 'no live account' in err, err
+
+
+SUBS = {'anthropic:k': {'provider': 'anthropic', 'mode': 'api_key'}, PA: {'provider': 'anthropic', 'mode': 'token'},
+        PC: {'provider': 'anthropic', 'mode': 'token'}, PB: {'provider': 'anthropic', 'mode': 'oauth'},
+        OA: {'provider': 'openai', 'mode': 'oauth'}}
+
+
+@offline
+def test_without_auth_order_targets_are_the_subscription_profiles():
+    # No auth.order key for a provider: the targets are what OpenClaw's automatic selection rotates through, its oauth
+    # and token profiles in config order, oauth first. An api_key profile never is.
+    for order in ({}, {'openai': [OA]}):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': order, 'profiles': SUBS})
+        assert h.accounts('anthropic') == [PB, PA, PC], (order, h.accounts('anthropic'))
+    # With auth.order: that list in its order, an api_key account included when listed, unlisted profiles ignored.
+    h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': [PC, 'anthropic:k']}, 'profiles': SUBS})
+    assert h.accounts('anthropic') == [PC, 'anthropic:k'] and h.target(OPUS) is None
+    # An empty list is an explicit empty order, as in OpenClaw: no targets.
+    h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': []}, 'profiles': SUBS})
+    assert h.accounts('anthropic') == [] and h.target(OPUS) is None
+    # Config declares no profile for the provider: no targets, and no probe is made to look for any.
+    with patch.object(F, 'FAKE', {'probe': {'xai': {'xai:x': 'ok'}}}):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
+        assert h.accounts('xai') == [] and 'xai' not in h.cache
+    # No auth.order key: a declared profile that probes 'unknown' (left out by a CLI-saved order) does not make
+    # 'nothing alive' unproven; with a config auth.order it still does.
+    h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
+    h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown', PC: 'unknown'}
+    assert not h.unknown() and h.target(OPUS) is None
+    h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': [PA, PB]}, 'profiles': SUBS})
+    h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown'}
+    assert h.unknown()
+
+
+def test_pinned_account_limited_without_auth_order_moves_to_a_declared_subscription():
+    # The reported install: no auth.order for anthropic, the job's account limited, two other subscriptions ok. The
+    # job moves to the first of them in config order instead of reporting no target; the ok api_key account is skipped.
+    d = setup(JOBS, [], {'anthropic': {'anthropic:k': 'ok', PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
+    c = json.loads((d / 'cfg.json').read_text())
+    c['auth']['order'].pop('anthropic')
+    c['auth']['profiles'] = {k: dict(v, mode='token') if k == PB else v for k, v in SUBS.items()}
+    (d / 'cfg.json').write_text(json.dumps(c))
+    rc, err, j = go(d, True)
+    assert {(r['job'], r['to']) for r in kinds(j, 'job_move')} == {('a', OPUS + '@' + PC), ('b', OPUS + '@' + PC)}, (err, j)
+    assert 'no live account' not in err and 'no_target' not in err, err
 
 
 def test_landed_edit_of_a_job_already_on_a_fallback_keeps_its_way_home():
