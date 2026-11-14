@@ -57,6 +57,10 @@ if a[:2] == ['cron', 'list']:
         d.pop('inferenceBinding', None)
         jobs.append(dict(d, id=jid, enabled=bool(en), agentId='main', state=s))
     print(json.dumps({os.environ.get('OCF_FAKE_JOBS_KEY', 'jobs'): jobs, 'hasMore': bool(os.environ.get('OCF_FAKE_MORE'))}))
+elif a[:2] == ['models', 'status']:
+    f = json.load(open(os.environ['OCF_FAKE']))
+    print(json.dumps(f.get('models_status', {'auth': {'oauth': {'warnAfterMs': 86400000, 'profiles': [], 'providers': []}}})))
+    sys.exit(f.get('models_status_rc', 0))
 elif a[:2] == ['cron', 'runs']:
     lim = int(a[a.index('--limit') + 1])
     print(json.dumps({'entries': [r for r in runs if r['status'] == 'error'][:lim], 'total': 0, 'hasMore': False}))
@@ -652,36 +656,216 @@ def test_only_accounts_listed_in_auth_order_are_targets():
             assert rc == 1 and 'no live account' in err, err
 
 
+SECRET = 'LABEL-VALUE-9f3c'      # stands for the masked key or email in a label: it must never leave models status
+
+
+def models_status(rows):
+    """The shape of the real 'openclaw models status --json' for [(profile id, type)] in the agent's store: per provider
+    counts and labels, and auth.oauth.profiles sorted by provider then id, as OpenClaw builds them."""
+    lab = {'oauth': 'OAuth (%s@example.invalid)', 'token': 'token:%s...', 'api_key': 'sk-%s...'}
+    rows = sorted(rows, key=lambda r: (r[0].split(':')[0], r[0]))
+    provs = {}
+    for pid, kind in rows:
+        provs.setdefault(pid.split(':')[0], []).append((pid, kind))
+    prof = lambda pid, kind: {'profileId': pid, 'provider': pid.split(':')[0], 'type': kind, 'source': 'store',
+                              'label': '%s (%s@example.invalid)' % (pid, SECRET), 'status': 'ok' if kind == 'oauth' else 'static'}
+    n = lambda ps, k: sum(1 for _, t in ps if t == k)
+    return {'configPath': 'cfg.json', 'agentDir': 'agent', 'defaultModel': OPUS, 'resolvedDefault': OPUS, 'fallbacks': [],
+            'auth': {'storePath': 'auth.json', 'shellEnvFallback': {'enabled': False, 'appliedKeys': []},
+                     'providersWithOAuth': ['%s (%d)' % (pv, n(ps, 'oauth') + n(ps, 'token')) for pv, ps in provs.items()],
+                     'missingProvidersInUse': [], 'modelRouteIssues': [], 'runtimeAuthRoutes': [],
+                     'providers': [{'provider': pv, 'effective': {'kind': 'profiles', 'detail': 'auth.json'},
+                                    'profiles': {'count': len(ps), 'oauth': n(ps, 'oauth'), 'token': n(ps, 'token'),
+                                                 'apiKey': n(ps, 'api_key'),
+                                                 'labels': ['%s=%s' % (pid, lab[k] % SECRET) for pid, k in ps]}}
+                                   for pv, ps in provs.items()],
+                     'unusableProfiles': [],
+                     'oauth': {'warnAfterMs': 86400000, 'profiles': [prof(*r) for r in rows],
+                               'providers': [{'provider': pv, 'status': 'ok', 'profiles': [prof(*r) for r in ps],
+                                              'effectiveProfiles': [prof(*r) for r in ps]} for pv, ps in provs.items()]}}}
+
+
+def saved_cli(rows, calls=None, error=None):
+    """In-process models status: [(profile id, type)] saved in the agent's store, or a failure."""
+    def cli(argv, timeout=75):
+        assert argv[:3] == ['models', 'status', '--json'], argv
+        if calls is not None:
+            calls.append(argv)
+        if error:
+            raise error
+        return models_status(rows)
+    return patch.object(F, 'cli_json', cli)
+
+
+_run = F.run
+def _guarded_run(argv, timeout=120):
+    assert argv[1:3] != ['models', 'status'], 'a unit test ran the real openclaw models status'
+    return _run(argv, timeout)
+F.run = _guarded_run
+
+
 SUBS = {'anthropic:k': {'provider': 'anthropic', 'mode': 'api_key'}, PA: {'provider': 'anthropic', 'mode': 'token'},
         PC: {'provider': 'anthropic', 'mode': 'token'}, PB: {'provider': 'anthropic', 'mode': 'oauth'},
         OA: {'provider': 'openai', 'mode': 'oauth'}}
 
 
 @offline
+@saved_cli([])
 def test_without_auth_order_targets_are_the_subscription_profiles():
-    # No auth.order key for a provider: the targets are what OpenClaw's automatic selection rotates through, its oauth
-    # and token profiles in config order, oauth first. An api_key profile never is.
-    for order in ({}, {'openai': [OA]}):
+    # No non-empty auth.order for a provider: the targets are its oauth and token profiles in config order, oauth
+    # first. An api_key profile never is. An empty list is the same as no key.
+    for order in ({}, {'openai': [OA]}, {'anthropic': []}):
         h = F.Health({'primary': OPUS, 'chain': [], 'order': order, 'profiles': SUBS})
         assert h.accounts('anthropic') == [PB, PA, PC], (order, h.accounts('anthropic'))
     # With auth.order: that list in its order, an api_key account included when listed, unlisted profiles ignored.
     h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': [PC, 'anthropic:k']}, 'profiles': SUBS})
     assert h.accounts('anthropic') == [PC, 'anthropic:k'] and h.target(OPUS) is None
-    # An empty list is an explicit empty order, as in OpenClaw: no targets.
-    h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': []}, 'profiles': SUBS})
-    assert h.accounts('anthropic') == [] and h.target(OPUS) is None
     # Config declares no profile for the provider: no targets, and no probe is made to look for any.
     with patch.object(F, 'FAKE', {'probe': {'xai': {'xai:x': 'ok'}}}):
         h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
         assert h.accounts('xai') == [] and 'xai' not in h.cache
-    # No auth.order key: a declared profile that probes 'unknown' (left out by a CLI-saved order) does not make
-    # 'nothing alive' unproven; with a config auth.order it still does.
+    # No non-empty auth.order: a profile that probes 'unknown' (left out by a CLI-saved order) does not make 'nothing
+    # alive' unproven; with a non-empty config auth.order it still does. Under an empty list OpenClaw's probe answers
+    # 'unknown' for every account, and those accounts are used anyway (any order rather than stopping).
     h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
     h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown', PC: 'unknown'}
     assert not h.unknown() and h.target(OPUS) is None
+    with saved_cli([(PA, 'token'), (PB, 'oauth'), (PC, 'token')]):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': []}, 'profiles': SUBS})
+        h.cache['anthropic'] = {PA: 'unknown', PB: 'unknown', PC: 'unknown'}
+        h.hold(PB, F.NOW() + 3600000, OPUS)
+        assert not h.unknown() and h.target(OPUS, avoid=(PA,)) == OPUS + '@' + PC
+    # ... but not an account whose saved credential is expired or missing: the probe checks nothing under [].
+    d = models_status([(PA, 'token'), (PB, 'oauth'), (PC, 'token')])
+    for r in d['auth']['oauth']['profiles']:
+        if r['profileId'] == PC:
+            r['status'] = 'expired'
+    with patch.object(F, 'cli_json', lambda argv, timeout=75: d):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': []}, 'profiles': SUBS})
+        h.cache['anthropic'] = {PA: 'unknown', PB: 'unknown', PC: 'unknown'}
+        h.hold(PB, F.NOW() + 3600000, OPUS)
+        assert h.target(OPUS, avoid=(PA,)) is None
     h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': [PA, PB]}, 'profiles': SUBS})
     h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown'}
     assert h.unknown()
+
+
+@offline
+def test_saved_rows_are_dropped_when_types_differ_from_store_counts_or_ids_name_another_provider():
+    # A plugin runtime credential reports every xai account as api_key while the store holds an oauth one: the counts
+    # disagree, so no xai row is trusted and the mismatch is a problem. A row whose id names another provider is
+    # skipped; its provider's other rows stay.
+    d = models_status([('xai:x', 'oauth'), (OA, 'oauth')])
+    for r in d['auth']['oauth']['profiles']:
+        if r['provider'] == 'xai':
+            r['type'] = 'api_key'
+    d['auth']['oauth']['profiles'].append({'profileId': 'codex:w', 'provider': 'openai', 'type': 'oauth'})
+    d['auth']['providers'][[p['provider'] for p in d['auth']['providers']].index('openai')]['profiles']['oauth'] += 1
+    with patch.object(F, 'cli_json', lambda argv, timeout=75: d):
+        rows, bad, _ = F.saved_profiles()
+    assert bad == ['xai'] and rows == [(OA, 'openai', 'oauth')], (rows, bad)
+    with patch.object(F, 'cli_json', lambda argv, timeout=75: d):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {}})
+        assert h.accounts('xai') == [] and h.accounts('openai') == [OA] and 'xai' in h.saved_err
+
+
+@offline
+def test_a_late_pass_skips_models_status_without_a_problem():
+    calls = []
+    with saved_cli([(OA, 'oauth')], calls), patch.object(F, 'fits', lambda s: False):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {}})
+        assert h.accounts('openai') == [] and not calls and h.saved_err is None
+        assert h.unknown()             # saved-only accounts were not looked at: 'nothing alive' is unproven
+    # A config profile whose id names another provider is not a target either (its probe would ask that provider).
+    with saved_cli([]):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {'x:n': {'provider': 'anthropic', 'mode': 'token'}}})
+        assert h.accounts('anthropic') == []
+
+
+@offline
+def test_saved_store_profiles_are_targets_once_and_api_keys_only_when_listed():
+    # Config declares PB (oauth) and PA (token); the saved store repeats them and adds PC (token), an api_key and an
+    # oauth account of a provider config does not mention. Each subscription is a target once, oauth first.
+    saved = [(PA, 'token'), (PC, 'token'), (PB, 'oauth'), ('anthropic:k', 'api_key'), (OA, 'oauth'), ('openai:k', 'api_key')]
+    calls = []
+    with saved_cli(saved, calls):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {PB: SUBS[PB], PA: SUBS[PA]}})
+        assert h.accounts('anthropic') == [PB, PA, PC], h.accounts('anthropic')
+        assert h.accounts('openai') == [OA] and h.accounts('xai') == []
+        assert len(calls) == 1, calls                                  # read once per pass
+    # A non-empty auth.order is the whole answer: an api_key it lists is a target, and the saved store is not read.
+    calls = []
+    with saved_cli(saved, calls):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': ['anthropic:k', PC]}, 'profiles': {}})
+        assert h.accounts('anthropic') == ['anthropic:k', PC] and calls == []
+    # The read fails: the config profiles are the targets, the failure is kept for finish() and is not retried, and an
+    # account the probe calls 'unknown' still does not make 'nothing alive' unproven.
+    calls = []
+    with saved_cli(saved, calls, F.Unreachable('openclaw models status --json: rc=1 %s=%s' % (PC, SECRET))):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {PA: SUBS[PA]}})
+        assert h.accounts('anthropic') == [PA] and h.accounts('anthropic') == [PA] and len(calls) == 1
+        assert h.saved_err == 'rc=1' and SECRET not in h.saved_err, h.saved_err
+        h.cache['anthropic'] = {PA: 'rate_limit', PC: 'unknown'}
+        assert not h.unknown() and h.target(OPUS) is None
+    with saved_cli(saved, error=None), patch.object(F, 'cli_json', lambda argv, timeout=75: {'auth': {'oauth': {}}}):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {PA: SUBS[PA]}})
+        assert h.accounts('anthropic') == [PA] and h.saved_err == F.MS_SHAPE_ERR
+
+
+def test_empty_auth_order_and_saved_only_account_move_the_job():
+    # anthropic: auth.order [] (same as no key), PA limited, PB only in the saved store; openai has no auth.order and
+    # its live accounts are an api_key and an oauth account, both only in the saved store.
+    d = setup(JOBS, [], {'anthropic': {PA: 'rate_limit', PB: 'unknown', 'anthropic:k': 'unknown'},
+                         'openai': {'openai:default': 'rate_limit', 'openai:k': 'ok', OA: 'ok'}, 'xai': {'xai:x': 'rate_limit'}})
+    c = json.loads((d / 'cfg.json').read_text())
+    c['auth'] = {'order': {'anthropic': [], 'xai': ['xai:x']}, 'profiles': {PA: SUBS[PA], 'openai:default': {'provider': 'openai', 'mode': 'oauth'}}}
+    (d / 'cfg.json').write_text(json.dumps(c))
+    fake(d, models_status=models_status([('anthropic:k', 'api_key'), (PA, 'token'), (PB, 'token'), ('openai:default', 'oauth'),
+                                         ('openai:k', 'api_key'), (OA, 'oauth')]))
+    rc, err, j = go(d, True)
+    assert {(r['job'], r['to']) for r in kinds(j, 'job_move')} == {
+        ('a', OPUS + '@' + PB), ('b', OPUS + '@' + PB), ('c', 'openai/gpt-6.1-sol@' + OA)}, (err, j)
+    assert rc == 0 and not err, err
+    assert [x for x in calls(d) if x.startswith('models status')] == ['models status --json --agent main'], calls(d)
+    st = (d / 'st' / 'journal.jsonl').read_text() + (d / 'st' / 'state.json').read_text()
+    assert SECRET not in st and 'example.invalid' not in st
+
+
+def test_models_status_is_not_read_when_every_provider_has_an_order():
+    d = setup(JOBS, [], {'anthropic': DEAD, 'xai': {'xai:x': 'ok'}, 'openai': {'openai:default': 'ok'}})
+    fake(d, models_status_rc=1)
+    rc, err, j = go(d, True)
+    assert {r['to'] for r in kinds(j, 'job_move')} == {'xai/grok-4.7@xai:x'}, (err, j)
+    assert not [x for x in calls(d) if x.startswith('models')] and 'models status' not in err, (calls(d), err)
+
+
+def test_failed_models_status_falls_back_to_config_and_never_hides_no_target():
+    # The read fails with the full answer (labels included) on stdout: the config profile is the only target, it is
+    # limited, so the alert fires; the failure is a problem of its own; no label value reaches the journal or stderr.
+    for broken in (dict(models_status_rc=1), dict(models_status={'auth': {'oauth': {'profiles': [{'profileId': PB}]}}})):
+        d = setup(JOBS, [], {'anthropic': {PA: 'rate_limit', PB: 'ok'}, 'openai': {'openai:default': 'rate_limit'},
+                             'xai': {'xai:x': 'rate_limit'}})
+        c = json.loads((d / 'cfg.json').read_text())
+        c['auth'] = {'order': {'xai': ['xai:x'], 'openai': ['openai:default']}, 'profiles': {PA: SUBS[PA]}}
+        (d / 'cfg.json').write_text(json.dumps(c))
+        fake(d, models_status=models_status([(PA, 'token'), (PB, 'token')]))
+        fake(d, **broken)
+        rc, err, j = go(d, True)
+        assert not kinds(j, 'job_move'), j
+        assert rc == 1 and 'no live account' in err and 'models status' in err, err
+        assert len([x for x in calls(d) if x.startswith('models status')]) == 1, calls(d)
+        st = (d / 'st' / 'journal.jsonl').read_text() + (d / 'st' / 'state.json').read_text() + err
+        assert SECRET not in st and 'example.invalid' not in st, st
+
+
+def test_check_reports_an_unreadable_models_status_without_its_output():
+    d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'ok', PC: 'ok'}})
+    fake(d, models_status=models_status([(PA, 'token')]))
+    rc, err, j = go(d, False, '--check')
+    assert rc == 0 and not err, err
+    fake(d, models_status_rc=1)
+    rc, err, j = go(d, False, '--check')
+    assert rc == 1 and 'models status' in err and 'rc=1' in err and SECRET not in err, err
 
 
 def test_pinned_account_limited_without_auth_order_moves_to_a_declared_subscription():
@@ -786,6 +970,7 @@ def recovery_fixture():
     p = {'kind': 'stall', 't': ms() - 40_000, 'until': ms() + 3600_000, 'model': FABLE}
     state = {'handled': {}, 'pending': {run: p}}
     health = F.Health({'primary': OPUS, 'chain': [], 'order': {}})
+    health.saved = []                                                  # no saved-only accounts
     out = {'problems': [], 'chats': [], 'continued': [], 'no_target': []}
     return run, e, s, p, state, health, out
 
