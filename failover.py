@@ -491,7 +491,7 @@ class Health:
             return []
         if self.saved is None:
             self.saved = []
-            if not fits(MS_TIMEOUT_S):       # a late pass already reports 'slow'; the config profiles serve this once
+            if not fits(MS_TIMEOUT_S):       # a late pass: the config profiles serve this once, the next pass reads it
                 journal('saved_profiles_skipped', why='no time left in this pass')
                 self.saved_skipped = True
                 return self.saved
@@ -723,12 +723,28 @@ def selfcheck():
     return sorted(set(miss))
 
 
-def down(state, out, e):
-    """OpenClaw did not answer: nothing is changed this pass. It is a problem only once it has lasted DOWN_MS."""
-    since = state.setdefault('down_since', NOW())
+def down(state, out, e, slow=False, part=None):
+    """OpenClaw did not answer, or (slow) answered so slowly that the pass was cut off after saving what it did.
+    Either is one outage: one clock from the start of the first pass it hit, one ledger key, a problem only once it
+    has lasted DOWN_MS. Cleared by a pass that gets all its answers, or by a self-check finding (raised on its own).
+    A part that does not run every pass (part: the 30-min check, the disabled jobs) keeps its own clock as well, which
+    only that part finishing clears: the ordinary passes between its runs get their answers and stop the main one."""
+    start = NOW() - int((time.time() - T0) * 1000)                                     # this pass's start, on NOW's clock
+    since = state.setdefault('down_since', start)
+    if part:
+        since = min(since, state.setdefault('cut_since', {}).setdefault(part, start))
     if NOW() - since >= DOWN_MS:
-        prob(out, 'gateway', 'OpenClaw has not answered for %d min, nothing was changed: %s'
+        prob(out, 'gateway', ('OpenClaw has answered too slowly for %d min: %s' if slow else
+                              'OpenClaw has not answered for %d min, nothing was changed: %s')
              % ((NOW() - since) // 60_000, str(e)[:200]))
+
+
+def part_done(state, part):
+    """A part that does not run every pass finished: its own clock (see down) stops."""
+    cut = state.get('cut_since') or {}
+    cut.pop(part, None)
+    if not cut:
+        state.pop('cut_since', None)
 
 
 jobs_partial = lambda: bool(cli_json(CLI_JOBS).get(LIST_MORE))   # the job list did not fit one page
@@ -1688,6 +1704,7 @@ def main():
     for k in ('rerun', 'rerun_wanted', 'run_req'):
         state.pop(k, None)     # an older version's rerun bookkeeping
     ev, streak, health = {'providers': set()}, {}, Health(conf, limited)
+    part = None                # the part running now that does not run every pass: a cut-off there keeps its own clock
     try:
         del CRON_STORE_ERR[:]
         jobs, streak = load_jobs(state)
@@ -1713,17 +1730,23 @@ def main():
         continued_check(state, out)
         if health.cache:                     # disabled jobs last, on what this pass already asked; their wait ('later')
             health.no_probe = True           # does not make the next pass probe
+            part = 'disabled'
             try:
                 jobs_pass(conf, jobs, health, state, t0, out, disabled=True)
             finally:
                 health.no_probe = False
+            part_done(state, part)
+            part = None
         if APPLY and not late() and NOW() - state.get('checked_at', 0) >= CHECK_EVERY_MS:
-            state['checked_at'] = NOW()
+            state['checked_at'] = NOW()      # set first, so a check that is cut off is not retried on every pass
+            part = 'check'
             check(state, out, jobs)
+            part_done(state, part)
+            part = None
         state.pop('down_since', None)
-    except Deadline:
-        prob(out, 'slow', 'pass cut off after %d s because the Gateway answers slowly; what was done is saved, the rest '
-             'continues next pass' % PASS_HARD_S)
+    except Deadline:           # a slow Gateway is OpenClaw not answering: a problem only once it lasts DOWN_MS
+        down(state, out, 'pass cut off after %d s; what was done is saved, the rest continues next pass' % PASS_HARD_S,
+             slow=True, part=part)
     except (Shape, Unreachable) as e:
         if not (out['moved'] or out['chats'] or out['continued'] or out['aborted']):
             state = json.loads(before)    # nothing was done: keep log offsets and pending events for the next pass
@@ -1747,12 +1770,12 @@ def surface_ok(state, out, shape_error=None):
         if not shape_error and sc.get('version') == ver and not sc.get('missing'):
             return True
         missing = selfcheck() or ([shape_error] if shape_error else [])
-        state.pop('down_since', None)      # the self-check got its answers, so OpenClaw is up
     except Unreachable as e:
         down(state, out, e)
         return False
     state['selfcheck'] = {'version': ver, 'missing': missing, 'at': NOW()}
-    if missing:
+    if missing:                            # OpenClaw answered and the finding is raised on its own; a clean self-check
+        state.pop('down_since', None)      # leaves the clock to the rest of the pass, which may still be cut off
         journal('selfcheck', version=ver, missing=missing)
         prob(out, 'selfcheck:' + '|'.join(missing), 'OpenClaw %s lacks what this script reads, so it changed nothing: %s'
              % (ver, '; '.join(missing)))

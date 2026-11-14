@@ -547,12 +547,88 @@ def test_second_park_within_a_day_waits_before_going_home():
 
 
 def test_slow_gateway_pass_is_cut_off_and_saved_before_the_job_timeout():
+    # A slow Gateway is OpenClaw not answering: the cut-off pass saves its state and stays quiet; ten minutes of it fail.
     d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
     fake(d, slow_probe=5)
     t = time.time()
     rc, err, j = go(d, False, env={'OCF_PASS_HARD_S': '2'})
-    assert rc == 1 and 'cut off' in err and time.time() - t < 5, (rc, err)
-    assert any(k.startswith('slow') for k in json.loads((d / 'st' / 'state.json').read_text())['problems'])
+    assert rc == 0 and not err and time.time() - t < 5, (rc, err)
+    s = json.loads((d / 'st' / 'state.json').read_text())
+    assert s['down_since'] and s['last_pass'] and not s.get('problems'), s      # saved, nothing raised yet
+    s['down_since'] = ms() - 11 * 60_000
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    rc, err, j = go(d, False, env={'OCF_PASS_HARD_S': '2'})
+    assert rc == 1 and 'too slowly for 11 min' in err and 'cut off' in err, (rc, err)
+    fake(d, slow_probe=0)                                             # answers again: the clock stops, the moves go
+    rc, err, j = go(d, True)
+    assert 'down_since' not in json.loads((d / 'st' / 'state.json').read_text()) and len(kinds(j, 'job_move')) == 2, j
+
+
+def test_slow_gateway_clock_starts_when_the_first_cut_off_pass_started():
+    # The grace counts from the start of the first pass that could not finish, not from the moment it was cut off.
+    d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
+    fake(d, slow_probe=5)
+    t = ms()
+    go(d, False, env={'OCF_PASS_HARD_S': '2'})
+    s = json.loads((d / 'st' / 'state.json').read_text())
+    assert t <= s['down_since'] and s['last_pass'] - s['down_since'] >= 1000, (t, s['down_since'], s['last_pass'])
+
+
+def test_update_with_a_clean_self_check_does_not_restart_the_slow_gateway_clock():
+    # After a version change the self-check gets through but the pass is cut off again: the outage goes on.
+    d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
+    go(d)
+    s = json.loads((d / 'st' / 'state.json').read_text())
+    s['down_since'] = ms() - 11 * 60_000
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    fake(d, slow_probe=5)
+    rc, err, j = go(d, True, env={'OCF_PASS_HARD_S': '2', 'OCF_FAKE_VERSION': '2026.11.1'})
+    assert rc == 1 and 'too slowly for 11 min' in err, (rc, err)
+
+
+def test_one_outage_that_turns_from_no_answer_to_slow_fails_only_two_passes():
+    # One clock, one ledger entry: a Gateway that first does not answer and then answers slowly is one problem.
+    d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
+    go(d)
+    s = json.loads((d / 'st' / 'state.json').read_text())
+    s['down_since'] = ms() - 11 * 60_000
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    rcs = [go(d, True, env={'OCF_FAKE_CLI_DOWN': '1'})[0]]
+    fake(d, slow_probe=5)
+    rcs += [go(d, True, env={'OCF_PASS_HARD_S': '2'})[0] for _ in range(4)]
+    led = json.loads((d / 'st' / 'state.json').read_text())['problems']
+    assert rcs == [1, 1, 0, 0, 0] and list(led) == ['gateway'], (rcs, led)
+
+
+def test_cut_off_30_min_check_keeps_its_clock_across_ordinary_passes():
+    # The check runs every 30 min and the passes between it finish: a check cut off each time still fails after
+    # ten minutes, the passes between do not retry it, and a check that finishes stops its clock.
+    d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'ok', PC: 'ok'}})
+    go(d)
+    st = d / 'st' / 'state.json'
+    (d / 'bin' / 'grep').write_text('#!/bin/sh\nif [ "$1" = "-hF" ]; then sleep 6; fi\nexec /usr/bin/grep "$@"\n')
+    (d / 'bin' / 'grep').chmod(0o755)                                  # only the check's log search is slow
+
+    def check_pass():
+        s = json.loads(st.read_text())
+        s['checked_at'] = 0                                           # 30 min since the last check
+        st.write_text(json.dumps(s))
+        return go(d, env={'OCF_PASS_HARD_S': '3'})
+    rc, err, j = check_pass()
+    s = json.loads(st.read_text())
+    assert rc == 0 and not err and not s.get('problems'), (rc, err, s)  # one cut-off: quiet
+    at = s['checked_at']
+    rc, err, j = go(d)                                                 # an ordinary pass: no retry of the check
+    s = json.loads(st.read_text())
+    assert rc == 0 and 'down_since' not in s and s['checked_at'] == at, (rc, err, s)
+    for part in s.get('cut_since', {}):                                # 30 min of ordinary passes go by
+        s['cut_since'][part] -= 30 * 60_000
+    st.write_text(json.dumps(s))
+    rc, err, j = check_pass()
+    assert rc == 1 and 'too slowly for 30 min' in err, (rc, err)
+    (d / 'bin' / 'grep').unlink()                                      # the log search answers again
+    rc, err, j = check_pass()
+    assert 'cut_since' not in json.loads(st.read_text()), st.read_text()
 
 
 def test_prompt_edit_of_a_parked_job_does_not_cancel_the_return():
