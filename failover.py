@@ -5,9 +5,9 @@ Run once a minute by an OpenClaw command job. A limit is always one model on one
 whole account: a probe that answers ok for one model says nothing about another model on that account.
   jobs   an enabled cron job whose model@account is held or probed out moves to the same model on the next live account
          of auth.order, else to the first live entry of agents.defaults.model.fallbacks. The targets of a provider are
-         the accounts its auth.order lists; a provider without one (or with an empty list) has the accounts OpenClaw's
-         automatic selection rotates through: its oauth and token profiles (auth.profiles, else the agent's saved
-         ones), oauth first, then config order. An api_key profile is a target only when auth.order lists it. No return
+         the accounts its auth.order lists; a provider without an auth.order key has the accounts OpenClaw's
+         automatic selection rotates through: its oauth and token profiles in auth.profiles, oauth first, then config
+         order. An api_key profile is a target only when auth.order lists it. No return
          between accounts (no account is preferred). A move to another MODEL is
          temporary: the job goes back to its own model once an account of it is live again. A job is never rerun.
   chats  a pinned human chat (a model or account the user chose, or this script set) is moved the same way on the same
@@ -69,7 +69,6 @@ RPC_DESCRIBE = 'sessions.describe'                                  # one sessio
 RPC_PATCH = 'sessions.patch'                                        # set a chat's model@account
 RPC_ABORT = 'sessions.abort'                                        # abort a stalled run
 PROBE_RESULTS, PROBE_PROFILE, PROBE_STATUS = 'results', 'profileId', 'status'
-PROBE_MODE = 'mode'                                                 # the probed profile's credential type
 PROBE_ARGS = lambda provider, agent: {'provider': provider, 'agentId': agent}   # models.probe params
 DESCRIBE_ARGS = lambda key: {'key': key}                            # sessions.describe params
 PATCH_ARGS = lambda key, ref: {'key': key, 'model': ref}            # sessions.patch params
@@ -417,19 +416,15 @@ class Health:
         # between passes, so limits seen in real runs (stall delay, failed turns, job receipts) are held here, for the
         # model they were seen on only, until the time the provider named. A probe answer never clears a hold.
         self.conf, self.limited, self.cache, self.failed = conf, limited if limited is not None else {}, {}, []
-        self.modes = {}            # {provider: {profile: credential type}} as the probe reported them
 
     def probe(self, provider):
         if provider not in self.cache:
             if FAKE is not None:
                 time.sleep(FAKE.get('slow_probe', 0))
                 res = dict(FAKE.get('probe', {}).get(provider, {}))
-                self.modes[provider] = dict(FAKE.get('modes', {}).get(provider, {}))
             else:
                 d, err = gw(RPC_PROBE, PROBE_ARGS(provider, default_agent()), 120)
-                rows = [r for r in (d or {}).get(PROBE_RESULTS, []) if r.get(PROBE_PROFILE)]
-                res = {r[PROBE_PROFILE]: r.get(PROBE_STATUS) for r in rows}
-                self.modes[provider] = {r[PROBE_PROFILE]: r.get(PROBE_MODE) for r in rows}
+                res = {r[PROBE_PROFILE]: r.get(PROBE_STATUS) for r in (d or {}).get(PROBE_RESULTS, []) if r.get(PROBE_PROFILE)}
                 if d is None:
                     self.failed.append(provider)
                     journal('probe_failed', provider=provider, error=err)
@@ -455,18 +450,15 @@ class Health:
 
     def accounts(self, provider):
         """The accounts that are targets for provider, in order; the one answer for every caller. auth.order[provider]
-        when it lists any. Otherwise the accounts OpenClaw's automatic selection rotates through: the provider's
-        auth.profiles in config order, or, when config declares none, the agent's saved profiles as models.probe
-        reports them; only oauth and token (subscription) profiles, oauth first. OpenClaw then breaks ties by last use;
-        this script prefers no account, so config order stands."""
+        when the key exists (an empty list means none, as in OpenClaw). Otherwise the accounts OpenClaw's automatic
+        selection rotates through: the provider's oauth and token (subscription) profiles in auth.profiles, oauth
+        first, then config order. OpenClaw then breaks ties by last use; this script prefers no account, so config
+        order stands. Profiles only in the agent's saved store are not seen: models.probe does not report their type."""
         order = (self.conf.get('order') or {}).get(provider)
-        if order:
+        if order is not None:
             return list(order)
         modes = {p: v.get(PROFILE_MODE) for p, v in (self.conf.get('profiles') or {}).items()
                  if isinstance(v, dict) and v.get(PROFILE_PROVIDER) == provider}
-        if not modes:
-            self.probe(provider)
-            modes = self.modes.get(provider, {})
         return [p for m in SUB_MODES for p, pm in modes.items() if pm == m]
 
     def target(self, model, avoid=(), chain=True):

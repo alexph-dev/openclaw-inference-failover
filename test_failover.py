@@ -659,25 +659,27 @@ SUBS = {'anthropic:k': {'provider': 'anthropic', 'mode': 'api_key'}, PA: {'provi
 
 @offline
 def test_without_auth_order_targets_are_the_subscription_profiles():
-    # No auth.order for a provider, or an empty list: the targets are what OpenClaw's automatic selection rotates
-    # through, its oauth and token profiles in config order, oauth first. An api_key profile never is.
-    for order in ({}, {'anthropic': []}, {'openai': [OA]}):
+    # No auth.order key for a provider: the targets are what OpenClaw's automatic selection rotates through, its oauth
+    # and token profiles in config order, oauth first. An api_key profile never is.
+    for order in ({}, {'openai': [OA]}):
         h = F.Health({'primary': OPUS, 'chain': [], 'order': order, 'profiles': SUBS})
         assert h.accounts('anthropic') == [PB, PA, PC], (order, h.accounts('anthropic'))
     # With auth.order: that list in its order, an api_key account included when listed, unlisted profiles ignored.
     h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': [PC, 'anthropic:k']}, 'profiles': SUBS})
     assert h.accounts('anthropic') == [PC, 'anthropic:k'] and h.target(OPUS) is None
-    # Config declares no profile for the provider: the agent's saved profiles, with the type models.probe reports.
-    with patch.object(F, 'FAKE', {'probe': {'xai': {'xai:k': 'ok', 'xai:x': 'ok'}},
-                                  'modes': {'xai': {'xai:k': 'api_key', 'xai:x': 'token'}}}):
+    # An empty list is an explicit empty order, as in OpenClaw: no targets.
+    h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': []}, 'profiles': SUBS})
+    assert h.accounts('anthropic') == [] and h.target(OPUS) is None
+    # Config declares no profile for the provider: no targets, and no probe is made to look for any.
+    with patch.object(F, 'FAKE', {'probe': {'xai': {'xai:x': 'ok'}}}):
         h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
-        assert h.accounts('xai') == ['xai:x'] and h.target('xai/grok-4.7') == 'xai/grok-4.7@xai:x'
+        assert h.accounts('xai') == [] and 'xai' not in h.cache
 
 
 def test_pinned_account_limited_without_auth_order_moves_to_a_saved_subscription():
     # The reported install: no auth.order for anthropic, the job's account limited, two other subscriptions ok. The
     # job moves to the first of them in config order instead of reporting no target; the ok api_key account is skipped.
-    for anthropic in (None, []):
+    for anthropic in (None,):
         d = setup(JOBS, [], {'anthropic': {'anthropic:k': 'ok', PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
         c = json.loads((d / 'cfg.json').read_text())
         c['auth']['order'].pop('anthropic')
