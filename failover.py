@@ -5,10 +5,10 @@ Run once a minute by an OpenClaw command job. A limit is always one model on one
 whole account: a probe that answers ok for one model says nothing about another model on that account.
   jobs   an enabled cron job whose model@account is held or probed out moves to the same model on the next live account
          of auth.order, else to the first live entry of agents.defaults.model.fallbacks. The targets of a provider are
-         the accounts its auth.order lists; a provider without an auth.order key has the accounts OpenClaw's
-         automatic selection rotates through: its oauth and token profiles in auth.profiles, oauth first, then config
-         order. An api_key profile is a target only when auth.order lists it. No return
-         between accounts (no account is preferred). A move to another MODEL is
+         the accounts its non-empty auth.order lists; a provider without one (no key or an empty list) has all its
+         subscription accounts: its oauth and token profiles in auth.profiles and in the agent's saved auth store
+         (openclaw models status), oauth first, then config order, then saved order. An api_key profile is a target
+         only when auth.order lists it. No return between accounts (no account is preferred). A move to another MODEL is
          temporary: the job goes back to its own model once an account of it is live again. A job is never rerun.
   chats  a pinned human chat (a model or account the user chose, or this script set) is moved the same way on the same
          passes, whatever its runs did.
@@ -49,6 +49,7 @@ CLI_RUNS = ['cron', 'runs', '--all', '--status', 'error', '--sort', 'desc', '--l
             '--timeout', '60000']                                   # recent failed runs, newest first (200 = cap)
 CLI_EDIT = lambda jid, ref: ['cron', 'edit', jid, '--model', ref, '--timeout', '120000']   # rebind a job to model@account
 CLI_AGENT = lambda key, msg, deliver=True: ['agent', '--session-key', key, '--message', msg] + (['--deliver'] if deliver else []) + ['--timeout', '3600']  # continue on the stored route, or locally
+CLI_MODELS = lambda agent: ['models', 'status', '--json', '--agent', agent]   # the agent's accounts, saved ones too
 CLI_CALL = lambda method, params, ms: ['gateway', 'call', method, '--params', json.dumps(params), '--json', '--timeout', str(ms)]  # one RPC
 # JSON fields of the CLI answers ('a.b' = nested)
 JOBS_LIST, RUNS_LIST = 'jobs', 'entries'                            # top-level lists of cron list / cron runs
@@ -93,9 +94,18 @@ T_CRON, C_CRON_ID, C_CRON_JSON = 'cron_jobs', 'job_id', 'job_json'  # one row pe
 JOB_BINDING = 'inferenceBinding.profileId'                          # the account the job is bound to
 E_MODEL, E_PROVIDER, E_MODEL_SRC = 'modelOverride', 'providerOverride', 'modelOverrideSource'   # entry_json keys
 E_PROFILE, E_PROFILE_SRC, E_USER = 'authProfileOverride', 'authProfileOverrideSource', 'user'   # 'user' = pinned by hand
+# openclaw models status --json: only these fields are read. Never the label next to them, nor
+# auth.providers[].profiles.labels: they show masked keys and emails.
+MS_PROFILES = ('auth', 'oauth', 'profiles')                          # every profile of the agent's auth store, all types
+MS_ID, MS_PROVIDER, MS_TYPE = 'profileId', 'provider', 'type'        # per profile; type is oauth, token or api_key
+MS_COUNTS, MS_COUNT_FIELD = ('auth', 'providers'), 'profiles'      # per provider: raw store counts by type
+MS_COUNT_TYPES = {'oauth': 'oauth', 'token': 'token', 'api_key': 'apiKey'}   # type -> count field
+MS_STATE = 'status'                                                 # per profile: ok, expiring, static, expired, missing
+MS_USABLE = ('ok', 'expiring', 'static')                            # credential states OpenClaw can use
+MS_TIMEOUT_S = 60                                                    # the command reads local files; ~8 s seen
 # Config file
 CFG_MODEL = ('agents', 'defaults', 'model')                         # {primary, fallbacks}
-CFG_ORDER = ('auth', 'order')                                       # account order per provider: its targets when set
+CFG_ORDER = ('auth', 'order')                                       # account order per provider: its targets when not empty
 CFG_PROFILES = ('auth', 'profiles')                                 # optional: declared accounts {id: {provider, mode}}
 PROFILE_PROVIDER, PROFILE_MODE = 'provider', 'mode'
 SUB_MODES = ('oauth', 'token')     # subscription modes, in the order OpenClaw's automatic selection ranks them; never
@@ -416,6 +426,8 @@ class Health:
         # between passes, so limits seen in real runs (stall delay, failed turns, job receipts) are held here, for the
         # model they were seen on only, until the time the provider named. A probe answer never clears a hold.
         self.conf, self.limited, self.cache, self.failed = conf, limited if limited is not None else {}, {}, []
+        self.saved, self.saved_err = None, None    # the agent's saved accounts, read once per pass when first needed
+        self.saved_state, self.saved_skipped = {}, False   # {profile: credential status}; read skipped for time
 
     def probe(self, provider):
         if provider not in self.cache:
@@ -443,24 +455,62 @@ class Health:
         self.limited[k] = max(self.limited.get(k, 0), until)
 
     def alive(self, profile, model):
-        return self.status(profile) == 'ok' and not self.held(profile, model)
+        # Under an empty auth.order list OpenClaw's probe excludes every account ('unknown', excluded_by_auth_order),
+        # so it can prove none live. The owner's rule is to use them all in any order rather than stop: 'unknown' then
+        # counts as usable when the saved store says the credential itself is usable (the probe checks nothing else
+        # there), and a real limit on the account comes back as a hold from its runs.
+        s = self.status(profile)
+        usable = s == 'ok' or (s == 'unknown' and self.empty_order(profile.split(':')[0])
+                               and self.saved_state.get(profile) in MS_USABLE)
+        return usable and not self.held(profile, model)
 
     def dead(self, profile, model):
         return self.held(profile, model) or self.status(profile) in LIMITED
 
+    def ordered(self, provider):
+        """True when a non-empty auth.order lists the provider's targets."""
+        return bool((self.conf.get('order') or {}).get(provider))
+
+    def empty_order(self, provider):
+        """True when auth.order has the provider's key with an empty list."""
+        order = self.conf.get('order') or {}
+        return provider in order and not order[provider]
+
+    def saved_store(self):
+        """[(profile id, provider, type)] of the agent's saved accounts, read at most once per pass. A failed read is
+        journaled and raised as a problem by finish(); the targets are then the config profiles only."""
+        if self.saved is None:
+            self.saved = []
+            if not fits(MS_TIMEOUT_S):       # a late pass already reports 'slow'; the config profiles serve this once
+                journal('saved_profiles_skipped', why='no time left in this pass')
+                self.saved_skipped = True
+                return self.saved
+            try:
+                self.saved, bad, self.saved_state = saved_profiles()
+                if bad:
+                    self.saved_err = 'saved types disagree with the store for %s' % ', '.join(bad)
+                    journal('saved_profiles_failed', error=self.saved_err)
+            except (Shape, Unreachable) as e:
+                self.saved_err = quiet_error(e)
+                journal('saved_profiles_failed', error=self.saved_err)
+        return self.saved
+
     def accounts(self, provider):
         """The accounts that are targets for provider, in order; the one answer for every caller. auth.order[provider]
-        when the key exists (an empty list means none, as in OpenClaw). Otherwise the accounts OpenClaw's automatic
-        selection rotates through: the provider's oauth and token (subscription) profiles in auth.profiles, oauth
-        first, then config order. OpenClaw then breaks ties by last use; this script prefers no account, so config
-        order stands. Profiles only in the agent's saved store are not seen: models.probe does not report their type. An
-        order saved with 'openclaw models auth order set' is not read either; profiles it leaves out probe 'unknown',
-        so they are never chosen."""
+        when it is a non-empty list, api_key profiles included. Otherwise (no key, or an empty list) every subscription
+        account of the provider: its oauth and token profiles in auth.profiles (config order) and in the agent's saved
+        auth store (models status order), each once, oauth first. A profile declared in config keeps its config mode.
+        OpenClaw breaks ties by last use; this script prefers no account, so that order stands. models status is asked
+        only here, so a pass whose providers all have a non-empty auth.order never runs it. An order saved with
+        'openclaw models auth order set' is not read; profiles it leaves out probe 'unknown', so they are never chosen."""
         order = (self.conf.get('order') or {}).get(provider)
-        if order is not None:
+        if self.ordered(provider):
             return list(order)
         modes = {p: v.get(PROFILE_MODE) for p, v in (self.conf.get('profiles') or {}).items()
-                 if isinstance(v, dict) and v.get(PROFILE_PROVIDER) == provider}
+                 if isinstance(v, dict) and v.get(PROFILE_PROVIDER) == provider and p.split(':')[0] == provider}
+        for p, prov, kind in self.saved_store():
+            if prov == provider:
+                modes.setdefault(p, kind)
         return [p for m in SUB_MODES for p, pm in modes.items() if pm == m]
 
     def target(self, model, avoid=(), chain=True):
@@ -478,10 +528,14 @@ class Health:
         """True when a probe failed or timed out for a target account (accounts()): 'nothing alive' is then unproven.
         auth, no_model and format are definite answers (that account cannot be used), so an expired token does not hide
         'nothing alive'. An account that is not a target is never chosen, so its answer does not matter. For a provider
-        without an auth.order key, 'unknown' counts as a definite answer: OpenClaw reports it for a profile that an order
-        saved with 'openclaw models auth order set' leaves out (excluded_by_auth_order), which this script cannot read."""
+        without a non-empty auth.order, 'unknown' counts as a definite answer: OpenClaw reports it for a profile that an
+        order saved with 'openclaw models auth order set' leaves out (excluded_by_auth_order), which this script cannot
+        read. A failed models status read does not count: the config profiles are then the targets. A read skipped
+        because the pass ran out of time does: saved-only accounts were not looked at."""
+        if self.saved_skipped:
+            return True
         def open_(prov):
-            return ('timeout', 'unknown', None) if (self.conf.get('order') or {}).get(prov) is not None else ('timeout', None)
+            return ('timeout', 'unknown', None) if self.ordered(prov) else ('timeout', None)
         return bool(self.failed) or any(s in open_(prov) for prov, r in list(self.cache.items())
                                         for p, s in r.items() if p in self.accounts(prov))
 
@@ -505,6 +559,46 @@ def cli_json(argv, timeout=75):
             raise Shape('cli: openclaw %s: answer is not a JSON object' % k)
         _CACHE[k] = d
     return _CACHE[k]
+
+
+def saved_profiles():
+    """[(profile id, provider, type)] of every account in the default agent's auth store, saved-only ones included.
+    Reads id, provider and type only: a profile's label shows a masked key or an email.
+    Returns (rows, providers whose rows were dropped). A plugin's runtime credential can override the reported type for
+    a whole provider (e.g. an API key in the environment), so a provider's rows are kept only when their types match
+    the raw store counts in auth.providers[].profiles; a row whose id prefix is not its provider is skipped, because
+    the probe of that account would ask another provider."""
+    d = cli_json(CLI_MODELS(default_agent()), MS_TIMEOUT_S)
+    rows = dig(d, MS_PROFILES)
+    if not isinstance(rows, list) or not all(isinstance(r, dict) and all(isinstance(r.get(k), str) for k in
+                                                                         (MS_ID, MS_PROVIDER, MS_TYPE)) for r in rows):
+        raise Shape(MS_SHAPE_ERR)
+    counts = {}
+    for p in dig(d, MS_COUNTS) or []:
+        c = p.get(MS_COUNT_FIELD) if isinstance(p, dict) else None
+        if isinstance(c, dict) and isinstance(p.get(MS_PROVIDER), str):
+            counts[p[MS_PROVIDER]] = {t: c.get(f) for t, f in MS_COUNT_TYPES.items()}
+    rows = [(r[MS_ID], r[MS_PROVIDER], r[MS_TYPE]) for r in rows]
+    bad = sorted(pv for pv in {pv for _, pv, _ in rows}
+                 if counts.get(pv) != {t: sum(1 for _, q, k in rows if q == pv and k == t) for t in MS_COUNT_TYPES})
+    state = {r[MS_ID]: r.get(MS_STATE) for r in dig(d, MS_PROFILES)}
+    return [r for r in rows if r[1] not in bad and r[0].split(':')[0] == r[1]], bad, state
+
+
+MS_SHAPE_ERR = 'cli: openclaw %s: no list %s of {%s, %s, %s}' % (' '.join(CLI_MODELS('<agent>')), '.'.join(MS_PROFILES),
+                                                                 MS_ID, MS_PROVIDER, MS_TYPE)
+
+
+def quiet_error(e):
+    """A failed models status read without the command's output, which may carry account labels."""
+    s = str(e)
+    if s == MS_SHAPE_ERR:
+        return s
+    for t in ('timeout', 'no time left in this pass', 'no complete JSON answer', 'is not accepted', 'not a JSON object'):
+        if t in s:
+            return t
+    m = re.search(r'rc=-?\d+', s)
+    return m.group(0) if m else type(e).__name__
 
 
 class Shape(Exception):
@@ -1524,7 +1618,15 @@ def main():
     if '--check' in sys.argv:
         try:
             ver, missing = openclaw_version(), selfcheck()
-            print(json.dumps({'openclaw': ver, 'missing': missing}, indent=1, ensure_ascii=False))
+            try:                   # optional: without it the targets are the config profiles, so it is not 'missing'
+                bad = saved_profiles()[1]
+                saved = 'ok' if not bad else 'saved types disagree with the store for %s' % ', '.join(bad)
+                if bad:
+                    prob(out, 'saved-profiles', 'openclaw %s: %s' % (' '.join(CLI_MODELS('<agent>')), saved))
+            except (Shape, Unreachable) as e:
+                saved = quiet_error(e)
+                prob(out, 'saved-profiles', 'openclaw %s could not be read: %s' % (' '.join(CLI_MODELS('<agent>')), saved))
+            print(json.dumps({'openclaw': ver, 'missing': missing, 'saved_profiles': saved}, indent=1, ensure_ascii=False))
             if missing:
                 prob(out, 'selfcheck', 'OpenClaw %s lacks what this script reads: %s' % (ver, '; '.join(missing)))
             else:
@@ -1635,6 +1737,9 @@ def finish(state, out, ev, streak, health):
         models = sorted({m for _, m in out['no_target']})
         prob(out, 'no_target:' + ','.join(models), 'no live account or fallback model for %s: %s'
              % (', '.join(models), ', '.join(i for i, _ in out['no_target'][:8])))
+    if health.saved_err:
+        prob(out, 'saved-profiles', 'openclaw %s could not be used (%s): accounts only in the agent\'s saved auth store '
+             'are not targets until it can' % (' '.join(CLI_MODELS('<agent>')), health.saved_err))
     state['last_pass'] = NOW()
     due = raise_due(state, out) if APPLY else sorted({t for _, t in out['problems']})
     save(state)
