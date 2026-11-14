@@ -14,7 +14,7 @@ fixed, and delete the whole script when all of them are.
 
 A limit is always one model on one account (model@account), never a whole account: a probe that answers ok for one
 model says nothing about another model on that account. The targets of a provider are the accounts `auth.order` lists
-for it, in that order; a provider without an `auth.order` entry (or with an empty list) has the accounts OpenClaw's
+for it, in that order; a provider without an `auth.order` key has the accounts OpenClaw's
 automatic selection uses (see "Targets" under Requirements and limits). After those come the entries of
 `agents.defaults.model.fallbacks`.
 
@@ -64,7 +64,6 @@ automatic selection uses (see "Targets" under Requirements and limits). After th
 | Account status | Gateway RPC `models.probe` |
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
 | Model, fallbacks, account order and declared accounts (the targets) | config file (`~/.openclaw/openclaw.json`) |
-| Saved accounts and their type, when config declares none for a provider | Gateway RPC `models.probe` (`mode` per profile) |
 | Chats' pinned model/account and queued input | internal: tables `session_nodes` and `session_pending_inputs` in each agent database (read-only) |
 | The recorded account of a job whose `payload.model` names no account | internal: table `cron_jobs` (`inferenceBinding.profileId`) in `state/openclaw.sqlite` (read-only); `cron list` does not show it |
 | Stalls and failed turns | internal: Gateway log lines (`/tmp/openclaw*/openclaw-*.log`) |
@@ -110,10 +109,10 @@ Requirements and limits:
 - `openclaw cron list` returns one page of 200 jobs and has no paging option. With more jobs the script reports it
   and watches only the first page.
 - Targets: with an `auth.order` entry for a provider, an account is chosen only when that entry lists it, whatever
-  the probe reports about it and however it is billed. Without one (key missing or an empty list) the targets are the
-  set OpenClaw's automatic selection rotates through: the provider's `auth.profiles` in config order, or, when config
-  declares none for it, the agent's saved profiles; only `oauth` and `token` profiles, `oauth` first, as OpenClaw
-  ranks them. OpenClaw then breaks ties by last use; this script prefers no account, so config order stands. An
+  the probe reports about it and however it is billed; an empty list means no account, as in OpenClaw. Without the
+  key the targets are the set OpenClaw's automatic selection rotates through: the provider's `oauth` and `token`
+  profiles in `auth.profiles`, `oauth` first, then config order. A profile only in the agent's saved store is not a
+  target: `models.probe` does not report its type. OpenClaw then breaks ties by last use; this script prefers no account, so config order stands. An
   `api_key` profile is billed per token and is a target only when `auth.order` lists it. Work that can go nowhere
   else is reported as having no live account.
 - Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
