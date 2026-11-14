@@ -674,22 +674,27 @@ def test_without_auth_order_targets_are_the_subscription_profiles():
     with patch.object(F, 'FAKE', {'probe': {'xai': {'xai:x': 'ok'}}}):
         h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
         assert h.accounts('xai') == [] and 'xai' not in h.cache
+    # No auth.order key: a declared profile that probes 'unknown' (left out by a CLI-saved order) does not make
+    # 'nothing alive' unproven; with a config auth.order it still does.
+    h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
+    h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown', PC: 'unknown'}
+    assert not h.unknown() and h.target(OPUS) is None
+    h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': [PA, PB]}, 'profiles': SUBS})
+    h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown'}
+    assert h.unknown()
 
 
-def test_pinned_account_limited_without_auth_order_moves_to_a_saved_subscription():
+def test_pinned_account_limited_without_auth_order_moves_to_a_declared_subscription():
     # The reported install: no auth.order for anthropic, the job's account limited, two other subscriptions ok. The
     # job moves to the first of them in config order instead of reporting no target; the ok api_key account is skipped.
-    for anthropic in (None,):
-        d = setup(JOBS, [], {'anthropic': {'anthropic:k': 'ok', PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
-        c = json.loads((d / 'cfg.json').read_text())
-        c['auth']['order'].pop('anthropic')
-        if anthropic is not None:
-            c['auth']['order']['anthropic'] = anthropic
-        c['auth']['profiles'] = {k: dict(v, mode='token') if k == PB else v for k, v in SUBS.items()}
-        (d / 'cfg.json').write_text(json.dumps(c))
-        rc, err, j = go(d, True)
-        assert {(r['job'], r['to']) for r in kinds(j, 'job_move')} == {('a', OPUS + '@' + PC), ('b', OPUS + '@' + PC)}, (anthropic, err, j)
-        assert 'no live account' not in err and 'no_target' not in err, err
+    d = setup(JOBS, [], {'anthropic': {'anthropic:k': 'ok', PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
+    c = json.loads((d / 'cfg.json').read_text())
+    c['auth']['order'].pop('anthropic')
+    c['auth']['profiles'] = {k: dict(v, mode='token') if k == PB else v for k, v in SUBS.items()}
+    (d / 'cfg.json').write_text(json.dumps(c))
+    rc, err, j = go(d, True)
+    assert {(r['job'], r['to']) for r in kinds(j, 'job_move')} == {('a', OPUS + '@' + PC), ('b', OPUS + '@' + PC)}, (err, j)
+    assert 'no live account' not in err and 'no_target' not in err, err
 
 
 def test_landed_edit_of_a_job_already_on_a_fallback_keeps_its_way_home():
