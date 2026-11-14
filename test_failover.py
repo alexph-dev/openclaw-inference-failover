@@ -730,10 +730,21 @@ def test_without_auth_order_targets_are_the_subscription_profiles():
     h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
     h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown', PC: 'unknown'}
     assert not h.unknown() and h.target(OPUS) is None
-    h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': []}, 'profiles': SUBS})
-    h.cache['anthropic'] = {PA: 'unknown', PB: 'unknown', PC: 'unknown'}
-    h.hold(PB, F.NOW() + 3600000, OPUS)
-    assert not h.unknown() and h.target(OPUS, avoid=(PA,)) == OPUS + '@' + PC
+    with saved_cli([(PA, 'token'), (PB, 'oauth'), (PC, 'token')]):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': []}, 'profiles': SUBS})
+        h.cache['anthropic'] = {PA: 'unknown', PB: 'unknown', PC: 'unknown'}
+        h.hold(PB, F.NOW() + 3600000, OPUS)
+        assert not h.unknown() and h.target(OPUS, avoid=(PA,)) == OPUS + '@' + PC
+    # ... but not an account whose saved credential is expired or missing: the probe checks nothing under [].
+    d = models_status([(PA, 'token'), (PB, 'oauth'), (PC, 'token')])
+    for r in d['auth']['oauth']['profiles']:
+        if r['profileId'] == PC:
+            r['status'] = 'expired'
+    with patch.object(F, 'cli_json', lambda argv, timeout=75: d):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': []}, 'profiles': SUBS})
+        h.cache['anthropic'] = {PA: 'unknown', PB: 'unknown', PC: 'unknown'}
+        h.hold(PB, F.NOW() + 3600000, OPUS)
+        assert h.target(OPUS, avoid=(PA,)) is None
     h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': [PA, PB]}, 'profiles': SUBS})
     h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown'}
     assert h.unknown()
@@ -751,7 +762,7 @@ def test_saved_rows_are_dropped_when_types_differ_from_store_counts_or_ids_name_
     d['auth']['oauth']['profiles'].append({'profileId': 'codex:w', 'provider': 'openai', 'type': 'oauth'})
     d['auth']['providers'][[p['provider'] for p in d['auth']['providers']].index('openai')]['profiles']['oauth'] += 1
     with patch.object(F, 'cli_json', lambda argv, timeout=75: d):
-        rows, bad = F.saved_profiles()
+        rows, bad, _ = F.saved_profiles()
     assert bad == ['xai'] and rows == [(OA, 'openai', 'oauth')], (rows, bad)
     with patch.object(F, 'cli_json', lambda argv, timeout=75: d):
         h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {}})
@@ -764,6 +775,11 @@ def test_a_late_pass_skips_models_status_without_a_problem():
     with saved_cli([(OA, 'oauth')], calls), patch.object(F, 'fits', lambda s: False):
         h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {}})
         assert h.accounts('openai') == [] and not calls and h.saved_err is None
+        assert h.unknown()             # saved-only accounts were not looked at: 'nothing alive' is unproven
+    # A config profile whose id names another provider is not a target either (its probe would ask that provider).
+    with saved_cli([]):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {'x:n': {'provider': 'anthropic', 'mode': 'token'}}})
+        assert h.accounts('anthropic') == []
 
 
 @offline
