@@ -725,14 +725,45 @@ def test_without_auth_order_targets_are_the_subscription_profiles():
         h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
         assert h.accounts('xai') == [] and 'xai' not in h.cache
     # No non-empty auth.order: a profile that probes 'unknown' (left out by a CLI-saved order) does not make 'nothing
-    # alive' unproven, with no key or with an empty list; with a non-empty config auth.order it still does.
-    for order in ({}, {'anthropic': []}):
-        h = F.Health({'primary': OPUS, 'chain': [], 'order': order, 'profiles': SUBS})
-        h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown', PC: 'unknown'}
-        assert not h.unknown() and h.target(OPUS) is None, order
+    # alive' unproven; with a non-empty config auth.order it still does. Under an empty list OpenClaw's probe answers
+    # 'unknown' for every account, and those accounts are used anyway (any order rather than stopping).
+    h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': SUBS})
+    h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown', PC: 'unknown'}
+    assert not h.unknown() and h.target(OPUS) is None
+    h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': []}, 'profiles': SUBS})
+    h.cache['anthropic'] = {PA: 'unknown', PB: 'unknown', PC: 'unknown'}
+    h.hold(PB, F.NOW() + 3600000, OPUS)
+    assert not h.unknown() and h.target(OPUS, avoid=(PA,)) == OPUS + '@' + PC
     h = F.Health({'primary': OPUS, 'chain': [], 'order': {'anthropic': [PA, PB]}, 'profiles': SUBS})
     h.cache['anthropic'] = {PA: 'rate_limit', PB: 'unknown'}
     assert h.unknown()
+
+
+@offline
+def test_saved_rows_are_dropped_when_types_differ_from_store_counts_or_ids_name_another_provider():
+    # A plugin runtime credential reports every xai account as api_key while the store holds an oauth one: the counts
+    # disagree, so no xai row is trusted and the mismatch is a problem. A row whose id names another provider is
+    # skipped; its provider's other rows stay.
+    d = models_status([('xai:x', 'oauth'), (OA, 'oauth')])
+    for r in d['auth']['oauth']['profiles']:
+        if r['provider'] == 'xai':
+            r['type'] = 'api_key'
+    d['auth']['oauth']['profiles'].append({'profileId': 'codex:w', 'provider': 'openai', 'type': 'oauth'})
+    d['auth']['providers'][[p['provider'] for p in d['auth']['providers']].index('openai')]['profiles']['oauth'] += 1
+    with patch.object(F, 'cli_json', lambda argv, timeout=75: d):
+        rows, bad = F.saved_profiles()
+    assert bad == ['xai'] and rows == [(OA, 'openai', 'oauth')], (rows, bad)
+    with patch.object(F, 'cli_json', lambda argv, timeout=75: d):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {}})
+        assert h.accounts('xai') == [] and h.accounts('openai') == [OA] and 'xai' in h.saved_err
+
+
+@offline
+def test_a_late_pass_skips_models_status_without_a_problem():
+    calls = []
+    with saved_cli([(OA, 'oauth')], calls), patch.object(F, 'fits', lambda s: False):
+        h = F.Health({'primary': OPUS, 'chain': [], 'order': {}, 'profiles': {}})
+        assert h.accounts('openai') == [] and not calls and h.saved_err is None
 
 
 @offline
@@ -768,7 +799,7 @@ def test_saved_store_profiles_are_targets_once_and_api_keys_only_when_listed():
 def test_empty_auth_order_and_saved_only_account_move_the_job():
     # anthropic: auth.order [] (same as no key), PA limited, PB only in the saved store; openai has no auth.order and
     # its live accounts are an api_key and an oauth account, both only in the saved store.
-    d = setup(JOBS, [], {'anthropic': {PA: 'rate_limit', PB: 'ok', 'anthropic:k': 'ok'},
+    d = setup(JOBS, [], {'anthropic': {PA: 'rate_limit', PB: 'unknown', 'anthropic:k': 'unknown'},
                          'openai': {'openai:default': 'rate_limit', 'openai:k': 'ok', OA: 'ok'}, 'xai': {'xai:x': 'rate_limit'}})
     c = json.loads((d / 'cfg.json').read_text())
     c['auth'] = {'order': {'anthropic': [], 'xai': ['xai:x']}, 'profiles': {PA: SUBS[PA], 'openai:default': {'provider': 'openai', 'mode': 'oauth'}}}
