@@ -2795,9 +2795,12 @@ def cron_stall(state, jobs, key, jid, s, r, p, out):
     """A cron run sleeping out a long rate-limit wait is aborted so it does not sit for hours. Its job was rebound by
     jobs_pass (the stall holds the model@account), so the next scheduled run uses the new binding; the aborted run is
     not replayed. A one-shot (at) job's run is left alone: an abort disables the job without a notice, while its
-    timeout is retried by the scheduler on the new binding."""
+    timeout is retried by the scheduler on the new binding.
+    The session's active flag is not read: OpenClaw clears a cron run's handle at the end of each attempt and sleeps
+    the same-model retry outside it, so a sleeping cron run reports no active run. Only a log line of the run after
+    the stall shows that it woke up or ended. An abort that stops no run leaves it sleeping and is a problem."""
     pend, handled = state['pending'], state['handled']
-    if not s.get(S_ACTIVE) or any(ts_ms(x) > p['t'] + 5000 for x in log_lines(r)):
+    if any(ts_ms(x) > p['t'] + 5000 for x in log_lines(r)):
         return drop_event(pend, r, p, key, 'the cron run woke up or ended')
     if not fits(30):
         return
@@ -2807,7 +2810,12 @@ def cron_stall(state, jobs, key, jid, s, r, p, out):
     if not j or j.get('kind') == 'at':
         return journal('cron_stall_left', session=key, run=r, why='one-shot job: its timeout retry runs on the new '
                        'binding' if j else 'job not in the job list: it may be a one-shot job')
-    d, err = (1, '') if (FAKE is not None or not APPLY) else gw(RPC_ABORT, ABORT_ARGS(key, r), 30)
+    d, err = ((FAKE or {}).get('abort_answer', {A_ABORTED_RUN: r}), '') if (FAKE is not None or not APPLY) else \
+        gw(RPC_ABORT, ABORT_ARGS(key, r), 30)
+    if d and d.get(A_ABORTED_RUN) != r:    # answered, but no run was stopped: it still sleeps
+        journal('cron_stall_abort', session=key, run=r, wait_ms=p['until'] - p['t'], result='no-active-run')
+        return prob(out, 'abort:' + r, 'stalled cron run %s sleeps until %s and sessions.abort found no active run to '
+                    'stop' % (key[-50:], time.strftime('%Y-%m-%d %H:%M', time.localtime(p['until'] / 1000))))
     journal('cron_stall_abort', session=key, run=r, wait_ms=p['until'] - p['t'], result='ok' if d else err)
     out['aborted'].append(key[-50:])
     if not d:

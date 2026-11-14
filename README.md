@@ -52,6 +52,8 @@ limits). After those come the entries of
   is live in time. Use it for conversations that must only ever run on one model.
 - **Stalled runs.** A run that sleeps out a long same-model rate-limit wait is aborted, and that model@account is held
   until the time the provider named. One-shot (`at`) jobs are never aborted. An aborted cron run is not replayed. A
+  cron run counts as still sleeping until the Gateway log names it again (a sleeping cron run's session reports no
+  active run), and an abort that stops no run is raised as a problem. A
   subagent's stalled run is aborted too, so its parent sees it end as killed now instead of days later; it is not
   moved or continued, because the parent chose its model.
 - **Turns that died on a limit.** A human chat turn whose run died on a limit is continued on a live model@account
