@@ -3,13 +3,15 @@
 
 Run once a minute by an OpenClaw command job. A limit is always one model on one account (model@account), never a
 whole account: a probe that answers ok for one model says nothing about another model on that account.
-  jobs   an enabled cron job whose model@account is held or probed out moves to the same model on the next live account
+  jobs   a cron job whose model@account is held or probed out moves to the same model on the next live account
          of auth.order, else to the first live entry of agents.defaults.model.fallbacks. The targets of a provider are
          the accounts its non-empty auth.order lists; a provider without one (no key or an empty list) has all its
          subscription accounts: its oauth and token profiles in auth.profiles and in the agent's saved auth store
          (openclaw models status), oauth first, then config order, then saved order. An api_key profile is a target
          only when auth.order lists it. No return between accounts (no account is preferred). A move to another MODEL is
          temporary: the job goes back to its own model once an account of it is live again. A job is never rerun.
+         A disabled job moves too, after the chats, and stays disabled, so a run started by hand ('cron run') finds a
+         live account. It never triggers a probe or a no-target problem; a disabled one-shot job is left alone.
   chats  a pinned human chat (a model or account the user chose, or this script set) is moved the same way on the same
          passes, whatever its runs did.
   strict chats  session keys listed in OCF_STRICT_CHATS (comma-separated) never change model: they move only to
@@ -60,6 +62,7 @@ JOB_F = {'id': 'id', 'enabled': 'enabled', 'name': 'name',          # per job in
          'last': 'state.lastRunStatus', 'last_at': 'state.lastRunAtMs', 'streak': 'state.consecutiveErrors',
          'pkind': 'payload.kind'}                                   #   'agentTurn' for AI jobs (command jobs have no account)
 AGENT_TURN = 'agentTurn'
+AT_KIND = 'at'                                                      # schedule.kind of a one-shot job
 JOB_REQUIRED = ('id', 'enabled', 'model', 'kind', 'next', 'mode')   # fields every job list must show somewhere
 JOB_REQUIRED_RUN = ('last', 'streak')                               # and these once any job has run (shows 'last_at')
 JOB_TRUSTED = 'trusted'                                             # scheduledToolPolicy.mode of an operator job
@@ -167,6 +170,7 @@ PASS_SOFT_S = 200              # no new Gateway call is started after this
 PASS_HARD_S = int(os.environ.get('OCF_PASS_HARD_S', 270))   # a running call is cut off here: the job's own timeout is 300 s
 GONE_MS = 70 * 60_000          # a problem not seen for this long (two 30-min checks) and seen again is a new one
 PASS_BUDGET_S = 40             # stop starting new edits after this; the next minute continues
+DISABLED_BUDGET_S = float(os.environ.get('OCF_DISABLED_BUDGET_S', 10))   # edits of disabled jobs per pass, after chats
 CHAT_MAX_PER_HOUR = 2
 HOLD_MS = 3600_000             # a model@account that failed on a limit without naming a wait is not a target this long
 RERAISE_MS = 6 * 3600_000      # an unfixed problem fails the run once, then again only after this long
@@ -428,8 +432,11 @@ class Health:
         self.conf, self.limited, self.cache, self.failed = conf, limited if limited is not None else {}, {}, []
         self.saved, self.saved_err = None, None    # the agent's saved accounts, read once per pass when first needed
         self.saved_state, self.saved_skipped = {}, False   # {profile: credential status}; read skipped for time
+        self.no_probe = False                # True: a provider not asked yet this pass answers nothing, unasked
 
     def probe(self, provider):
+        if provider not in self.cache and self.no_probe:
+            return {}
         if provider not in self.cache:
             if FAKE is not None:
                 time.sleep(FAKE.get('slow_probe', 0))
@@ -478,7 +485,10 @@ class Health:
 
     def saved_store(self):
         """[(profile id, provider, type)] of the agent's saved accounts, read at most once per pass. A failed read is
-        journaled and raised as a problem by finish(); the targets are then the config profiles only."""
+        journaled and raised as a problem by finish(); the targets are then the config profiles only. Under no_probe a
+        read not made yet is not made: the config profiles serve, and nothing is skipped or failed."""
+        if self.saved is None and self.no_probe:
+            return []
         if self.saved is None:
             self.saved = []
             if not fits(MS_TIMEOUT_S):       # a late pass already reports 'slow'; the config profiles serve this once
@@ -861,12 +871,18 @@ def park(state, kind, ident, own, tgt):
 ripe = lambda h: NOW() - h.get('at', 0) >= h.get('wait', 0)
 
 
-def jobs_pass(conf, jobs, health, state, t0, out):
+def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
     """Every enabled job whose model@account is held or probed out moves to a live one, soonest-due first. A job parked
     on a fallback model goes back to its own model once an account of that model is live and not held for it. A job
-    is only rebound, never run: its next scheduled run uses the new binding."""
+    is only rebound, never run: its next scheduled run uses the new binding.
+    disabled=True runs the same for disabled jobs, after all other work of a pass that asked the accounts, so a run started by hand ('cron run') finds a live
+    account; they stay disabled. It costs the other work nothing: the caller sets health.no_probe, so only what the
+    pass already learned counts (an unasked provider is neither dead nor live), the moves get DISABLED_BUDGET_S from
+    the start of this call, and no target or a legacy mode is not a problem. A failed edit is still reported. A
+    disabled one-shot (at) job has run already and is left alone."""
+    t1 = time.time()
     home = state.setdefault('home', {})      # {job: {'model': its own model, 'parked': 'fallback@account'}}
-    for jid, u in list(state.setdefault('unsure', {}).items()):
+    for jid, u in list(state.setdefault('unsure', {}).items()) if not disabled else ():   # once, before any edit
         state['unsure'].pop(jid)             # an edit that reported failure (a timeout) may still have landed
         if jid in jobs and jobs[jid]['model'] == u['tgt']:
             journal('job_move', job=jid, name=jobs[jid]['name'][:60], frm=u['frm'], to=u['tgt'], result='ok',
@@ -879,7 +895,9 @@ def jobs_pass(conf, jobs, health, state, t0, out):
             state.get('problems', {}).pop('rebind:' + jid, None)   # the failure reported last pass did not happen
     todo = []
     for jid, j in jobs.items():
-        if not (j['enabled'] and j['profile']):
+        if j['enabled'] == disabled:
+            continue                         # the other call's job
+        if not j['profile'] or disabled and j['kind'] == AT_KIND:
             home.pop(jid, None)
             continue
         ref = j['model'] or conf['primary'] + '@' + j['profile']
@@ -894,25 +912,28 @@ def jobs_pass(conf, jobs, health, state, t0, out):
     for _, jid, back in sorted(todo, key=lambda x: x[:2]):
         j = jobs[jid]
         if j['mode'] != JOB_TRUSTED:
+            if disabled:
+                continue
             prob(out, 'legacy:' + jid, 'legacy account-mode job %s (%s) is on exhausted %s; recreate it as an operator job'
                  % (jid[:8], j['name'][:40], j['profile']))
             continue
-        if time.time() - t0 > PASS_BUDGET_S:
-            out['deferred'] += 1
+        if (time.time() - t1 > DISABLED_BUDGET_S) if disabled else (time.time() - t0 > PASS_BUDGET_S):
+            out['later' if disabled else 'deferred'] += 1
             continue
         model = MODEL(j['model'] or conf['primary'])
         own = home.get(jid, {}).get('model', model)
         tgt = back or health.target(own, avoid=(j['profile'],))
         if not tgt:
-            out['no_target'].append((jid[:8], own))
+            if not disabled:
+                out['no_target'].append((jid[:8], own))
             continue
         if not fits(180):
-            out['deferred'] += 1
+            out['later' if disabled else 'deferred'] += 1
             continue
         r = cron_edit(jid, tgt)
         journal('job_move', job=jid, name=j['name'][:60], frm=model + '@' + j['profile'], to=tgt, result=r)
         if r == 'write_limited':
-            out['deferred'] += 1
+            out['later' if disabled else 'deferred'] += 1
             break
         if r in ('ok', 'dry-run'):
             out['moved'].append((jid[:8], tgt))
@@ -1611,7 +1632,7 @@ def status(state):
 
 
 def main():
-    out = {'moved': [], 'chats': [], 'continued': [], 'aborted': [], 'no_target': [], 'problems': [], 'deferred': 0}
+    out = {'moved': [], 'chats': [], 'continued': [], 'aborted': [], 'no_target': [], 'problems': [], 'deferred': 0, 'later': 0}
     state = load_state()
     if '--status' in sys.argv:
         return status(state)
@@ -1690,6 +1711,12 @@ def main():
             state['retry'] = bool(out['deferred'] or out['no_target'] or health.failed)
         stalls_and_chats(state, health, jobs, out)
         continued_check(state, out)
+        if health.cache:                     # disabled jobs last, on what this pass already asked; their wait ('later')
+            health.no_probe = True           # does not make the next pass probe
+            try:
+                jobs_pass(conf, jobs, health, state, t0, out, disabled=True)
+            finally:
+                health.no_probe = False
         if APPLY and not late() and NOW() - state.get('checked_at', 0) >= CHECK_EVERY_MS:
             state['checked_at'] = NOW()
             check(state, out, jobs)
