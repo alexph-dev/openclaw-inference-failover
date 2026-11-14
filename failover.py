@@ -100,6 +100,8 @@ MS_PROFILES = ('auth', 'oauth', 'profiles')                          # every pro
 MS_ID, MS_PROVIDER, MS_TYPE = 'profileId', 'provider', 'type'        # per profile; type is oauth, token or api_key
 MS_COUNTS, MS_COUNT_FIELD = ('auth', 'providers'), 'profiles'      # per provider: raw store counts by type
 MS_COUNT_TYPES = {'oauth': 'oauth', 'token': 'token', 'api_key': 'apiKey'}   # type -> count field
+MS_STATE = 'status'                                                 # per profile: ok, expiring, static, expired, missing
+MS_USABLE = ('ok', 'expiring', 'static')                            # credential states OpenClaw can use
 MS_TIMEOUT_S = 60                                                    # the command reads local files; ~8 s seen
 # Config file
 CFG_MODEL = ('agents', 'defaults', 'model')                         # {primary, fallbacks}
@@ -425,6 +427,7 @@ class Health:
         # model they were seen on only, until the time the provider named. A probe answer never clears a hold.
         self.conf, self.limited, self.cache, self.failed = conf, limited if limited is not None else {}, {}, []
         self.saved, self.saved_err = None, None    # the agent's saved accounts, read once per pass when first needed
+        self.saved_state, self.saved_skipped = {}, False   # {profile: credential status}; read skipped for time
 
     def probe(self, provider):
         if provider not in self.cache:
@@ -454,9 +457,12 @@ class Health:
     def alive(self, profile, model):
         # Under an empty auth.order list OpenClaw's probe excludes every account ('unknown', excluded_by_auth_order),
         # so it can prove none live. The owner's rule is to use them all in any order rather than stop: 'unknown' then
-        # counts as usable, and a real limit on the account comes back as a hold from its runs.
+        # counts as usable when the saved store says the credential itself is usable (the probe checks nothing else
+        # there), and a real limit on the account comes back as a hold from its runs.
         s = self.status(profile)
-        return (s == 'ok' or (s == 'unknown' and self.empty_order(profile.split(':')[0]))) and not self.held(profile, model)
+        usable = s == 'ok' or (s == 'unknown' and self.empty_order(profile.split(':')[0])
+                               and self.saved_state.get(profile) in MS_USABLE)
+        return usable and not self.held(profile, model)
 
     def dead(self, profile, model):
         return self.held(profile, model) or self.status(profile) in LIMITED
@@ -477,11 +483,12 @@ class Health:
             self.saved = []
             if not fits(MS_TIMEOUT_S):       # a late pass already reports 'slow'; the config profiles serve this once
                 journal('saved_profiles_skipped', why='no time left in this pass')
+                self.saved_skipped = True
                 return self.saved
             try:
-                self.saved, bad = saved_profiles()
+                self.saved, bad, self.saved_state = saved_profiles()
                 if bad:
-                    self.saved_err = 'types differ from the store counts for %s' % ', '.join(bad)
+                    self.saved_err = 'saved types disagree with the store for %s' % ', '.join(bad)
                     journal('saved_profiles_failed', error=self.saved_err)
             except (Shape, Unreachable) as e:
                 self.saved_err = quiet_error(e)
@@ -500,7 +507,7 @@ class Health:
         if self.ordered(provider):
             return list(order)
         modes = {p: v.get(PROFILE_MODE) for p, v in (self.conf.get('profiles') or {}).items()
-                 if isinstance(v, dict) and v.get(PROFILE_PROVIDER) == provider}
+                 if isinstance(v, dict) and v.get(PROFILE_PROVIDER) == provider and p.split(':')[0] == provider}
         for p, prov, kind in self.saved_store():
             if prov == provider:
                 modes.setdefault(p, kind)
@@ -523,7 +530,10 @@ class Health:
         'nothing alive'. An account that is not a target is never chosen, so its answer does not matter. For a provider
         without a non-empty auth.order, 'unknown' counts as a definite answer: OpenClaw reports it for a profile that an
         order saved with 'openclaw models auth order set' leaves out (excluded_by_auth_order), which this script cannot
-        read. A failed models status read does not count: the config profiles are then the targets."""
+        read. A failed models status read does not count: the config profiles are then the targets. A read skipped
+        because the pass ran out of time does: saved-only accounts were not looked at."""
+        if self.saved_skipped:
+            return True
         def open_(prov):
             return ('timeout', 'unknown', None) if self.ordered(prov) else ('timeout', None)
         return bool(self.failed) or any(s in open_(prov) for prov, r in list(self.cache.items())
@@ -571,7 +581,8 @@ def saved_profiles():
     rows = [(r[MS_ID], r[MS_PROVIDER], r[MS_TYPE]) for r in rows]
     bad = sorted(pv for pv in {pv for _, pv, _ in rows}
                  if counts.get(pv) != {t: sum(1 for _, q, k in rows if q == pv and k == t) for t in MS_COUNT_TYPES})
-    return [r for r in rows if r[1] not in bad and r[0].split(':')[0] == r[1]], bad
+    state = {r[MS_ID]: r.get(MS_STATE) for r in dig(d, MS_PROFILES)}
+    return [r for r in rows if r[1] not in bad and r[0].split(':')[0] == r[1]], bad, state
 
 
 MS_SHAPE_ERR = 'cli: openclaw %s: no list %s of {%s, %s, %s}' % (' '.join(CLI_MODELS('<agent>')), '.'.join(MS_PROFILES),
@@ -1608,7 +1619,10 @@ def main():
         try:
             ver, missing = openclaw_version(), selfcheck()
             try:                   # optional: without it the targets are the config profiles, so it is not 'missing'
-                saved = 'ok' if not saved_profiles()[1] else 'types differ from the store counts'
+                bad = saved_profiles()[1]
+                saved = 'ok' if not bad else 'saved types disagree with the store for %s' % ', '.join(bad)
+                if bad:
+                    prob(out, 'saved-profiles', 'openclaw %s: %s' % (' '.join(CLI_MODELS('<agent>')), saved))
             except (Shape, Unreachable) as e:
                 saved = quiet_error(e)
                 prob(out, 'saved-profiles', 'openclaw %s could not be read: %s' % (' '.join(CLI_MODELS('<agent>')), saved))
@@ -1724,7 +1738,7 @@ def finish(state, out, ev, streak, health):
         prob(out, 'no_target:' + ','.join(models), 'no live account or fallback model for %s: %s'
              % (', '.join(models), ', '.join(i for i, _ in out['no_target'][:8])))
     if health.saved_err:
-        prob(out, 'saved-profiles', 'openclaw %s could not be read (%s): accounts only in the agent\'s saved auth store '
+        prob(out, 'saved-profiles', 'openclaw %s could not be used (%s): accounts only in the agent\'s saved auth store '
              'are not targets until it can' % (' '.join(CLI_MODELS('<agent>')), health.saved_err))
     state['last_pass'] = NOW()
     due = raise_due(state, out) if APPLY else sorted({t for _, t in out['problems']})

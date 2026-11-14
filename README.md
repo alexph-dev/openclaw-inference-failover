@@ -123,8 +123,8 @@ Requirements and limits:
   left out the same way. OpenClaw breaks ties by last use; this script prefers no account, so that order stands. An
   `api_key` profile is billed per token and is a target only when `auth.order` lists it. Under an empty list
   OpenClaw itself uses no account for unpinned work and its probe answers `unknown` for every one; the script still
-  moves pinned work onto those accounts (any order rather than stopping), and a real limit comes back as a hold from
-  the runs. Without an empty list, an order saved with `openclaw models auth order set` is not read: profiles it
+  moves pinned work onto those accounts (any order rather than stopping) when the saved store calls their credential
+  usable (ok, expiring or static), and a real limit comes back as a hold from the runs. Without an empty list, an order saved with `openclaw models auth order set` is not read: profiles it
   leaves out probe `unknown` and are never chosen. Work that can go nowhere else is reported as having no live
   account.
 - Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
