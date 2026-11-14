@@ -84,8 +84,11 @@ unexpected shape. Fix the section, and the next pass works again. The one except
 (accounts saved only in the agent's store): if it fails or changes shape, the pass goes on with the config's accounts
 and reports the failure as a problem.
 
-When OpenClaw does not answer (a slow or restarting Gateway), the pass changes nothing and stays quiet; it becomes a
-problem only after ten minutes without an answer.
+When OpenClaw does not answer, or answers so slowly that a pass is cut off (a slow or restarting Gateway), the pass
+keeps what it already did and stays quiet; the rest continues next pass. It becomes a problem only after ten minutes of
+this, counted from the start of the first pass it hit. A part that does not run every pass (the 24 h check every 30
+minutes, the disabled jobs) keeps its own count while it is cut off, until it finishes once, so ordinary passes between its
+runs do not hide it.
 
 The script discovers the OpenClaw state directory (`~/.openclaw`, or `OPENCLAW_STATE_DIR`), the config file, the
 agents (one database per directory under `agents/`), the log directory (`logging.file` in the config, else
