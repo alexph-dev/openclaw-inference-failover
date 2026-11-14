@@ -13,8 +13,10 @@ fixed, and delete the whole script when all of them are.
 ## What it does
 
 A limit is always one model on one account (model@account), never a whole account: a probe that answers ok for one
-model says nothing about another model on that account. Targets are only the accounts that `auth.order` lists for a
-provider, in that order, and then the entries of `agents.defaults.model.fallbacks`.
+model says nothing about another model on that account. The targets of a provider are the accounts `auth.order` lists
+for it, in that order; a provider without an `auth.order` entry (or with an empty list) has the accounts OpenClaw's
+automatic selection uses (see "Targets" under Requirements and limits). After those come the entries of
+`agents.defaults.model.fallbacks`.
 
 - **Cron jobs.** A job whose model@account is held or probed out is rebound to the same model on the next live account
   of `auth.order`, or, if no account of that model is live, to the first live fallback entry. A move to another model
@@ -61,7 +63,8 @@ provider, in that order, and then the entries of `agents.defaults.model.fallback
 | Continuing a chat | documented CLI: `openclaw agent --session-key ...` (`--deliver` only for external chats) |
 | Account status | Gateway RPC `models.probe` |
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
-| Model, fallbacks, account order (the only targets) | config file (`~/.openclaw/openclaw.json`) |
+| Model, fallbacks, account order and declared accounts (the targets) | config file (`~/.openclaw/openclaw.json`) |
+| Saved accounts and their type, when config declares none for a provider | Gateway RPC `models.probe` (`mode` per profile) |
 | Chats' pinned model/account and queued input | internal: tables `session_nodes` and `session_pending_inputs` in each agent database (read-only) |
 | The recorded account of a job whose `payload.model` names no account | internal: table `cron_jobs` (`inferenceBinding.profileId`) in `state/openclaw.sqlite` (read-only); `cron list` does not show it |
 | Stalls and failed turns | internal: Gateway log lines (`/tmp/openclaw*/openclaw-*.log`) |
@@ -106,9 +109,13 @@ Requirements and limits:
   Linux with a user systemd session. Without it the chat is still moved, and the failed start is reported.
 - `openclaw cron list` returns one page of 200 jobs and has no paging option. With more jobs the script reports it
   and watches only the first page.
-- Targets: an account is chosen only when `auth.order` lists it for its provider, whatever the probe reports about it
-  and however it is billed. A provider without an `auth.order` entry has no target; work that can go nowhere else is
-  reported as having no live account.
+- Targets: with an `auth.order` entry for a provider, an account is chosen only when that entry lists it, whatever
+  the probe reports about it and however it is billed. Without one (key missing or an empty list) the targets are the
+  set OpenClaw's automatic selection rotates through: the provider's `auth.profiles` in config order, or, when config
+  declares none for it, the agent's saved profiles; only `oauth` and `token` profiles, `oauth` first, as OpenClaw
+  ranks them. OpenClaw then breaks ties by last use; this script prefers no account, so config order stands. An
+  `api_key` profile is billed per token and is a target only when `auth.order` lists it. Work that can go nowhere
+  else is reported as having no live account.
 - Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
   a failure that named no time. A probe that answers ok (it tests another model) does not end a hold, and nothing
   moves back onto a model while it is held there. `--status` lists the holds.
