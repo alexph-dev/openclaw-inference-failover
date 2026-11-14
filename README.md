@@ -112,8 +112,9 @@ Requirements and limits:
   the probe reports about it and however it is billed; an empty list means no account, as in OpenClaw. Without the
   key the targets are the set OpenClaw's automatic selection rotates through: the provider's `oauth` and `token`
   profiles in `auth.profiles`, `oauth` first, then config order. A profile only in the agent's saved store is not a
-  target: `models.probe` does not report its type. OpenClaw then breaks ties by last use; this script prefers no account, so config order stands. An
-  `api_key` profile is billed per token and is a target only when `auth.order` lists it. Work that can go nowhere
+  target: `models.probe` does not report its type. OpenClaw then breaks ties by last use; this script prefers no
+  account, so config order stands. An `api_key` profile is billed per token and is a target only when `auth.order`
+  lists it. Work that can go nowhere
   else is reported as having no live account.
 - Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
   a failure that named no time. A probe that answers ok (it tests another model) does not end a hold, and nothing
