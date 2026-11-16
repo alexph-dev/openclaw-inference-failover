@@ -1603,6 +1603,84 @@ def test_stalled_subagent_run_is_aborted_not_moved_or_continued():
     assert len(kinds(go(d, True)[2], 'subagent_stall_abort')) == 1      # handled once (the journal accumulates)
 
 
+RT_OK = {'rc': 0, 'out': json.dumps({'ok': True, 'capability': 'model.run', 'transport': 'local', 'provider': 'anthropic',
+                                      'outputs': [{'text': 'ok', 'mediaUrl': None}]})}
+RT_LIMIT = {'rc': 1, 'out': json.dumps({'ok': False, 'error': {'type': 'cli_error', 'message': 'No text output returned for '
+            'provider "anthropic" model "claude-opus-5-5": 429 {"type":"error","error":{"type":"rate_limit_error","message":'
+            '"This request would exceed your account\'s rate limit. Please try again later."}}; Retry-After: 205922 seconds.'}}),
+            'err': '[provider-error] Model request failed provider=anthropic model=claude-opus-5-5 status=429\n'}
+
+
+def held_fixture(holds, retest):
+    """Job 'a' parked on grok, its own model Opus held on the given accounts for 20 h; every probe says ok."""
+    d = setup({'a': ('xai/grok-4.7', 'xai:x', 'trusted')}, [], {'anthropic': {PB: 'ok', PA: 'ok', PC: 'ok'}, 'xai': {'xai:x': 'ok'}})
+    later = ms() + 20 * 3600_000
+    (d / 'st').mkdir()
+    (d / 'st' / 'state.json').write_text(json.dumps({'started': 0, 'home': {'a': {'model': OPUS, 'parked': 'xai/grok-4.7@xai:x',
+                                                                                 'at': 0, 'wait': 0}},
+                                                      'limited': {OPUS + '@' + p: later for p in holds}}))
+    fake(d, retest=retest)
+    return d, later
+
+
+def state_of(d):
+    return json.loads((d / 'st' / 'state.json').read_text())
+
+
+def test_a_long_hold_is_cleared_when_a_real_request_of_that_model_on_that_account_answers():
+    # The reported case: the provider reset its limit early. The probe (another model) cannot see it; a real request
+    # of the held model on that account answers, so the hold goes and the next pass brings the parked job home.
+    d, _ = held_fixture((PB, PA, PC), {OPUS + '@' + PB: RT_OK})
+    rc, err, j = go(d, True)
+    c, = kinds(j, 'hold_cleared')
+    assert c['key'] == OPUS + '@' + PB and 'answered' in c['why'], c
+    e, = kinds(j, 'hold_retest')                                       # PA: no answer -> kept, no problem
+    assert e['key'] == OPUS + '@' + PA and e['result'] == 'error' and rc == 0, (e, err)
+    s = state_of(d)
+    assert OPUS + '@' + PB not in s['limited'] and OPUS + '@' + PA in s['limited'] and s['retry'], s
+    assert binding(d, 'a') == 'xai/grok-4.7@xai:x'                     # moved by the next pass, not this one
+    go(d)
+    assert binding(d, 'a') == OPUS + '@' + PB
+
+
+def test_a_re_test_that_hits_the_limit_keeps_the_hold_at_the_newly_named_time():
+    d, later = held_fixture((PB,), {OPUS + '@' + PB: RT_LIMIT})
+    rc, err, j = go(d, True)
+    r, = kinds(j, 'hold_retest')
+    assert r['result'] == 'limit' and 'rate_limit_error' in r['error'] and not kinds(j, 'hold_cleared'), r
+    until = state_of(d)['limited'][OPUS + '@' + PB]
+    assert abs(until - (ms() + 205922_000)) < 120_000 and until != later, until   # the provider's new time
+    assert rc == 0, err
+    # A limit that names no time keeps the old one; an error keeps the hold and is no problem the first time.
+    for answer in ({'rc': 1, 'err': 'rate_limit_error'}, {'rc': 1, 'err': 'gateway timeout'}):
+        d, later = held_fixture((PB,), {OPUS + '@' + PB: answer})
+        rc, err, j = go(d, True)
+        assert state_of(d)['limited'][OPUS + '@' + PB] == later and not kinds(j, 'hold_cleared'), j
+        assert rc == 0 and not kinds(j, 'problem'), (err, j)
+
+
+def test_holds_are_re_tested_at_most_hourly_a_few_per_pass_and_only_when_long():
+    d, _ = held_fixture((PB, PA, PC), {})
+    s = state_of(d)
+    s['limited'][FABLE + '@' + PB] = ms() + 30 * 60_000                # under an hour left: waits out its own time
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    n = lambda: sum(1 for x in open(d / 'calls.log') if x.startswith('infer model run'))
+    j = go(d, True)[2]
+    first = {r['key'] for r in kinds(j, 'hold_retest')}
+    assert len(first) == F.RETEST_PER_PASS == 2 and n() == 2, first
+    j = go(d, True)[2]
+    assert {r['key'] for r in kinds(j, 'hold_retest')} - first == {OPUS + '@' + PC} and n() == 3, j
+    go(d, True)
+    assert n() == 3                                                    # each tested within the hour: none again
+    s = state_of(d)
+    assert set(s['retested']) == {OPUS + '@' + p for p in (PA, PB, PC)}, s['retested']
+    s['retested'][OPUS + '@' + PA] -= F.RETEST_EVERY_MS
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    j = go(d, True)[2]
+    assert n() == 4 and kinds(j, 'hold_retest')[-1]['key'] == OPUS + '@' + PA, j
+    assert all(r['in_a_row'] < F.RETEST_ERRORS for r in kinds(j, 'hold_retest')) and not kinds(j, 'problem'), j
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:

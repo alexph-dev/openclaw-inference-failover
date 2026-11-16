@@ -66,6 +66,7 @@ limits). After those come the entries of
 | Rebinding a job | documented CLI: `openclaw cron edit <id> --model` |
 | Continuing a chat | documented CLI: `openclaw agent --session-key ...` (`--deliver` only for external chats) |
 | Account status | Gateway RPC `models.probe` |
+| Whether a held model@account answers again | documented CLI: `openclaw infer model run --local --model provider/model@account --prompt ... --json` |
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
 | Model, fallbacks, account order and declared accounts (the targets) | config file (`~/.openclaw/openclaw.json`) |
 | Accounts saved only in the agent's auth store (targets of a provider without a non-empty `auth.order`) | documented CLI: `openclaw models status --json --agent <id>`, `auth.oauth.profiles[]` `profileId`, `provider`, `type` (only when needed) |
@@ -135,7 +136,13 @@ Requirements and limits:
   account.
 - Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
   a failure that named no time. A probe that answers ok (it tests another model) does not end a hold, and nothing
-  moves back onto a model while it is held there. `--status` lists the holds.
+  moves back onto a model while it is held there. A provider can end a limit early (Anthropic resets a weekly limit
+  before the time it named), so a hold with more than an hour left is re-tested with one real minimal request of that
+  model on that account: `openclaw infer model run --local --model provider/model@account`, which uses the account's
+  own saved credential inside OpenClaw. At most once an hour per hold, two per pass, only while the pass has time; a
+  dry run makes none. An answer clears the hold (journal `hold_cleared`) and the next pass moves work back by the
+  usual rules; a limit keeps it, at the newly named time if the provider names one; any other failure keeps it and
+  becomes a problem after three in a row (journal `hold_retest`). `--status` lists the holds and their last re-test.
 - Cron, agent-to-agent (`a2a`), subagent and worker sessions are not continued as human chats. Dashboard keys also
   require a worker-metadata check; a remotely placed or spawned worker is not a browser conversation.
 - Before mutation, recovery refreshes the exact run, queued/newer input and model selection after account probes.

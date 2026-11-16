@@ -20,6 +20,9 @@ whole account: a probe that answers ok for one model says nothing about another 
   stalls a run sleeping out a long same-model rate-limit wait is aborted, and its model@account is held until the time
          the provider named. One-shot (at) jobs are never aborted: an abort disables them silently, their timeout is
          retried by the scheduler on the new binding. An aborted cron run is not replayed.
+  holds  a model@account is held until the time its provider named. A provider may end a limit early, so a hold with
+         more than an hour left is re-tested at most hourly with one real request of that model on that account
+         (openclaw infer model run --local --model provider/model@account); an answer clears the hold.
   turns  a human chat turn whose run died on a limit (the limit was the run's last word in the log) is continued on a
          live model@account, unless the user already wrote again or a person stopped it. The continuation prompt asks
          the agent to open its reply with one line, in the chat's own language, saying the chat moved to another model.
@@ -53,6 +56,14 @@ CLI_EDIT = lambda jid, ref: ['cron', 'edit', jid, '--model', ref, '--timeout', '
 CLI_AGENT = lambda key, msg, deliver=True: ['agent', '--session-key', key, '--message', msg] + (['--deliver'] if deliver else []) + ['--timeout', '3600']  # continue on the stored route, or locally
 CLI_MODELS = lambda agent: ['models', 'status', '--json', '--agent', agent]   # the agent's accounts, saved ones too
 CLI_CALL = lambda method, params, ms: ['gateway', 'call', method, '--params', json.dumps(params), '--json', '--timeout', str(ms)]  # one RPC
+# One real minimal request of exactly this model on exactly this account, through OpenClaw with the account's own saved
+# credential ('provider/model@profile' locks the profile; --local runs it in the CLI process, no chat session).
+RETEST_PROMPT = 'Reply with exactly: ok'
+CLI_RETEST = lambda ref, agent: ['infer', 'model', 'run', '--local', '--model', ref, '--prompt', RETEST_PROMPT, '--json',
+                                 '--agent', agent]
+RETEST_HELP = (['infer', 'model', 'run', '--help'], ('--local', '--model', '--agent', '--json'))   # self-check
+RETEST_OK, RETEST_OUTPUTS, RETEST_ERROR = 'ok', 'outputs', 'error'  # answer {ok: true, outputs: [{text}]} | {ok: false, error: {message}}
+RETRY_AFTER_RE = re.compile(r'Retry-After:\s*(\d+)\s*seconds', re.I)   # the provider's wait in the CLI's error message
 # JSON fields of the CLI answers ('a.b' = nested)
 JOBS_LIST, RUNS_LIST = 'jobs', 'entries'                            # top-level lists of cron list / cron runs
 LIST_MORE = 'hasMore'                                               # true when the job list did not fit one page
@@ -173,6 +184,11 @@ PASS_BUDGET_S = 40             # stop starting new edits after this; the next mi
 DISABLED_BUDGET_S = float(os.environ.get('OCF_DISABLED_BUDGET_S', 10))   # edits of disabled jobs per pass, after chats
 CHAT_MAX_PER_HOUR = 2
 HOLD_MS = 3600_000             # a model@account that failed on a limit without naming a wait is not a target this long
+RETEST_LEFT_MS = 3600_000      # a hold with more than this left is re-tested with a real request (a provider may reset early)
+RETEST_EVERY_MS = 60 * 60_000  # at most one re-test per hold this often
+RETEST_PER_PASS = 2            # re-tests per pass at most (one takes ~15 s)
+RETEST_TIMEOUT_S = 60
+RETEST_ERRORS = 3              # re-tests in a row that failed other than on a limit before it is a problem
 RERAISE_MS = 6 * 3600_000      # an unfixed problem fails the run once, then again only after this long
 DOWN_MS = 10 * 60_000          # OpenClaw not answering is a problem only after this long: one slow call is not
 PROF = lambda ref: ref.split('@', 1)[1]     # account ids may contain '@' (openai:name@example.com)
@@ -428,7 +444,8 @@ class Health:
     def __init__(self, conf, limited=None):
         # limited: {'model@account': until_ms}, kept in state. The probe tests one model per provider and forgets
         # between passes, so limits seen in real runs (stall delay, failed turns, job receipts) are held here, for the
-        # model they were seen on only, until the time the provider named. A probe answer never clears a hold.
+        # model they were seen on only, until the time the provider named. A probe answer never clears a hold; a real
+        # request of that model on that account does (retest_holds), since a provider may reset a limit early.
         self.conf, self.limited, self.cache, self.failed = conf, limited if limited is not None else {}, {}, []
         self.saved, self.saved_err = None, None    # the agent's saved accounts, read once per pass when first needed
         self.saved_state, self.saved_skipped = {}, False   # {profile: credential status}; read skipped for time
@@ -550,6 +567,80 @@ class Health:
                                         for p, s in r.items() if p in self.accounts(prov))
 
 
+def retest_one(ref):
+    """One real minimal request of this model on this account (CLI_RETEST). Returns ('ok' | 'limit' | 'error', the time
+    the provider named for a limit in ms or None, a short reason)."""
+    if FAKE is not None:                   # tests: {ref: {rc, out, err}}
+        time.sleep(FAKE.get('slow_retest', 0))
+        a = FAKE.get('retest', {}).get(ref) or {'rc': 1, 'err': 'fake: no answer for ' + ref}
+        rc, out, err = a.get('rc', 0), a.get('out', ''), a.get('err', '')
+        with open(os.environ['OCF_FAKE_CALLS'], 'a') as f:
+            f.write(' '.join(CLI_RETEST(ref, 'main')) + '\n')
+    else:
+        rc, out, err = run(['openclaw'] + CLI_RETEST(ref, default_agent()), RETEST_TIMEOUT_S)
+    d = None
+    for m in re.finditer(r'(?m)^\{', out or ''):          # the answer is one JSON object; log lines may come before it
+        try:
+            d = json.JSONDecoder().raw_decode(out[m.start():])[0]
+            break
+        except ValueError:
+            continue
+    d = d if isinstance(d, dict) else {}
+    texts = [o.get('text') for o in d.get(RETEST_OUTPUTS) or [] if isinstance(o, dict)]
+    if rc == 0 and d.get(RETEST_OK) is True and any(isinstance(t, str) and t.strip() for t in texts):
+        return 'ok', None, ''
+    e = d.get(RETEST_ERROR)
+    msg = (e.get('message') if isinstance(e, dict) else e if isinstance(e, str) else None) or \
+        (err or out or '').strip()[-300:] or ('timeout' if rc == 124 else 'rc=%s' % rc)
+    both = '%s\n%s' % (msg, err or '')
+    if LIMIT_RE.search(both) or re.search(r'status=429\b|^429\b', both, re.M):
+        w = RETRY_AFTER_RE.search(both)
+        return 'limit', (NOW() + int(w.group(1)) * 1000) if w else None, msg[:300]
+    return 'error', None, msg[:300]
+
+
+def retest_holds(state, health, out):
+    """A provider may end a limit before the time it named (Anthropic resets a weekly limit early), and the probe tests
+    another model, so it cannot see that. A hold with more than RETEST_LEFT_MS left is re-tested with one real request
+    of that model on that account, at most once per RETEST_EVERY_MS and RETEST_PER_PASS per pass, only while the pass
+    has time. An answer clears the hold (the next pass moves work back by the usual rules); a limit keeps it, at the
+    newly named time if any; anything else keeps it and becomes a problem after RETEST_ERRORS in a row."""
+    hm = lambda t: time.strftime('%d %b %H:%M', time.localtime(t / 1000))
+    limited, now = health.limited, NOW()
+    tested, errs = state.setdefault('retested', {}), state.setdefault('retest_errors', {})
+    for led in (tested, errs):
+        for k in [k for k in led if k not in limited]:
+            led.pop(k)
+    due = sorted((tested.get(k, 0), k) for k, u in limited.items()
+                 if u - now > RETEST_LEFT_MS and now - tested.get(k, 0) >= RETEST_EVERY_MS)
+    for _, k in due[:RETEST_PER_PASS]:
+        if late() or not fits(RETEST_TIMEOUT_S):
+            break
+        if not APPLY:                      # a dry run makes no request
+            out['retest_due'].append(k)
+            continue
+        tested[k] = NOW()                  # first: a re-test cut off by the deadline still counts
+        res, until, why = retest_one(k)
+        if res == 'ok':
+            was = limited.pop(k, 0)
+            errs.pop(k, None)
+            state['retry'] = True          # the next pass asks the accounts and moves work back
+            journal('hold_cleared', key=k, why='a real request of this model on this account answered; the hold ran '
+                                                'until %s' % hm(was))
+            out['cleared'].append(k)
+        elif res == 'limit':
+            errs.pop(k, None)
+            if until:
+                limited[k] = until
+            journal('hold_retest', key=k, result='limit', until=hm(limited.get(k, 0)), error=why)
+        else:
+            n = errs[k] = errs.get(k, 0) + 1
+            journal('hold_retest', key=k, result='error', in_a_row=n, error=why)
+            if n >= RETEST_ERRORS:
+                prob(out, 'retest:' + k, 'hold %s: its re-test failed %d times in a row (%s); the hold stays'
+                     % (k, n, why[:120]))
+
+
 def cli_json(argv, timeout=75):
     """One documented CLI command with JSON output, at most once per pass (cached). Raises Shape when the answer is not
     the expected JSON object, so a pass never acts on a misread job list."""
@@ -630,7 +721,8 @@ def openclaw_version():
 def selfcheck():
     """Checks every item of the OPENCLAW SURFACE section against the installed OpenClaw; returns the missing ones.
     Reads only: the job list and run history (cached for the pass), one sessions.describe of a session that does not
-    exist, the config, the agent database schemas, the log directory and a text search of the installed package."""
+    exist, the config, the agent database schemas, the log directory, a text search of the installed package and the
+    help of the re-test command."""
     miss = []
 
     def guard(f):
@@ -718,7 +810,16 @@ def selfcheck():
         miss.extend('error text: "%s"' % a for a in ERROR_TEXTS if a not in found)
         miss.extend('rpc: %s' % a for a in (RPC_PROBE, RPC_DESCRIBE, RPC_PATCH, RPC_ABORT) if a not in found)
 
-    for f in (config_ok, jobs_ok, runs_ok, describe_ok, tables_ok, logs_ok, package_ok):
+    def retest_ok():
+        if FAKE is not None:
+            return
+        rc, o, e = run(['openclaw'] + RETEST_HELP[0], 60)
+        if rc == 124:
+            raise Unreachable('openclaw %s timed out' % ' '.join(RETEST_HELP[0]))
+        miss.extend('cli: openclaw %s: option %s' % (' '.join(RETEST_HELP[0][:-1]), x) for x in RETEST_HELP[1]
+                    if x not in o + e)
+
+    for f in (config_ok, jobs_ok, runs_ok, describe_ok, tables_ok, logs_ok, package_ok, retest_ok):
         guard(f)
     return sorted(set(miss))
 
@@ -1641,6 +1742,8 @@ def status(state):
         'open_problems': [{'since': hm(e['raised']), 'text': e['text']} for e in state.get('problems', {}).values()
                           if now - max(e['raised'], e.get('seen', 0)) < CHECK_EVERY_MS + 5 * 60_000],
         'held': {k: hm(u) for k, u in state.get('limited', {}).items() if u > now},   # model@account: until
+        'hold_retested': {k: hm(t) for k, t in state.get('retested', {}).items()
+                          if state.get('limited', {}).get(k, 0) > now},       # last real re-test of a held pair
         'jobs_on_fallback_model': state.get('home', {}),
         'chats_on_fallback_model': state.get('chat_home', {}),
         'pending_events': state.get('pending', {}),
@@ -1648,7 +1751,8 @@ def status(state):
 
 
 def main():
-    out = {'moved': [], 'chats': [], 'continued': [], 'aborted': [], 'no_target': [], 'problems': [], 'deferred': 0, 'later': 0}
+    out = {'moved': [], 'chats': [], 'continued': [], 'aborted': [], 'no_target': [], 'problems': [], 'deferred': 0, 'later': 0,
+           'cleared': [], 'retest_due': []}
     state = load_state()
     if '--status' in sys.argv:
         return status(state)
@@ -1728,6 +1832,7 @@ def main():
             state['retry'] = bool(out['deferred'] or out['no_target'] or health.failed)
         stalls_and_chats(state, health, jobs, out)
         continued_check(state, out)
+        retest_holds(state, health, out)
         if health.cache:                     # disabled jobs last, on what this pass already asked; their wait ('later')
             health.no_probe = True           # does not make the next pass probe
             part = 'disabled'
@@ -1748,7 +1853,7 @@ def main():
         down(state, out, 'pass cut off after %d s; what was done is saved, the rest continues next pass' % PASS_HARD_S,
              slow=True, part=part)
     except (Shape, Unreachable) as e:
-        if not (out['moved'] or out['chats'] or out['continued'] or out['aborted']):
+        if not (out['moved'] or out['chats'] or out['continued'] or out['aborted'] or out['cleared']):
             state = json.loads(before)    # nothing was done: keep log offsets and pending events for the next pass
         if isinstance(e, Unreachable):
             down(state, out, e)
