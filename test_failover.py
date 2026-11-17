@@ -70,7 +70,7 @@ elif a[:2] == ['config', 'set']:
         cur = cur.setdefault(k, {})
     if '--expect-current-json' in a and cur.get(path[-1]) != json.loads(a[a.index('--expect-current-json') + 1]):
         sys.stderr.write('Config change declined (conditional config set expectation did not match the authored config). '
-                         'No settings were saved.\n')
+                         'No settings were saved. Review the current config and any conditional expectations before retrying.\n')
         sys.exit(1)
     cur[path[-1]] = new
     json.dump(c, open(f, 'w'))
@@ -1914,7 +1914,7 @@ def test_order_compare_and_set_never_overwrites_a_newer_order():
         "['anthropic:c', 'anthropic:b', 'anthropic:a']; json.dump(c0, open(os.environ['OCF_CONFIG'], 'w'))\n"))
     rc, err, j = go(d, True)
     o, = kinds(j, 'order_set')
-    assert o['result'].startswith('rc=1') and 'did not match' in o['result'] and order(d) == [PC, PB, PA], o
+    assert o['result'] == F.ORDER_CHANGED and order(d) == [PC, PB, PA], o
     assert rc == 0 and not kinds(j, 'problem'), err                   # a lost race is no problem: next pass decides
     wrapper.write_text(wrapper.read_text().replace("elif a[:2] == ['config', 'set']:\n", "elif a[:2] == ['config', 'set']:\n"
         "    sys.stderr.write('error: unknown option --expect-current-json\\n'); sys.exit(1)\n"))
@@ -1980,6 +1980,24 @@ def test_moves_off_a_held_account_come_before_returns_and_their_checks():
     assert [(r['kind'], r.get('job'), r.get('why')) for r in j] == [('job_move', 'h', 'out'), ('return_check', None, None),
                                                                     ('job_move', 'r', 'preference')], j
     assert binding(d, 'h') == OPUS + '@' + PA and binding(d, 'r') == OPUS + '@' + PA
+
+
+def test_a_proof_from_before_a_limit_does_not_count_after_it_and_failed_checks_never_lead_the_order():
+    # Opus on PA answered 10 min ago, then hit a 30-min limit that has just ended: the return needs a new answer.
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d, state={'verified': {OPUS + '@' + PA: ms() - 600_000}, 'limited': {OPUS + '@' + PA: ms() - 1000}})
+    j = go(d)[2]
+    assert [r['key'] for r in kinds(j, 'return_check')] == [OPUS + '@' + PA] and binding(d, 'a') == OPUS + '@' + PB, j
+    # That check found nothing (no answer): the order is not put on PA either, though its probe says ok.
+    assert order(d) == [PB, PA, PC] and not kinds(j, 'order_set'), j
+
+
+def test_a_pass_with_fresh_limits_makes_no_return_check():
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK, log=[req(K, 'R1'), end('R1')], entries={K: dict(PIN, authProfileOverride=PC)})
+    prefer(d)
+    fake(d, retest={OPUS + '@' + PA: RT_OK})
+    go(d)
+    assert not requests(d) and binding(d, 'a') == OPUS + '@' + PB
 
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]

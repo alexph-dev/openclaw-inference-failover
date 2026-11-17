@@ -70,7 +70,8 @@ AGENT_OUTPUT = lambda unit: ['journalctl', '--user', '-u', unit, '-t', 'openclaw
                             # what 'openclaw agent' printed in a continuation unit (syslog identifier 'openclaw')
 CLI_ORDER_SET = lambda provider, new, old: ['config', 'set', 'auth.order.%s' % provider, json.dumps(new), '--strict-json',
                                            '--expect-current-json', json.dumps(old)]   # compare-and-set of one order
-ORDER_CHANGED = 'expectation did not match'   # its answer when the order changed since it was read (no write)
+ORDER_RACES = ('expectation did not match', 'changed while this command was writing')   # its answers to a lost race
+ORDER_CHANGED = 'declined: the config changed since it was read'
 CLI_CALL = lambda method, params, ms: ['gateway', 'call', method, '--params', json.dumps(params), '--json', '--timeout', str(ms)]  # one RPC
 # One real minimal request of exactly this model on exactly this account, through OpenClaw with the account's own saved
 # credential ('provider/model@profile' locks the profile; --local runs it in the CLI process, no chat session).
@@ -709,8 +710,8 @@ def verify(state, health, ref, out, request=True):
     v, tried = state.setdefault('verified', {}), state.setdefault('verify_tried', {})
     if NOW() - v.get(ref, 0) < VERIFY_MS:
         return True
-    if not request or ref in _VERIFY['failed'] or NOW() - tried.get(ref, 0) < RETEST_EVERY_MS:
-        return False
+    if not request or _VERIFY.get('busy') or ref in _VERIFY['failed'] or NOW() - tried.get(ref, 0) < RETEST_EVERY_MS:
+        return False                       # busy: a pass with fresh limits keeps its time for them; returns wait
     if not APPLY:
         if ref not in out['verify_due']:
             out['verify_due'].append(ref)
@@ -1167,7 +1168,8 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
                  % (jid[:8], j['name'][:40], j['profile']))
             continue
         if (time.time() - t1 > DISABLED_BUDGET_S) if disabled else (time.time() - t0 > PASS_BUDGET_S):
-            out['later' if disabled else 'deferred'] += 1
+            if why != 'preference':          # a return may wait for the next probing pass; it forces no early one
+                out['later' if disabled else 'deferred'] += 1
             continue
         model = MODEL(j['model'] or conf['primary'])
         own = home.get(jid, {}).get('model', model)
@@ -1690,16 +1692,24 @@ def order_pass(state, health, conf, jobs, out):
         if r == 'ok':
             out['order'].append((prov, new))
             conf['order'][prov] = new
-        elif ORDER_CHANGED in r:
-            pass                           # someone changed it since it was read: the next pass decides on the new one
+        lost = state.setdefault('order_lost', {})
+        if r == ORDER_CHANGED and lost.get(prov, 0) + 1 < RETEST_ERRORS:
+            lost[prov] = lost.get(prov, 0) + 1   # someone changed it since it was read: the next pass decides anew
+        elif r == 'ok':
+            lost.pop(prov, None)
         else:
             prob(out, 'order:' + prov, 'auth.order.%s could not be set to %s: %s' % (prov, ', '.join(new), r[:120]))
 
 
 def order_set(provider, new, old):
-    """Writes auth.order.<provider> = new only while it still equals old (the CLI's compare-and-set)."""
+    """Writes auth.order.<provider> = new only while it still equals old (the CLI's compare-and-set). Returns 'ok',
+    ORDER_CHANGED when someone changed the config meanwhile (nothing written), else the error."""
     rc, out, err = run(['openclaw'] + CLI_ORDER_SET(provider, new, old), 60)
-    return 'ok' if rc == 0 else 'rc=%s %s' % (rc, (err or out).strip()[-200:])
+    if rc == 0:
+        return 'ok'
+    if any(t in err + out for t in ORDER_RACES):
+        return ORDER_CHANGED
+    return 'rc=%s %s' % (rc, (err or out).strip()[-200:])
 
 
 def chat_changed(state, health, key, s, e, queued, p):
@@ -2131,6 +2141,8 @@ def main():
                 health.hold(PROF(ref), NOW() + HOLD_MS, MODEL(ref))
         note_events(state, ev, jobs, health)
         # Ask the accounts when there is a fresh limit signal, an unfinished pass, or every 5 min while work uses them.
+        _VERIFY['busy'] = bool(ev['providers'] or any(NOW() - p.get('t', 0) < 600_000            # fresh limits first:
+                                                      for p in (state.get('pending') or {}).values()))   # no return checks now
         if ev['providers'] or streak or state.get('retry') or state.get('unsure') \
                 or NOW() - state.get('probed_at', 0) >= PROBE_EVERY_MS:
             jobs_pass(conf, jobs, health, state, t0, out)
@@ -2141,6 +2153,7 @@ def main():
             state['probed_at'] = NOW()
             state['retry'] = bool(out['deferred'] or out['no_target'] or health.failed)
         stalls_and_chats(state, health, jobs, out)
+        _VERIFY['busy'] = False
         continued_check(state, out)
         retest_holds(state, health, out)
         if health.cache:                     # disabled jobs last, on what this pass already asked; their wait ('later')
