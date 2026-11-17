@@ -20,7 +20,7 @@ limits). After those come the entries of
 `agents.defaults.model.fallbacks`.
 
 - **Cron jobs.** A job whose model@account is held or probed out is rebound to the same model on the next live account
-  of `auth.order`, or, if no account of that model is live, to the first live fallback entry. A move to another model
+  of `auth.order` (the most preferred one when a preference is set, see below), or, if no account of that model is live, to the first live fallback entry. A move to another model
   is temporary: the job goes back to its own model once an account of it is live again and not held for it. The script
   never runs a job: the next scheduled run uses the new binding. Disabled jobs move too, after all other work of a
   pass, and stay disabled, so a run started by hand (`openclaw cron run`) finds a live account. They use only what
@@ -47,6 +47,22 @@ limits). After those come the entries of
   language, saying the chat moved to another model, and to reconcile completed actions and uncertain side effects
   before doing more work, rather than replaying the request. Every limit event the script drops is journaled
   (`event_drop`) with the reason.
+- **Account preference (optional).** A settings file can name, per model, the accounts in the order they should be
+  spent (example below). For such a model a move off a held account goes to the most preferred live account, and work
+  returns to a more preferred account once it is live again: its hold ran out (the reset came on time) or a re-test
+  cleared it (the reset came early). Before the first return to that model@account in an hour, one real request of the
+  model there must answer (`return_check` in the journal; a limit holds it instead), so work does not bounce back onto
+  a model still at its limit. What returns: operator cron jobs (disabled ones only on a proof the pass already has),
+  and chats whose account no person chose: chats this script moved or parked, chats the operator moved by hand and
+  recorded with `--adopt`, and chats whose account OpenClaw picked itself (source `auto`). A chat whose account or model a
+  person chose is never moved back; once a person picks something else for a chat the script moved, that choice stands.
+  The model never changes on a return. Each job or chat is moved this way at most once an hour, at most 20 chats per
+  pass, journaled as `job_move` / `chat_move` with `why: preference`. The first account of a provider's
+  `auth.order` (where unpinned new chats and subagents start) follows the same preference: each preferred model votes
+  for its first live account with its weight (enabled jobs and pinned chats on it, the default model one more), and the
+  winner goes first when it beats the current first account. It is written with `openclaw config set` as a
+  compare-and-set against the order just read, at most once per 15 min per provider (`order_set`). Without a
+  preference for a model nothing returns between its accounts and `auth.order` is left alone.
 - **Problems** it cannot fix (no live account anywhere, a missing OpenClaw surface) fail the job run with the reason on
   stderr on two passes in a row, then stay quiet while open. It never fails every minute, so the scheduler does not
   disable it.
@@ -64,6 +80,8 @@ limits). After those come the entries of
 | Job list, bindings, last-run state | documented CLI: `openclaw cron list --all --json` |
 | Failed runs and their errors | documented CLI: `openclaw cron runs --all --status error --limit 200 --json` (only when a job is in a fresh error streak) |
 | Rebinding a job | documented CLI: `openclaw cron edit <id> --model` |
+| Putting the preferred live account first in `auth.order` | documented CLI: `openclaw config set auth.order.<provider> <json> --strict-json --expect-current-json <json>` |
+| Account preference per model (optional) | settings file `~/.config/openclaw-inference-failover/settings.json` (`OCF_SETTINGS` overrides) |
 | Continuing a chat | documented CLI: `openclaw agent --session-key ...` (`--deliver` only for external chats) |
 | Whether a failed continuation was only stopped | the unit's own output (`journalctl --user -u <unit> -t openclaw`): a last line `aborted` is a stop, not a failure |
 | Account status | Gateway RPC `models.probe` |
@@ -95,7 +113,15 @@ runs do not hide it.
 The script discovers the OpenClaw state directory (`~/.openclaw`, or `OPENCLAW_STATE_DIR`), the config file, the
 agents (one database per directory under `agents/`), the log directory (`logging.file` in the config, else
 `/tmp/openclaw` or `/tmp/openclaw-<uid>`, whichever holds the newest log) and the package (`openclaw` on `PATH`,
-its wrapper text, or `npm root -g`). It needs no settings file. `OCF_*` environment variables override these for tests
+its wrapper text, or `npm root -g`). It needs no settings file; the optional one holds only the account preference:
+
+```json
+{"prefer": {"anthropic/claude-opus-5-5": ["anthropic:a", "anthropic:b", "anthropic:c"],
+            "anthropic/claude-fable-5-2": ["anthropic:a", "anthropic:c", "anthropic:b"]}}
+```
+
+Accounts it names that are not targets are ignored; targets it leaves out come after, in target order. A file that is
+not valid is a problem, and until it is fixed no account is preferred. `OCF_*` environment variables override these for tests
 and unusual installs.
 
 Its own state and journal live in `~/.local/state/openclaw-inference-failover` (`OCF_STATE` overrides).
@@ -130,7 +156,7 @@ Requirements and limits:
   provider and type are read, never the labels (they show masked keys and emails). If it fails, the config profiles
   are the targets and the failure is reported as a problem. A provider whose saved types disagree with the store's
   per-type counts (a plugin credential can override the reported type) or a row whose id names another provider is
-  left out the same way. OpenClaw breaks ties by last use; this script prefers no account, so that order stands. An
+  left out the same way. OpenClaw breaks ties by last use; without a preference this script prefers no account, so that order stands. An
   `api_key` profile is billed per token and is a target only when `auth.order` lists it. Under an empty list
   OpenClaw itself uses no account for unpinned work and its probe answers `unknown` for every one; the script still
   moves pinned work onto those accounts (any order rather than stopping) when the saved store calls their credential
@@ -165,7 +191,9 @@ Requirements and limits:
 - `failover.py --apply`: one real pass (what the job runs).
 - `failover.py --check`: self-check plus a check of the last 24 hours; prints `{"openclaw": version, "missing": [...],
   "saved_profiles": "ok" or the failure}` and exits 1 with problems.
-- `failover.py --status`: open problems, held model@account pairs, and jobs and chats parked on a fallback model, as
+- `failover.py --adopt KEY...`: records that the operator set the current account of these chats by hand, so the
+  preference may move them; changes no chat (journal `chat_adopt`).
+- `failover.py --status`: open problems, held model@account pairs, the preference, and jobs and chats parked on a fallback model, as
   JSON.
 
 Tests: `python3 test_failover.py`. They use a fake `openclaw` and fixture files and never touch a Gateway.

@@ -8,8 +8,15 @@ whole account: a probe that answers ok for one model says nothing about another 
          the accounts its non-empty auth.order lists; a provider without one (no key or an empty list) has all its
          subscription accounts: its oauth and token profiles in auth.profiles and in the agent's saved auth store
          (openclaw models status), oauth first, then config order, then saved order. An api_key profile is a target
-         only when auth.order lists it. No return between accounts (no account is preferred). A move to another MODEL is
-         temporary: the job goes back to its own model once an account of it is live again. A job is never rerun.
+         only when auth.order lists it. A move to another MODEL is temporary: the job goes back to its own model once an
+         account of it is live again. A job is never rerun.
+  prefer optional per-model account preference (settings file, see SETTINGS): a move off a held account goes to the
+         most preferred live account, and work of that model returns to a more preferred account once it is live again
+         (its hold ran out or a re-test cleared it) and one real request of that model there answered within the hour.
+         Moved back: operator cron jobs, and chats this script moved, parked, was told to adopt (--adopt) or whose
+         account OpenClaw chose itself; never a chat whose account or model a person chose. At most one such move per
+         item an hour. The first account of auth.order follows the preferred live account of the most used models, so
+         new unpinned chats and subagents start there. Without a preference for a model: no return between accounts.
          A disabled job moves too, after the chats, and stays disabled, so a run started by hand ('cron run') finds a
          live account. It never triggers a probe or a no-target problem; a disabled one-shot job is left alone.
   chats  a pinned human chat (a model or account the user chose, or this script set) is moved the same way on the same
@@ -37,7 +44,10 @@ whole account: a probe that answers ok for one model says nothing about another 
   failover.py --apply    act
   failover.py --check    self-check of the OpenClaw surfaces it reads plus the 24 h check; exit 1 with problems
   failover.py --status   open problems, held model@account pairs, work parked on a fallback model (JSON)
+  failover.py --adopt KEY...   record that the current account of these chats was set by the operator, not a person
 State and journal: ~/.local/state/openclaw-inference-failover (OCF_STATE overrides).
+Settings (optional): ~/.config/openclaw-inference-failover/settings.json (OCF_SETTINGS overrides):
+  {"prefer": {"provider/model": ["provider:account", ...]}}
 """
 import calendar, fcntl, glob, hashlib, json, os, pathlib, re, signal, sqlite3, subprocess, sys, time
 
@@ -58,6 +68,9 @@ CLI_MODELS = lambda agent: ['models', 'status', '--json', '--agent', agent]   # 
 AGENT_STOPPED = 'aborted'   # last output line of 'openclaw agent' when its run was stopped (sessions.abort, a stop button)
 AGENT_OUTPUT = lambda unit: ['journalctl', '--user', '-u', unit, '-t', 'openclaw', '-o', 'cat', '--no-pager', '-n', '5']
                             # what 'openclaw agent' printed in a continuation unit (syslog identifier 'openclaw')
+CLI_ORDER_SET = lambda provider, new, old: ['config', 'set', 'auth.order.%s' % provider, json.dumps(new), '--strict-json',
+                                           '--expect-current-json', json.dumps(old)]   # compare-and-set of one order
+ORDER_SET_HELP = (['config', 'set', '--help'], ('--strict-json', '--expect-current-json'))   # self-check
 CLI_CALL = lambda method, params, ms: ['gateway', 'call', method, '--params', json.dumps(params), '--json', '--timeout', str(ms)]  # one RPC
 # One real minimal request of exactly this model on exactly this account, through OpenClaw with the account's own saved
 # credential ('provider/model@profile' locks the profile; --local runs it in the CLI process, no chat session).
@@ -169,7 +182,9 @@ STATE, JOURNAL = SDIR / 'state.json', SDIR / 'journal.jsonl'
 OC_DIR = pathlib.Path(os.environ.get('OCF_OPENCLAW_DIR') or os.environ.get('OPENCLAW_STATE_DIR') or HOME / '.openclaw')
 CONFIG = os.environ.get('OCF_CONFIG') or os.environ.get('OPENCLAW_CONFIG_PATH') or str(OC_DIR / 'openclaw.json')
 FAKE = json.load(open(os.environ['OCF_FAKE'])) if os.environ.get('OCF_FAKE') else None  # tests only
-APPLY = '--apply' in sys.argv
+APPLY = '--apply' in sys.argv or '--adopt' in sys.argv
+SETTINGS = pathlib.Path(os.environ.get('OCF_SETTINGS') or pathlib.Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config')
+                        / 'openclaw-inference-failover' / 'settings.json')
 NOW = lambda: int(time.time() * 1000)
 LOCAL = lambda fmt: time.strftime(fmt, time.localtime())
 
@@ -192,6 +207,11 @@ RETEST_EVERY_MS = 60 * 60_000  # at most one re-test per hold this often
 RETEST_PER_PASS = 2            # re-tests per pass at most (one takes ~15 s)
 RETEST_TIMEOUT_S = 60
 RETEST_ERRORS = 3              # re-tests in a row that failed other than on a limit before it is a problem
+VERIFY_MS = 60 * 60_000        # a return to a preferred account needs a real request there answered within this long
+VERIFY_PER_PASS = 2            # such requests per pass at most (separate from the hold re-tests)
+RETURN_EVERY_MS = 60 * 60_000  # a job or chat is moved by the preference at most once in this long
+RETURN_CHATS_PER_PASS = 20     # chats moved by the preference per pass at most
+ORDER_EVERY_MS = 15 * 60_000   # auth.order of a provider is rewritten at most once in this long
 RERAISE_MS = 6 * 3600_000      # an unfixed problem fails the run once, then again only after this long
 DOWN_MS = 10 * 60_000          # OpenClaw not answering is a problem only after this long: one slow call is not
 PROF = lambda ref: ref.split('@', 1)[1]     # account ids may contain '@' (openai:name@example.com)
@@ -436,8 +456,27 @@ def cfg():
     m = dig(c, CFG_MODEL) or {}
     if not m.get('primary'):
         raise Shape('config %s: no %s.primary' % (CONFIG, '.'.join(CFG_MODEL)))
+    prefer, err = load_settings()
     return {'primary': m['primary'], 'chain': m.get('fallbacks') or [], 'order': dig(c, CFG_ORDER) or {},
-            'profiles': dig(c, CFG_PROFILES) or {}}
+            'profiles': dig(c, CFG_PROFILES) or {}, 'prefer': prefer, 'settings_err': err}
+
+
+def load_settings():
+    """The operator's optional settings file: ({model: [accounts in order of preference]}, error or None). A missing
+    file is no preference. An unreadable or wrong one is a problem (main raises it) and counts as no preference, so a
+    typo never stops the rest of the failover. Accounts of another provider than the model's are an error too."""
+    if not SETTINGS.exists():
+        return {}, None
+    try:
+        d = json.loads(SETTINGS.read_text())
+    except (OSError, ValueError) as e:
+        return {}, 'settings %s: not readable JSON (%s)' % (SETTINGS, str(e)[:80])
+    p = d.get('prefer', {}) if isinstance(d, dict) else None
+    ok = isinstance(p, dict) and all(isinstance(m, str) and '/' in m and isinstance(a, list) and a and all(
+        isinstance(x, str) and x.split(':')[0] == m.split('/')[0] for x in a) for m, a in p.items())
+    if not ok:
+        return {}, ('settings %s: "prefer" must map "provider/model" to a list of that provider\'s accounts' % SETTINGS)
+    return {m: list(dict.fromkeys(a)) for m, a in p.items()}, None
 
 
 class Health:
@@ -543,13 +582,24 @@ class Health:
                 modes.setdefault(p, kind)
         return [p for m in SUB_MODES for p, pm in modes.items() if pm == m]
 
+    def prefers(self, model):
+        """True when the settings name a preference for this model."""
+        return bool((self.conf.get('prefer') or {}).get(model))
+
+    def pref(self, model):
+        """The model's targets in order of preference: the settings' accounts that are targets, then the other targets in
+        accounts() order. Without a preference for the model: accounts() unchanged."""
+        accts = self.accounts(model.split('/')[0])
+        want = [p for p in (self.conf.get('prefer') or {}).get(model) or [] if p in accts]
+        return want + [p for p in accts if p not in want]
+
     def target(self, model, avoid=(), chain=True):
-        """First live model@account: the same model on the next of its provider's accounts(), then the config fallback
+        """First live model@account: the same model on the first live of its pref() accounts, then the config fallback
         chain. avoid is the account this model just failed on, and it is skipped for this model only: a later model may
         use that account, because a limit on one model is not a limit on the next."""
         for m in dict.fromkeys([model] + (list(self.conf['chain']) if chain else [])):
             blocked = avoid if m == model else ()
-            for p in self.accounts(m.split('/')[0]):
+            for p in self.pref(m):
                 if p not in blocked and self.alive(p, m):
                     return m + '@' + p
         return None
@@ -627,6 +677,7 @@ def retest_holds(state, health, out):
         if res == 'ok':
             was = limited.pop(k, 0)
             errs.pop(k, None)
+            state.setdefault('verified', {})[k] = NOW()   # a return there needs no second request this hour
             state['retry'] = True          # the next pass asks the accounts and moves work back
             journal('hold_cleared', key=k, why='a real request of this model on this account answered; the hold ran '
                                                 'until %s' % hm(was))
@@ -642,6 +693,64 @@ def retest_holds(state, health, out):
             if n >= RETEST_ERRORS:
                 prob(out, 'retest:' + k, 'hold %s: its re-test failed %d times in a row (%s); the hold stays'
                      % (k, n, why[:120]))
+
+
+_VERIFY = {'n': 0, 'failed': set()}    # this pass: real requests made for returns, and pairs that did not answer
+
+
+def verify(state, health, ref, out, request=True):
+    """True when a real request of this model on this account answered within VERIFY_MS. A return to a preferred
+    account waits for that proof: the probe tests another model, and a hold that ran out (or an hour's hold for a limit
+    that named no time) does not show the limit is over, so without it work would bounce back onto a model still at
+    its limit every hour. Otherwise, when request is set and the pass has room, makes that request now (at most
+    VERIFY_PER_PASS per pass, once an hour per pair after one that did not answer; a dry run makes none). A limit holds
+    the pair until the time the provider named (an hour when it names none)."""
+    v, tried = state.setdefault('verified', {}), state.setdefault('verify_tried', {})
+    if NOW() - v.get(ref, 0) < VERIFY_MS:
+        return True
+    if not request or ref in _VERIFY['failed'] or NOW() - tried.get(ref, 0) < RETEST_EVERY_MS:
+        return False
+    if not APPLY:
+        if ref not in out['verify_due']:
+            out['verify_due'].append(ref)
+        return False
+    if _VERIFY['n'] >= VERIFY_PER_PASS or late() or not fits(RETEST_TIMEOUT_S):
+        return False
+    _VERIFY['n'] += 1
+    tried[ref] = NOW()                     # first: a request cut off by the deadline still counts
+    res, until, why = retest_one(ref)
+    journal('return_check', key=ref, result=res, **({'error': why} if why else {}))
+    if res == 'ok':
+        v[ref] = NOW()
+        tried.pop(ref, None)
+        return True
+    _VERIFY['failed'].add(ref)
+    if res == 'limit':
+        health.hold(PROF(ref), until or NOW() + HOLD_MS, MODEL(ref))
+        state.setdefault('retested', {})[ref] = NOW()    # this was the hold's re-test too: not again within the hour
+    return False
+
+
+def better(state, health, model, acct, out, request=True):
+    """model@account to move work of this model to from acct by the preference, or None: the first account of
+    pref(model) above acct that is live (probe ok, not held for this model) and verified by a real request. Only for a
+    model the settings name; never while acct itself is out (that is a move off a held account, not a return)."""
+    if not health.prefers(model) or not acct or acct.split(':')[0] != model.split('/')[0] or health.dead(acct, model):
+        return None                        # a stored account of another provider: the model is not what it runs
+    order = health.pref(model)
+    for p in order[:order.index(acct) if acct in order else len(order)]:
+        if health.alive(p, model) and verify(state, health, '%s@%s' % (model, p), out, request):
+            return '%s@%s' % (model, p)
+    return None
+
+
+def cleanup_prefer(state):
+    """Forget proofs and per-item marks once they no longer matter."""
+    now = NOW()
+    for led, ttl in (('verified', VERIFY_MS), ('verify_tried', RETEST_EVERY_MS), ('pref_moved', RETURN_EVERY_MS)):
+        d = state.get(led) or {}
+        for k in [k for k, t in d.items() if now - t >= ttl]:
+            d.pop(k)
 
 
 def cli_json(argv, timeout=75):
@@ -816,11 +925,11 @@ def selfcheck():
     def retest_ok():
         if FAKE is not None:
             return
-        rc, o, e = run(['openclaw'] + RETEST_HELP[0], 60)
-        if rc == 124:
-            raise Unreachable('openclaw %s timed out' % ' '.join(RETEST_HELP[0]))
-        miss.extend('cli: openclaw %s: option %s' % (' '.join(RETEST_HELP[0][:-1]), x) for x in RETEST_HELP[1]
-                    if x not in o + e)
+        for argv, opts in (RETEST_HELP, ORDER_SET_HELP):
+            rc, o, e = run(['openclaw'] + argv, 60)
+            if rc == 124:
+                raise Unreachable('openclaw %s timed out' % ' '.join(argv))
+            miss.extend('cli: openclaw %s: option %s' % (' '.join(argv[:-1]), x) for x in opts if x not in o + e)
 
     for f in (config_ok, jobs_ok, runs_ok, describe_ok, tables_ok, logs_ok, package_ok, retest_ok):
         guard(f)
@@ -1007,13 +1116,17 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
         if jid in jobs and jobs[jid]['model'] == u['tgt']:
             journal('job_move', job=jid, name=jobs[jid]['name'][:60], frm=u['frm'], to=u['tgt'], result='ok',
                     note='the edit reported a failure but was applied')
-            if MODEL(u['tgt']) != u['own']:
+            if u.get('why') == 'preference':
+                state.setdefault('pref_moved', {})[jid] = NOW()
+                if jid in home:
+                    home[jid]['parked'] = u['tgt']    # same fallback model, preferred account: still on its way home
+            elif MODEL(u['tgt']) != u['own']:
                 park(state, 'home', jid, u['own'], u['tgt'])   # also when it was parked elsewhere before: new place
             else:
                 home.pop(jid, None)
             out['moved'].append((jid[:8], u['tgt']))            # counts as done: the pass state is not rolled back
             state.get('problems', {}).pop('rebind:' + jid, None)   # the failure reported last pass did not happen
-    todo = []
+    todo, pref_moved = [], state.setdefault('pref_moved', {})
     for jid, j in jobs.items():
         if j['enabled'] == disabled:
             continue                         # the other call's job
@@ -1024,12 +1137,16 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
         if jid in home and home[jid]['parked'] != ref:
             home.pop(jid)                    # somebody rebound it since: that choice stands
         if health.dead(j['profile'], MODEL(ref)):
-            todo.append((j['next'], jid, None))
+            todo.append((j['next'], jid, None, 'out'))
         elif jid in home and ripe(home[jid]) and health.target(home[jid]['model'], chain=False):
-            todo.append((j['next'], jid, health.target(home[jid]['model'], chain=False)))
+            todo.append((j['next'], jid, health.target(home[jid]['model'], chain=False), 'home'))
+        elif j['mode'] == JOB_TRUSTED and NOW() - pref_moved.get(jid, 0) >= RETURN_EVERY_MS:
+            b = better(state, health, MODEL(ref), j['profile'], out, request=not disabled)
+            if b:                            # a more preferred account of its model is live again
+                todo.append((j['next'], jid, b, 'preference'))
     for jid in [k for k in home if k not in jobs and not jobs_partial()]:
         home.pop(jid)
-    for _, jid, back in sorted(todo, key=lambda x: x[:2]):
+    for _, jid, back, why in sorted(todo, key=lambda x: x[:2]):
         j = jobs[jid]
         if j['mode'] != JOB_TRUSTED:
             if disabled:
@@ -1051,13 +1168,17 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
             out['later' if disabled else 'deferred'] += 1
             continue
         r = cron_edit(jid, tgt)
-        journal('job_move', job=jid, name=j['name'][:60], frm=model + '@' + j['profile'], to=tgt, result=r)
+        journal('job_move', job=jid, name=j['name'][:60], frm=model + '@' + j['profile'], to=tgt, why=why, result=r)
         if r == 'write_limited':
             out['later' if disabled else 'deferred'] += 1
             break
         if r in ('ok', 'dry-run'):
             out['moved'].append((jid[:8], tgt))
-            if MODEL(tgt) != own:
+            if why == 'preference':
+                pref_moved[jid] = NOW()
+                if jid in home:
+                    home[jid]['parked'] = tgt  # same fallback model, preferred account: still on its way home
+            elif MODEL(tgt) != own:
                 park(state, 'home', jid, own, tgt)
             else:
                 home.pop(jid, None)
@@ -1067,7 +1188,7 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
             save(state)                      # a pass cut off later must still know where this job came from
         else:
             prob(out, 'rebind:' + jid, 'rebind of job %s to %s failed: %s' % (jid[:8], tgt, r))
-            state.setdefault('unsure', {})[jid] = {'own': own, 'tgt': tgt, 'frm': model + '@' + j['profile']}
+            state.setdefault('unsure', {})[jid] = {'own': own, 'tgt': tgt, 'frm': model + '@' + j['profile'], 'why': why}
             save(state)
 
 
@@ -1352,6 +1473,7 @@ def move_chat(state, key, plan, e, out, why):
     else:
         home.pop(key, None)
     state.setdefault('chat_moved', {})[key] = {'to': plan['tgt'], 't': NOW()}   # this script's choice, not the user's
+    state.setdefault('owned', {})[key] = plan['tgt']    # kept while the chat stays there: the preference may move it
     out['chats'].append((key[-40:], plan['tgt']))
     save(state)
     return res
@@ -1417,9 +1539,131 @@ def chats_home(state, health, conf, out):
         if not err:
             home.pop(key)
             state.setdefault('chat_moved', {})[key] = {'to': tgt, 't': NOW()}
+            state.setdefault('owned', {})[key] = tgt
             out['chats'].append((key[-40:], tgt))
         else:
             prob(out, 'chat_return:' + key, 'chat %s: could not move back to %s: %s' % (key[-40:], tgt, err[:120]))
+
+
+def chats_prefer(state, health, conf, out):
+    """Return by the preference: a human chat whose account was not chosen by a person moves to a more preferred live
+    account of the same model (better()). Such a chat is one this script moved, parked on a fallback or was told to
+    adopt (state 'owned' or 'chat_home', while the chat still sits where it was put), or one whose account OpenClaw
+    chose itself (source 'auto'). A different selection since then is a person's choice and is never touched; the move
+    off a held account (chats_pass) is unchanged. The model never changes here. A chat with a run in progress or queued
+    input waits; at most one such move per chat an hour and RETURN_CHATS_PER_PASS per pass."""
+    owned, home = state.setdefault('owned', {}), state.setdefault('chat_home', {})
+    moved, n = state.setdefault('pref_moved', {}), 0
+    entries = stored_entries(CHAT_RE.match)
+    for key in [k for k in owned if k not in entries or '%s@%s' % chat_ref(conf, entries[k]) != owned[k]]:
+        owned.pop(key)                     # gone, or a person chose something else since: that choice stands
+    if not conf.get('prefer'):
+        return
+    for key, e in sorted(entries.items()):
+        model, acct = chat_ref(conf, e)
+        ref = '%s@%s' % (model, acct)
+        mine = owned.get(key) == ref or home.get(key, {}).get('parked') == ref or e.get(E_PROFILE_SRC) == 'auto'
+        if not acct or not mine or not health.prefers(model) or not human_chat(key, None, e) \
+                or NOW() - moved.get(key, 0) < RETURN_EVERY_MS:
+            continue
+        if n >= RETURN_CHATS_PER_PASS or late() or not fits(60):
+            out['deferred'] += 1
+            break
+        tgt = better(state, health, model, acct, out)
+        if not tgt:
+            continue
+        try:
+            s = session(key)
+            fresh_e, queued = entry(key)
+        except RuntimeError:
+            out['deferred'] += 1               # the Gateway is busy: look again next pass
+            continue
+        if not s or s.get(S_ACTIVE) or queued or selection(fresh_e) != selection(e) or not human_chat(key, s, fresh_e):
+            continue                           # a run, new input or a person's choice wins
+        n += 1
+        err = patch_chat(key, tgt, fresh_e)
+        res = err or ('ok' if APPLY else 'dry-run')
+        journal('chat_move', session=key, frm=ref, to=tgt, why='preference', result=res)
+        if err:
+            prob(out, 'chat_move:' + key, 'chat %s: could not move to %s: %s' % (key[-40:], tgt, err[:120]))
+            continue
+        moved[key] = NOW()
+        owned[key] = tgt
+        if key in home:
+            home[key]['parked'] = tgt          # same fallback model, preferred account: still on its way home
+        state.setdefault('chat_moved', {})[key] = {'to': tgt, 't': NOW()}
+        out['chats'].append((key[-40:], tgt))
+        save(state)
+
+
+def adopt(state, keys):
+    """--adopt KEY...: the operator moved these chats by hand, so their current account is not a person's choice:
+    record it as this script's own (state 'owned'), and the preference may move them. Only human chats with a stored
+    account; anything else is listed as skipped. Changes no chat."""
+    conf, owned, res = cfg(), state.setdefault('owned', {}), {}
+    for key in keys:
+        e, _ = entry(key)
+        model, acct = chat_ref(conf, e)
+        if not e or not acct or not human_chat(key, None, e):
+            res[key] = 'skipped: no human chat with a stored account'
+            continue
+        owned[key] = res[key] = '%s@%s' % (model, acct)
+        journal('chat_adopt', session=key, ref=owned[key])
+    save(state)
+    print(json.dumps(res, indent=1, ensure_ascii=False))
+
+
+def order_pass(state, health, conf, jobs, out):
+    """auth.order decides only where unpinned work starts (new chats, subagents), and OpenClaw does not skip an account
+    this script holds. So per provider with a non-empty order and a preference for some of its models: each such model
+    votes for its first live account in pref() with its weight (enabled jobs plus pinned human chats on it; the config
+    primary, which new chats use, one more). The winner goes first when it beats the current first account; the rest
+    keep their order. Written with a compare-and-set of the documented CLI, at most once per ORDER_EVERY_MS per
+    provider, and only when it must change; a dry run only reports it."""
+    prefs = conf.get('prefer') or {}
+    weight = {}
+    for j in jobs.values():
+        if j['enabled'] and j['ref']:
+            weight[MODEL(j['ref'])] = weight.get(MODEL(j['ref']), 0) + 1
+    for key, e in stored_entries(CHAT_RE.match).items():
+        if pinned(e) and e.get(E_PROFILE) and human_chat(key, None, e):
+            m = chat_ref(conf, e)[0]
+            weight[m] = weight.get(m, 0) + 1
+    weight[conf['primary']] = weight.get(conf['primary'], 0) + 1
+    last = state.setdefault('order_set', {})
+    for prov, order in sorted((conf.get('order') or {}).items()):
+        models = [m for m in prefs if m.split('/')[0] == prov and weight.get(m)]
+        if not isinstance(order, list) or not order or not models or NOW() - last.get(prov, 0) < ORDER_EVERY_MS:
+            continue
+        score = {}
+        for m in models:
+            best = next((p for p in health.pref(m) if health.alive(p, m)), None)
+            if best:
+                score[best] = score.get(best, 0) + weight[m]
+        first = max(order, key=lambda p: (score.get(p, 0), -order.index(p)))   # a tie keeps the current first
+        if first == order[0] or score.get(first, 0) <= score.get(order[0], 0):
+            continue
+        new = [first] + [p for p in order if p != first]
+        if not APPLY:
+            out['order'].append((prov, new))
+            continue
+        if not fits(60):
+            out['deferred'] += 1
+            continue
+        last[prov] = NOW()
+        r = order_set(prov, new, order)
+        journal('order_set', provider=prov, frm=order, to=new, votes=score, result=r)
+        if r == 'ok':
+            out['order'].append((prov, new))
+            conf['order'][prov] = new
+        else:
+            prob(out, 'order:' + prov, 'auth.order.%s could not be set to %s: %s' % (prov, ', '.join(new), r[:120]))
+
+
+def order_set(provider, new, old):
+    """Writes auth.order.<provider> = new only while it still equals old (the CLI's compare-and-set)."""
+    rc, out, err = run(['openclaw'] + CLI_ORDER_SET(provider, new, old), 60)
+    return 'ok' if rc == 0 else 'rc=%s %s' % (rc, (err or out).strip()[-200:])
 
 
 def chat_changed(state, health, key, s, e, queued, p):
@@ -1758,6 +2002,9 @@ def status(state):
         'held': {k: hm(u) for k, u in state.get('limited', {}).items() if u > now},   # model@account: until
         'hold_retested': {k: hm(t) for k, t in state.get('retested', {}).items()
                           if state.get('limited', {}).get(k, 0) > now},       # last real re-test of a held pair
+        'prefer': load_settings()[0],                                       # model: accounts, most preferred first
+        'verified': {k: hm(t) for k, t in state.get('verified', {}).items()},  # last real answer of a return target
+        'chats_owned': len(state.get('owned', {})),        # chats whose account this script set: the preference moves them
         'jobs_on_fallback_model': state.get('home', {}),
         'chats_on_fallback_model': state.get('chat_home', {}),
         'pending_events': state.get('pending', {}),
@@ -1766,10 +2013,15 @@ def status(state):
 
 def main():
     out = {'moved': [], 'chats': [], 'continued': [], 'aborted': [], 'no_target': [], 'problems': [], 'deferred': 0, 'later': 0,
-           'cleared': [], 'retest_due': []}
+           'cleared': [], 'retest_due': [], 'verify_due': [], 'order': []}
     state = load_state()
     if '--status' in sys.argv:
         return status(state)
+    if '--adopt' in sys.argv:
+        SDIR.mkdir(parents=True, exist_ok=True)
+        lock = open(SDIR / 'lock', 'w')
+        fcntl.flock(lock, fcntl.LOCK_EX)   # waits for a running pass, so its save cannot overwrite this one
+        return adopt(load_state(), sys.argv[sys.argv.index('--adopt') + 1:])
     if '--check' in sys.argv:
         try:
             ver, missing = openclaw_version(), selfcheck()
@@ -1816,9 +2068,13 @@ def main():
     if not ok or conf is None:
         signal.alarm(0)
         return finish(state, out, {'providers': set()}, {}, Health(conf or {}, {}))
+    if conf.get('settings_err'):
+        prob(out, 'settings', conf['settings_err'] + '; no account is preferred until it is fixed')
     limited = state.setdefault('limited', {})
     for k in [k for k, u in limited.items() if u <= NOW() or '/' not in k.split('@', 1)[0]]:
-        limited.pop(k)         # expired, or a whole-account hold left by an older version
+        if limited.pop(k) <= NOW() and conf.get('prefer'):
+            state['retry'] = True          # a limit ran out: this pass asks the accounts, so work can return now
+    cleanup_prefer(state)
     for k in ('rerun', 'rerun_wanted', 'run_req'):
         state.pop(k, None)     # an older version's rerun bookkeeping
     ev, streak, health = {'providers': set()}, {}, Health(conf, limited)
@@ -1842,6 +2098,8 @@ def main():
             jobs_pass(conf, jobs, health, state, t0, out)
             chats_pass(state, health, out)
             chats_home(state, health, conf, out)
+            chats_prefer(state, health, conf, out)
+            order_pass(state, health, conf, jobs, out)
             state['probed_at'] = NOW()
             state['retry'] = bool(out['deferred'] or out['no_target'] or health.failed)
         stalls_and_chats(state, health, jobs, out)

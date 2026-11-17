@@ -61,6 +61,18 @@ elif a[:2] == ['models', 'status']:
     f = json.load(open(os.environ['OCF_FAKE']))
     print(json.dumps(f.get('models_status', {'auth': {'oauth': {'warnAfterMs': 86400000, 'profiles': [], 'providers': []}}})))
     sys.exit(f.get('models_status_rc', 0))
+elif a[:2] == ['config', 'set']:
+    f = os.environ['OCF_CONFIG']
+    c = json.load(open(f))
+    path, new = a[2].split('.'), json.loads(a[3])
+    cur = c
+    for k in path[:-1]:
+        cur = cur.setdefault(k, {})
+    if '--expect-current-json' in a and cur.get(path[-1]) != json.loads(a[a.index('--expect-current-json') + 1]):
+        sys.stderr.write('config changed since it was read\n')
+        sys.exit(1)
+    cur[path[-1]] = new
+    json.dump(c, open(f, 'w'))
 elif a[:2] == ['cron', 'runs']:
     lim = int(a[a.index('--limit') + 1])
     print(json.dumps({'entries': [r for r in runs if r['status'] == 'error'][:lim], 'total': 0, 'hasMore': False}))
@@ -156,7 +168,7 @@ def go(d, stale_probe=False, *extra, env=None):
         st.write_text(json.dumps(s))
     env = dict(os.environ, OCF_STATE=str(d / 'st'), OCF_STATE_DB='file:%s?mode=ro' % (d / 'state.sqlite'),
                OCF_FAKE_DB=str(d / 'state.sqlite'), OCF_CONFIG=str(d / 'cfg.json'), OCF_LOG_DIR=str(d / 'logs'),
-               OCF_FAKE=str(d / 'fake.json'), OCF_DIST=str(d / 'pkg' / 'dist'), OCF_OPENCLAW_DIR=str(d / 'oc'), OCF_FAKE_CALLS=str(d / 'calls.log'),
+               OCF_FAKE=str(d / 'fake.json'), OCF_DIST=str(d / 'pkg' / 'dist'), OCF_OPENCLAW_DIR=str(d / 'oc'), OCF_FAKE_CALLS=str(d / 'calls.log'), OCF_SETTINGS=str(d / 'settings.json'),
                PATH=str(d / 'bin') + os.pathsep + os.environ.get('PATH', ''))
     env.update(env_extra or {})
     p = subprocess.run([sys.executable, str(HERE / os.environ.get('OCF_SCRIPT', 'failover.py')), '--apply', *extra], env=env, capture_output=True, text=True)
@@ -1722,6 +1734,214 @@ def test_holds_are_re_tested_at_most_hourly_a_few_per_pass_and_only_when_long():
     assert n() == 4 and kinds(j, 'hold_retest')[-1]['key'] == OPUS + '@' + PA, j
     assert all(r['in_a_row'] < F.RETEST_ERRORS for r in kinds(j, 'hold_retest')) and not kinds(j, 'problem'), j
 
+
+# Per-model account preference (settings file): the owner's split is Opus on A, then B, then C; Fable on A, then C, then
+# B. Accounts here: PA, PB, PC; auth.order in the fixture config is [PB, PA, PC].
+PREFER = {'prefer': {OPUS: [PA, PB, PC], FABLE: [PA, PC, PB]}}
+ALL_OK = {'anthropic': {PB: 'ok', PA: 'ok', PC: 'ok'}}
+
+
+def prefer(d, settings=PREFER, state=None):
+    (d / 'settings.json').write_text(json.dumps(settings))
+    if state is not None:
+        (d / 'st').mkdir(exist_ok=True)
+        (d / 'st' / 'state.json').write_text(json.dumps(dict({'started': 0}, **state)))
+
+
+def go_dry(d):
+    env = dict(os.environ, OCF_STATE=str(d / 'st'), OCF_STATE_DB='file:%s?mode=ro' % (d / 'state.sqlite'),
+               OCF_FAKE_DB=str(d / 'state.sqlite'), OCF_CONFIG=str(d / 'cfg.json'), OCF_LOG_DIR=str(d / 'logs'),
+               OCF_FAKE=str(d / 'fake.json'), OCF_DIST=str(d / 'pkg' / 'dist'), OCF_OPENCLAW_DIR=str(d / 'oc'),
+               OCF_FAKE_CALLS=str(d / 'calls.log'), OCF_SETTINGS=str(d / 'settings.json'),
+               PATH=str(d / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+    p = subprocess.run([sys.executable, str(HERE / 'failover.py')], env=env, capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+def requests(d):
+    f = d / 'calls.log'
+    return [x.split()[5] for x in open(f) if x.startswith('infer model run')] if f.exists() else []
+
+
+def order(d):
+    return json.loads((d / 'cfg.json').read_text())['auth']['order']['anthropic']
+
+
+def test_a_move_off_a_held_account_goes_to_the_most_preferred_live_one():
+    # Fable is out on PA. auth.order would pick PB next; the preference puts Fable on PC before PB.
+    d = setup(probe=ALL_OK, entries={K: dict(PIN, authProfileOverride=PA)})
+    prefer(d, state={'limited': {FABLE + '@' + PA: ms() + 5 * 86400_000}})
+    m, = kinds(go(d, True)[2], 'chat_move')
+    assert (m['frm'], m['to'], m['why']) == (FABLE + '@' + PA, FABLE + '@' + PC, 'held'), m
+
+
+def test_a_job_returns_to_its_preferred_account_once_a_real_request_there_answers():
+    # The job was moved to PB while Opus was held on PA. The hold ran out (the weekly reset came): the first pass
+    # proves Opus answers on PA with one real request and moves the job back; no second request within the hour.
+    d = setup({'a': (OPUS, PB, 'trusted'), 'b': (OPUS, PA, 'trusted')}, [], ALL_OK)
+    prefer(d, state={'limited': {OPUS + '@' + PA: ms() - 1000}})
+    fake(d, retest={OPUS + '@' + PA: RT_OK})
+    rc, err, j = go(d)
+    c, = kinds(j, 'return_check')
+    m, = kinds(j, 'job_move')
+    assert c['key'] == OPUS + '@' + PA and c['result'] == 'ok', c
+    assert (m['job'], m['frm'], m['to'], m['why']) == ('a', OPUS + '@' + PB, OPUS + '@' + PA, 'preference'), m
+    assert binding(d, 'a') == OPUS + '@' + PA and binding(d, 'b') == OPUS + '@' + PA and rc == 0, err
+    assert len(kinds(go(d, True)[2], 'job_move')) == 1 and requests(d) == [OPUS + '@' + PA]
+
+
+def test_no_return_while_the_preferred_account_is_held_or_does_not_answer():
+    # Held there (a weekly limit): no request, no move. Its re-test is the hold logic's, not the return's.
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d, state={'limited': {OPUS + '@' + PA: ms() + 40 * 60_000}})
+    j = go(d, True)[2]
+    assert binding(d, 'a') == OPUS + '@' + PB and not kinds(j, 'job_move') and not requests(d), j
+    # The request hits the limit: held until the provider's time, the job stays, and later passes ask nothing.
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d)
+    fake(d, retest={OPUS + '@' + PA: RT_LIMIT})
+    rc, err, j = go(d, True)
+    c, = kinds(j, 'return_check')
+    assert c['result'] == 'limit' and binding(d, 'a') == OPUS + '@' + PB and rc == 0, (c, err)
+    assert abs(state_of(d)['limited'][OPUS + '@' + PA] - (ms() + 205922_000)) < 120_000
+    go(d, True)
+    assert requests(d) == [OPUS + '@' + PA] and binding(d, 'a') == OPUS + '@' + PB
+    # No answer at all (a timeout): no move, no problem, asked again only after an hour.
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d)
+    rc, err, j = go(d, True)
+    assert kinds(j, 'return_check')[0]['result'] == 'error' and binding(d, 'a') == OPUS + '@' + PB and rc == 0, err
+    go(d, True)
+    assert len(requests(d)) == 1
+    s = state_of(d)
+    s['verify_tried'][OPUS + '@' + PA] -= F.RETEST_EVERY_MS
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    fake(d, retest={OPUS + '@' + PA: RT_OK})
+    go(d, True)
+    assert len(requests(d)) == 2 and binding(d, 'a') == OPUS + '@' + PA
+
+
+def test_without_a_preference_nothing_returns_and_auth_order_is_left_alone():
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK, entries={K: dict(PIN, authProfileOverrideSource='auto')})
+    prefer(d, {'prefer': {'anthropic/claude-sonnet-5-5': [PA]}})
+    j = go(d, True)[2]
+    assert not kinds(j, 'job_move') and not kinds(j, 'chat_move') and not requests(d) and order(d) == [PB, PA, PC], j
+
+
+def test_chats_return_only_where_no_person_chose_the_account():
+    # Opus on PB everywhere, PA preferred and answering. The chat a person pinned stays; the chat this script moved, the
+    # one the operator adopted, the one OpenClaw placed itself (auto) and the one parked on a fallback model move; a
+    # chat with a run in progress waits; a chat whose person changed the account after our move stays.
+    opus_b = {'modelOverrideSource': 'default', 'authProfileOverride': PB, 'authProfileOverrideSource': 'user'}
+    keys = {n: 'agent:main:telegram:group:-100%d' % i for i, n in enumerate(
+        ('person', 'ours', 'adopted', 'auto', 'parked', 'busy', 'changed'))}
+    entries = {k: dict(opus_b) for k in keys.values()}
+    entries[keys['auto']]['authProfileOverrideSource'] = 'auto'
+    entries[keys['changed']]['authProfileOverride'] = PC
+    sessions = {keys['busy']: {'hasActiveRun': True}}
+    d = setup(probe=ALL_OK, entries=entries, sessions=sessions)
+    ob = OPUS + '@' + PB
+    prefer(d, state={'owned': {keys['ours']: ob, keys['busy']: ob, keys['changed']: ob},
+                     'chat_home': {keys['parked']: {'model': FABLE, 'parked': ob, 'at': ms(), 'wait': 3600_000}}})
+    fake(d, retest={OPUS + '@' + PA: RT_OK})
+    rc, err, j = go(d, False, '--adopt', keys['adopted'])
+    assert rc == 0 and kinds(j, 'chat_adopt')[0]['ref'] == ob, (err, j)
+    rc, err, j = go(d, True)
+    moved = {m['session']: m for m in kinds(j, 'chat_move')}
+    assert set(moved) == {keys[n] for n in ('ours', 'adopted', 'auto', 'parked')}, moved
+    assert all(m['to'] == OPUS + '@' + PA and m['why'] == 'preference' for m in moved.values()), moved
+    s = state_of(d)
+    assert s['chat_home'][keys['parked']]['parked'] == OPUS + '@' + PA and s['chat_home'][keys['parked']]['model'] == FABLE
+    assert keys['changed'] not in s['owned'] and s['owned'][keys['auto']] == OPUS + '@' + PA, s['owned']
+    assert len(requests(d)) == 1 and rc == 0, err
+    # The busy chat goes once its run is over; nothing moves twice.
+    fake(d, sessions={k: {'key': k, 'hasActiveRun': False} for k in keys.values()})
+    j = go(d, True)[2]
+    assert [m['session'] for m in kinds(j, 'chat_move')][4:] == [keys['busy']], j
+
+
+def test_preference_moves_are_rate_limited_per_item():
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d, state={'verified': {OPUS + '@' + PA: ms()}, 'pref_moved': {'a': ms() - 30 * 60_000}})
+    assert not kinds(go(d, True)[2], 'job_move')                       # moved by the preference half an hour ago
+    s = state_of(d)
+    s['pref_moved']['a'] -= F.RETURN_EVERY_MS
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    m, = kinds(go(d, True)[2], 'job_move')
+    assert m['why'] == 'preference' and not requests(d), m             # proof less than an hour old: no new request
+
+
+def test_auth_order_follows_the_preferred_live_account_of_the_most_used_models():
+    # The reported state: Opus work on PA, Fable out on PA and PC, auth.order still [PB, PA, PC]. New unpinned work
+    # must start on PA: Opus (2 jobs + the primary) votes PA, Fable (1 pinned chat) votes PB.
+    fable_b = dict(PIN, authProfileOverride=PB)
+    d = setup({'a': (OPUS, PA, 'trusted'), 'b': (OPUS, PA, 'trusted')}, [], ALL_OK, entries={K: fable_b})
+    prefer(d, state={'limited': {FABLE + '@' + PA: ms() + 5 * 86400_000, FABLE + '@' + PC: ms() + 86400_000}})
+    out = go_dry(d)
+    assert out['order'] == [['anthropic', [PA, PB, PC]]] and order(d) == [PB, PA, PC], out   # a dry run only says so
+    rc, err, j = go(d, True)
+    o, = kinds(j, 'order_set')
+    assert (o['frm'], o['to'], o['result'], o['votes']) == ([PB, PA, PC], [PA, PB, PC], 'ok', {PA: 3, PB: 1}), o
+    assert order(d) == [PA, PB, PC] and rc == 0, err
+    assert len(kinds(go(d, True)[2], 'order_set')) == 1                # already first: nothing to write
+    # Opus is then held on PA: it votes PB, which wins. Not before ORDER_EVERY_MS has passed since the last write.
+    s = state_of(d)
+    s['limited'][OPUS + '@' + PA] = ms() + 86400_000
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    assert len(kinds(go(d, True)[2], 'order_set')) == 1 and order(d) == [PA, PB, PC]
+    s = state_of(d)
+    s['order_set']['anthropic'] -= F.ORDER_EVERY_MS
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    o = kinds(go(d, True)[2], 'order_set')[-1]
+    assert o['to'] == [PB, PA, PC] and order(d) == [PB, PA, PC], o
+
+
+def test_order_compare_and_set_never_overwrites_a_newer_order():
+    d = setup({'a': (OPUS, PA, 'trusted')}, [], ALL_OK)
+    prefer(d)
+    wrapper = d / 'bin' / 'openclaw'                                   # the order changes between read and write
+    wrapper.write_text(wrapper.read_text().replace("elif a[:2] == ['config', 'set']:\n", "elif a[:2] == ['config', 'set']:\n"
+        "    c0 = json.load(open(os.environ['OCF_CONFIG'])); c0['auth']['order']['anthropic'] = "
+        "['anthropic:c', 'anthropic:b', 'anthropic:a']; json.dump(c0, open(os.environ['OCF_CONFIG'], 'w'))\n"))
+    rc, err, j = go(d, True)
+    o, = kinds(j, 'order_set')
+    assert o['result'].startswith('rc=1') and order(d) == [PC, PB, PA], o
+    assert rc == 1 and 'auth.order.anthropic could not be set' in err, err
+
+
+def test_a_broken_settings_file_is_a_problem_and_prefers_nothing():
+    for bad in ('{not json', json.dumps({'prefer': {OPUS: ['openai:a']}}), json.dumps({'prefer': {OPUS: []}})):
+        d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+        (d / 'settings.json').write_text(bad)
+        rc, err, j = go(d, True)
+        assert rc == 1 and 'settings' in err and not kinds(j, 'job_move') and order(d) == [PB, PA, PC], (bad, err)
+
+
+def test_dry_run_makes_no_request_and_no_edit():
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d)
+    fake(d, retest={OPUS + '@' + PA: RT_OK})
+    out = go_dry(d)
+    assert out['verify_due'] == [OPUS + '@' + PA] and not out['moved'] and not requests(d), out
+    assert binding(d, 'a') == OPUS + '@' + PB
+
+
+def test_disabled_jobs_return_only_on_proof_the_pass_already_has():
+    d = setup({'a': (OPUS, PB, 'trusted'), 'b': (OPUS, PA, 'trusted')}, [], ALL_OK)   # b: the pass asks anthropic
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute("update cron_jobs set enabled=0 where job_id='a'")
+    c.commit()
+    c.close()
+    prefer(d)
+    fake(d, retest={OPUS + '@' + PA: RT_OK})
+    go(d, True)
+    assert binding(d, 'a') == OPUS + '@' + PB and not requests(d)      # no request of its own for a disabled job
+    s = state_of(d)
+    s['verified'] = {OPUS + '@' + PA: ms()}
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    m, = kinds(go(d, True)[2], 'job_move')
+    assert m['why'] == 'preference' and binding(d, 'a') == OPUS + '@' + PA, m
 
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
