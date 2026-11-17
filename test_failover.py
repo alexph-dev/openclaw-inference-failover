@@ -446,6 +446,48 @@ def test_failed_continuation_is_reported():
     assert list(json.loads((d / 'st' / 'state.json').read_text())['continued']) == ['ocf-continue-2']
 
 
+def test_continuation_stopped_by_a_person_is_not_a_failure():
+    # 17 Nov 2026: the operator stopped a running continuation by hand to move the chat; 'openclaw agent' printed
+    # 'aborted' and exited 1. That is a stop, not a failed continuation, and must not fail the job.
+    d = setup(probe={'anthropic': {PB: 'ok'}})
+    (d / 'st').mkdir()
+    (d / 'st' / 'state.json').write_text(json.dumps({'continued': {'ocf-continue-1': K, 'ocf-continue-2': K}, 'probed_at': ms()}))
+    fake(d, units={'ocf-continue-1': 'failed', 'ocf-continue-2': 'failed'},
+         unit_output={'ocf-continue-1': F.AGENT_STOPPED + '\n', 'ocf-continue-2': 'Error: gateway closed\n'})
+    rc, err, j = go(d)
+    assert rc == 1 and 'ocf-continue-2' in err and 'ocf-continue-1' not in err, err
+    s, = kinds(j, 'continue_stopped')
+    assert s['unit'] == 'ocf-continue-1', s
+    assert json.loads((d / 'st' / 'state.json').read_text())['continued'] == {}
+
+
+# The real Gateway log lines of a Control UI (dashboard) chat whose Fable request got a 5.4-day Retry-After
+# (/tmp/openclaw/openclaw-2026-11-17.log lines 6490-6493). The retry line names only runId and sessionId.
+DASH = 'agent:main:dashboard:2c2d08a7-2ef4-474d-a940-8ea5113fab4f'
+DASH_RUN = 'b6cffd71-d0f6-44a6-a9f7-6f10dff3e906'
+DASH_LOG = [
+    {'0': '{"subsystem":"provider-transport-fetch"}', '1': '[model-fetch] response provider=anthropic api=anthropic-messages model=claude-fable-5-2 status=429 elapsedMs=317 dispatcher=reused contentType=application/json httpRequestId=unknown sessionKey="%s" runId="%s" requestId="%s:model:1" requestNumber=1' % (DASH, DASH_RUN, DASH_RUN)},
+    {'0': '{"subsystem":"provider-error"}', '1': {'provider': 'anthropic', 'model': 'claude-fable-5-2', 'status': 429, 'message': '429 status code (no body)', 'body': {'type': 'error', 'error': {'type': 'rate_limit_error', 'message': "This request would exceed your account's rate limit. Please try again later."}, 'request_id': 'req_011Ch8fQH9WJxo7eU1BuvQBy'}},
+     '2': 'Model request failed sessionKey="%s" runId="%s" requestId="%s:model:1" requestNumber=1' % (DASH, DASH_RUN, DASH_RUN)},
+    {'0': '{"subsystem":"agent/embedded"}', '1': {'event': 'embedded_run_agent_end', 'tags': ['error_handling', 'lifecycle', 'agent_end', 'assistant_error'], 'runId': DASH_RUN, 'isError': True, 'error': '\u26a0\ufe0f The AI service needs a short break. Please try again in a few minutes.', 'failoverReason': 'rate_limit', 'model': 'claude-fable-5-2', 'provider': 'anthropic', 'rawErrorPreview': '429: {"error":{"message":"This request would exceed your account\'s rate limit. Please try again later.","type":"rate_limit_error"},"request_id":"req_011Ch8fQH9WJxo7eU1BuvQBy","type":"error"}; Retry-After: 469674 seconds', 'rawErrorHash': 'sha256:84a976a9aa41', 'providerRuntimeFailureKind': 'rate_limit'}, '2': 'embedded run agent end'},
+    {'0': '{"subsystem":"agent/embedded"}', '1': 'transient same-model retry 1/9 for anthropic/claude-fable-5-2 reason=rate_limit: delayMs=469674000 runId="%s" sessionId="f8f4654a-e634-4e9d-86b2-1dba88c01b0c"' % DASH_RUN},
+]
+
+
+def test_dashboard_chat_sleeping_a_long_wait_is_recovered_from_the_real_log_lines():
+    log = [dict(x, _meta=line(None)['_meta']) for x in DASH_LOG]
+    d = setup(log=log, probe={'anthropic': {PB: 'ok', PA: 'ok'}},     # the probe does not see a per-model limit
+              sessions={DASH: {'key': DASH, 'hasActiveRun': True, 'sessionId': 'f8f4654a-e634-4e9d-86b2-1dba88c01b0c'}},
+              entries={DASH: PIN})
+    rc, err, j = go(d)
+    r, = kinds(j, 'chat_recover')
+    assert (r['session'], r['run'], r['why'], r['frm'], r['to'], r['abort'], r['patch'], r['continue']) == \
+        (DASH, DASH_RUN, 'stall', FABLE + '@' + PB, FABLE + '@' + PA, 'ok', 'ok', 'started'), r
+    held = json.loads((d / 'st' / 'state.json').read_text())['limited'][FABLE + '@' + PB]
+    assert abs(held - (ms() + 469674000)) < 120_000, held                # held until the time the provider named
+    assert len(kinds(go(d)[2], 'chat_recover')) == 1                  # handled once (the journal is cumulative)
+
+
 def test_log_format_drift_after_an_update_is_reported():
     d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'ok', PC: 'ok'}})
     pkg_strings(d / 'pkg', tuple(s for s in F.ANCHORS + F.ERROR_TEXTS if s != F.EV_END))

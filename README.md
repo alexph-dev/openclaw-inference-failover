@@ -65,6 +65,7 @@ limits). After those come the entries of
 | Failed runs and their errors | documented CLI: `openclaw cron runs --all --status error --limit 200 --json` (only when a job is in a fresh error streak) |
 | Rebinding a job | documented CLI: `openclaw cron edit <id> --model` |
 | Continuing a chat | documented CLI: `openclaw agent --session-key ...` (`--deliver` only for external chats) |
+| Whether a failed continuation was only stopped | the unit's own output (`journalctl --user -u <unit> -t openclaw`): a last line `aborted` is a stop, not a failure |
 | Account status | Gateway RPC `models.probe` |
 | Whether a held model@account answers again | documented CLI: `openclaw infer model run --local --model provider/model@account --prompt ... --json` |
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
@@ -116,7 +117,9 @@ Requirements and limits:
 
 - Python 3.8+ and the `openclaw` CLI on the job's `PATH`.
 - Continuing a chat starts `openclaw agent` as a transient user unit (`systemd-run --user`), so that part needs
-  Linux with a user systemd session. Without it the chat is still moved, and the failed start is reported.
+  Linux with a user systemd session. Without it the chat is still moved, and the failed start is reported. A
+  continuation whose run someone stopped (`openclaw agent` ends with `aborted`) is journaled `continue_stopped`, not
+  reported as a failure.
 - `openclaw cron list` returns one page of 200 jobs and has no paging option. With more jobs the script reports it
   and watches only the first page.
 - Targets: with a non-empty `auth.order` list for a provider, an account is chosen only when that list names it,
