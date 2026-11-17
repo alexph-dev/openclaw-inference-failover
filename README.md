@@ -53,16 +53,21 @@ limits). After those come the entries of
   cleared it (the reset came early). Before the first return to that model@account in an hour, one real request of the
   model there must answer (`return_check` in the journal; a limit holds it instead), so work does not bounce back onto
   a model still at its limit. What returns: operator cron jobs (disabled ones only on a proof the pass already has),
-  and chats whose account no person chose: chats this script moved or parked, chats the operator moved by hand and
-  recorded with `--adopt`, and chats whose account OpenClaw picked itself (source `auto`). A chat whose account or model a
-  person chose is never moved back; once a person picks something else for a chat the script moved, that choice stands.
-  The model never changes on a return. Each job or chat is moved this way at most once an hour, at most 20 chats per
-  pass, journaled as `job_move` / `chat_move` with `why: preference`. The first account of a provider's
+  and chats whose account this script set: chats it moved or parked, and chats the operator moved by hand and
+  recorded with `--adopt`, while they still sit where they were put in the same session. A chat whose account or model
+  a person chose is never moved back, nor one whose account OpenClaw picked itself; once a person picks something
+  else for a chat the script moved, that choice stands (a person picking exactly the same model and account is not
+  visible). The model never changes on a return. Moves off held accounts come first in a pass, returns and their
+  checks after them. Each job or chat is moved this way at most once an hour, at most 10 jobs and 10 chats per pass,
+  journaled as `job_move` / `chat_move` with `why: preference`. The first account of a provider's
   `auth.order` (where unpinned new chats and subagents start) follows the same preference: each preferred model votes
   for its first live account with its weight (enabled jobs and pinned chats on it, the default model one more), and the
   winner goes first when it beats the current first account. It is written with `openclaw config set` as a
-  compare-and-set against the order just read, at most once per 15 min per provider (`order_set`). Without a
-  preference for a model nothing returns between its accounts and `auth.order` is left alone.
+  compare-and-set against the order just read, at most once per 15 min per provider (`order_set`); the settings file
+  is then the one place to change the order, since a hand edit that the preference disagrees with is undone. The order
+  is one per provider, so a model whose preferred account differs from the winner's still starts there (and is moved
+  once held). Without a preference for any model of a provider nothing returns between its accounts and its
+  `auth.order` is left alone.
 - **Problems** it cannot fix (no live account anywhere, a missing OpenClaw surface) fail the job run with the reason on
   stderr on two passes in a row, then stay quiet while open. It never fails every minute, so the scheduler does not
   disable it.
