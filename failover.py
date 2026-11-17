@@ -55,6 +55,9 @@ CLI_RUNS = ['cron', 'runs', '--all', '--status', 'error', '--sort', 'desc', '--l
 CLI_EDIT = lambda jid, ref: ['cron', 'edit', jid, '--model', ref, '--timeout', '120000']   # rebind a job to model@account
 CLI_AGENT = lambda key, msg, deliver=True: ['agent', '--session-key', key, '--message', msg] + (['--deliver'] if deliver else []) + ['--timeout', '3600']  # continue on the stored route, or locally
 CLI_MODELS = lambda agent: ['models', 'status', '--json', '--agent', agent]   # the agent's accounts, saved ones too
+AGENT_STOPPED = 'aborted'   # last output line of 'openclaw agent' when its run was stopped (sessions.abort, a stop button)
+AGENT_OUTPUT = lambda unit: ['journalctl', '--user', '-u', unit, '-t', 'openclaw', '-o', 'cat', '--no-pager', '-n', '5']
+                            # what 'openclaw agent' printed in a continuation unit (syslog identifier 'openclaw')
 CLI_CALL = lambda method, params, ms: ['gateway', 'call', method, '--params', json.dumps(params), '--json', '--timeout', str(ms)]  # one RPC
 # One real minimal request of exactly this model on exactly this account, through OpenClaw with the account's own saved
 # credential ('provider/model@profile' locks the profile; --local runs it in the CLI process, no chat session).
@@ -1268,7 +1271,8 @@ def continue_turn(key, model, moved, run_id=''):
 
 
 def continued_check(state, out):
-    """A continuation that ended in failure is a problem; a finished one is forgotten (systemd drops the unit)."""
+    """A continuation that ended in failure is a problem; a finished one is forgotten (systemd drops the unit). One whose
+    run was stopped (by a person, or by an operator moving the chat by hand) is an intentional stop, not a failure."""
     c = state.setdefault('continued', {})
     for unit, key in list(c.items()):
         st = FAKE.get('units', {}).get(unit, 'inactive') if FAKE is not None else \
@@ -1280,10 +1284,20 @@ def continued_check(state, out):
             if APPLY:
                 run(['systemctl', '--user', 'stop', unit], 15)
         c.pop(unit)
-        if st == 'failed':
+        if st != 'failed':
+            continue
+        if stopped_continuation(unit):
+            journal('continue_stopped', session=key, unit=unit, why='its run was stopped, not failed')
+        else:
             prob(out, 'continue:' + unit, 'chat %s: the continued turn failed (journalctl --user -u %s)' % (key[-40:], unit))
-            if FAKE is None and APPLY:
-                run(['systemctl', '--user', 'reset-failed', unit], 15)
+        if FAKE is None and APPLY:
+            run(['systemctl', '--user', 'reset-failed', unit], 15)
+
+
+def stopped_continuation(unit):
+    out = FAKE.get('unit_output', {}).get(unit, '') if FAKE is not None else run(AGENT_OUTPUT(unit), 15)[1]
+    lines = [x.strip() for x in (out or '').splitlines() if x.strip()]
+    return bool(lines) and lines[-1] == AGENT_STOPPED
 
 
 def patch_chat(key, tgt, e=None):
