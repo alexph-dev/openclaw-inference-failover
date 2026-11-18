@@ -591,6 +591,119 @@ def test_pinned_chat_parked_on_the_primary_model_returns_too():
     assert (r['to'], r['result']) == (FABLE + '@' + PB, 'ok'), r
 
 
+def test_chat_home_removed_from_config_is_forgotten_without_a_patch():
+    d = setup(probe={'anthropic': {PB: 'ok'}, 'openai': {'openai:default': 'ok'}}, entries={K: PIN})
+    c = json.loads((d / 'cfg.json').read_text())
+    c['agents']['defaults']['models'] = {OPUS: {}, FABLE: {}}
+    (d / 'cfg.json').write_text(json.dumps(c))
+    (d / 'st').mkdir()
+    (d / 'st/state.json').write_text(json.dumps({'chat_home': {K: {'model': 'openai/old-model', 'parked': FABLE + '@' + PB}}}))
+    rc, err, j = go(d)
+    assert not kinds(j, 'chat_return') and not kinds(j, 'chat_move'), j
+    assert rc == 0 and not err, err
+    assert not json.loads((d / 'st/state.json').read_text())['chat_home']
+    assert json.loads((d / 'fake.json').read_text())['entries'][K] == PIN
+    r, = kinds(j, 'home_gone')
+    assert r['session'] == K and r['model'] == 'openai/old-model' and r['reason'], r
+    assert len(kinds(go(d, True)[2], 'home_gone')) == 1
+
+
+def test_job_home_removed_from_config_is_forgotten_without_an_edit():
+    for enabled in (True, False):
+        d = setup({'a': (OPUS, PB, 'trusted')}, probe={'anthropic': {PB: 'ok'}, 'openai': {'openai:default': 'ok'}})
+        c = json.loads((d / 'cfg.json').read_text())
+        c['agents']['defaults']['models'] = {OPUS: {}}
+        (d / 'cfg.json').write_text(json.dumps(c))
+        with sqlite3.connect(d / 'state.sqlite') as db:
+            db.execute('update cron_jobs set enabled=?', (enabled,))
+        (d / 'st').mkdir()
+        (d / 'st/state.json').write_text(json.dumps({'home': {'a': {'model': 'openai/old-model', 'parked': OPUS + '@' + PB}}}))
+        rc, err, j = go(d)
+        assert not kinds(j, 'job_move'), j
+        assert rc == 0 and not err and binding(d, 'a') == OPUS + '@' + PB, err
+        assert not json.loads((d / 'st/state.json').read_text())['home']
+        r, = kinds(j, 'home_gone')
+        assert r['job'] == 'a' and r['model'] == 'openai/old-model' and r['reason'], r
+        assert len(kinds(go(d, True)[2], 'home_gone')) == 1
+
+
+@offline
+def test_return_model_not_allowed_backstop_retires_chat_and_job_homes():
+    for path in ('chat_return', 'chat_move', 'job_return'):
+        kind = 'home' if path == 'job_return' else 'chat_home'
+        for error, gone in ((json.dumps({'type': 'gateway_request_error', 'code': 'INVALID_REQUEST',
+                'message': 'model not allowed: ' + OPUS, 'retryable': False}), True),
+                ('rc=1 Error: model not allowed: ' + OPUS, True),
+                (json.dumps({'message': 'model not allowed: ' + OPUS, 'retryable': True}), False),
+                ('gateway timeout', False)):
+            ident, parked = (K if kind == 'chat_home' else 'a'), FABLE + '@' + PB
+            problem = ('rebind:' if kind == 'home' else path + ':') + ident
+            state = {kind: {ident: {'model': OPUS, 'parked': parked}}, 'problems': {
+                problem: {'raised': ms(), 'seen': ms(), 'left': 1, 'text': 'could not move to ' + OPUS + '@' + PA}}}
+            conf = {'primary': OPUS, 'chain': [], 'order': {}, 'allowed': {OPUS: {}, FABLE: {}}}
+            health = F.Health(conf)
+            out = {'problems': [], 'chats': [], 'moved': [], 'deferred': 0, 'later': 0}
+            F.JOURNAL.write_text('')
+            with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+                    patch.object(F, 'entry', return_value=(PIN, False)), \
+                    patch.object(F, 'session', return_value={'hasActiveRun': False}), \
+                    patch.object(health, 'dead', return_value=False), \
+                    patch.object(health, 'target', return_value=OPUS + '@' + PA), \
+                    patch.object(F, 'gw', return_value=(None, error)) as gateway, \
+                    patch.object(F, 'run', return_value=(1, '', error)) as cli:
+                if kind == 'chat_home':
+                    if path == 'chat_return':
+                        F.chats_home(state, health, conf, out)
+                    else:
+                        F.move_chat(state, ident, {'ref': parked, 'own': OPUS, 'tgt': OPUS + '@' + PA}, PIN, out, 'held')
+                    gateway.assert_called_once()
+                else:
+                    jobs = {'a': {'enabled': True, 'profile': PB, 'model': parked, 'next': 0,
+                                 'mode': 'trusted', 'name': 'a'}}
+                    F.jobs_pass(conf, jobs, health, state, time.time(), out)
+                    cli.assert_called_once()
+                assert (ident not in state[kind]) == gone, (kind, error, state)
+                assert bool(out['problems']) == (not gone), (kind, error, out)
+                assert not out['chats'] and not out['moved'], out
+                if gone:
+                    assert not state.get('unsure')
+                    assert not F.raise_due(state, out)              # no cron failure for a permanent refusal
+                    rows = [json.loads(x) for x in F.JOURNAL.read_text().splitlines()]
+                    r, = kinds(rows, 'home_gone')
+                    assert r['model'] == OPUS and r['reason'] and r['session' if kind == 'chat_home' else 'job'] == ident
+
+
+def test_empty_or_matching_allowlist_keeps_chat_and_job_returns():
+    for allowed in ({}, {OPUS: {}, FABLE: {}}):
+        d = setup({'a': (FABLE, PB, 'trusted')}, probe={'anthropic': {PB: 'ok'}}, entries={K: PIN})
+        c = json.loads((d / 'cfg.json').read_text())
+        c['agents']['defaults']['models'] = allowed
+        (d / 'cfg.json').write_text(json.dumps(c))
+        parked = {'model': OPUS, 'parked': FABLE + '@' + PB}
+        (d / 'st').mkdir()
+        (d / 'st/state.json').write_text(json.dumps({'home': {'a': parked}, 'chat_home': {K: parked}}))
+        rc, err, j = go(d)
+        assert rc == 0 and not err and not kinds(j, 'home_gone'), (err, j)
+        assert binding(d, 'a') == OPUS + '@' + PB and kinds(j, 'chat_return')[0]['to'] == OPUS + '@' + PB
+
+
+def test_removed_home_is_not_reused_when_fallback_account_dies():
+    d = setup({'a': (FABLE, PB, 'trusted')}, probe={'anthropic': {PB: 'rate_limit', PA: 'ok'},
+              'openai': {'openai:default': 'ok'}}, entries={K: PIN})
+    c = json.loads((d / 'cfg.json').read_text())
+    c['agents']['defaults']['models'] = {OPUS: {}, FABLE: {}}
+    (d / 'cfg.json').write_text(json.dumps(c))
+    parked = {'model': 'openai/old-model', 'parked': FABLE + '@' + PB}
+    (d / 'st').mkdir()
+    (d / 'st/state.json').write_text(json.dumps({'home': {'a': parked}, 'chat_home': {K: parked}}))
+    rc, err, j = go(d)
+    assert rc == 0 and not err and len(kinds(j, 'home_gone')) == 2, (err, j)
+    assert binding(d, 'a') == FABLE + '@' + PA
+    assert kinds(j, 'chat_move')[0]['to'] == FABLE + '@' + PA
+    s = json.loads((d / 'st/state.json').read_text())
+    assert not s['home'] and not s['chat_home']
+
+
 def test_second_park_within_a_day_waits_before_going_home():
     d = setup(JOBS, [], {'anthropic': DEAD, 'xai': {'xai:x': 'ok'}})
     (d / 'st').mkdir()
