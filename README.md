@@ -68,6 +68,17 @@ limits). After those come the entries of
   is one per provider, so a model whose preferred account differs from the winner's still starts there (and is moved
   once held). Without a preference for any model of a provider nothing returns between its accounts and its
   `auth.order` is left alone.
+- **Order from the accounts' limits (optional, Claude subscriptions).** The owner's rule: get the most out of what is
+  paid for, so fill the account whose limit resets earliest first. With `usage` logins in the settings (below),
+  `claude_usage.py` reads each account's limits at most every 5 minutes, before a pass decides anything: weekly use
+  and reset, each model's own weekly limit (Fable) and reset, the 5-hour window, and the number of free limit
+  resets the account holds (it never claims one). While every account the settings name for a model has a reading
+  of the right account that is under 20 minutes old, the preference for that model is computed from the readings:
+  accounts with room for that model (weekly under 100 %, and for Fable its own weekly limit under 100 %) first,
+  earliest reset first, then the full ones, the one back soonest first. Otherwise the settings' order stands. All the
+  rules of the preference above (moves, returns after a real request, at most once an hour, `auth.order`) apply to
+  the computed order unchanged; each change of it is journaled as `prefer_order`. `--status` and
+  `python3 claude_usage.py` show the readings.
 - **Problems** it cannot fix (no live account anywhere, a missing OpenClaw surface) fail the job run with the reason on
   stderr on two passes in a row, then stay quiet while open. It never fails every minute, so the scheduler does not
   disable it.
@@ -87,6 +98,7 @@ limits). After those come the entries of
 | Rebinding a job | documented CLI: `openclaw cron edit <id> --model` |
 | Putting the preferred live account first in `auth.order` | documented CLI: `openclaw config set auth.order.<provider> <json> --strict-json --expect-current-json <json>` |
 | Account preference per model (optional) | settings file `~/.config/openclaw-inference-failover/settings.json` (`OCF_SETTINGS` overrides) |
+| Claude account limits (optional, `usage` in the settings) | Claude's own endpoints, as Claude Code reads them: `GET /api/oauth/usage?cedar_ember=1&skip_spend=1`, `GET /api/oauth/account`, token refresh at `platform.claude.com/v1/oauth/token`, with a Claude Code login per account (`claude_usage.py`) |
 | Continuing a chat | documented CLI: `openclaw agent --session-key ...` (`--deliver` only for external chats) |
 | Whether a failed continuation was only stopped | the unit's own output (`journalctl --user -u <unit> -t openclaw`): a last line `aborted` is a stop, not a failure |
 | Account status | Gateway RPC `models.probe` |
@@ -124,6 +136,22 @@ its wrapper text, or `npm root -g`). It needs no settings file; the optional one
 {"prefer": {"anthropic/claude-opus-5-5": ["anthropic:a", "anthropic:b", "anthropic:c"],
             "anthropic/claude-fable-5-2": ["anthropic:a", "anthropic:c", "anthropic:b"]}}
 ```
+
+Optional `usage` logins (one Claude Code login per account, made once with
+`CLAUDE_CONFIG_DIR=<dir> claude auth login --claudeai`; OpenClaw's setup-tokens cannot read limits):
+
+```json
+{"usage": {"anthropic:a": {"dir": "~/.config/claude-usage/a", "email": "a@example.com"},
+           "anthropic:b": {"dir": "~/.config/claude-usage/b", "email": "b@example.com", "borrow": "~/.claude"}}}
+```
+
+`dir` is a login the script owns and refreshes; `borrow` is another Claude Code login of the same account, read only
+while its token is valid and never refreshed (a refresh would rotate the token under the Claude Code that owns it),
+shown but never deciding the order (it comes and goes with that token);
+`email` must match the login's account, else the reading is not used (without it the reading is shown, unverified,
+and not used). An account without a usable reading is a problem after an hour when its own login read before, after
+a day otherwise (no login yet, no email set, only a borrowed login); one failed read keeps the last good one in use. Readings go to `usage.json` in the
+state directory.
 
 Accounts it names that are not targets are ignored; targets it leaves out come after, in target order. A file that is
 not valid is a problem, and until it is fixed no account is preferred. `OCF_*` environment variables override these for tests
