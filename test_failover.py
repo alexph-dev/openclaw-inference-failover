@@ -2253,6 +2253,33 @@ def test_one_failed_read_keeps_the_order_and_a_reading_that_never_works_is_raise
     assert rc == 1 and 'anthropic:a' in err and 'email' in err, err
 
 
+def test_usage_rules_for_full_accounts_five_hour_window_and_changed_answers():
+    def entry(*a, **kw):
+        return dict(CU.parse(usage_answer(*a, **kw), T18), ok=True, email_ok=True, t=T18, source='own')
+    F20 = 20 * 60_000
+    # Fable has room on PA and resets tomorrow, but PA's weekly is full for three more days: PA is back in 3 days,
+    # after PB (full until tomorrow).
+    snap = {'profiles': {PA: entry(100, T18 + 3 * DAY, 40, T18 + DAY), PB: entry(100, T18 + DAY, 100, T18 + DAY),
+                         PC: entry(30, T18 + 6 * DAY, 10, T18 + 6 * DAY)}}
+    assert CU.order([PA, PB, PC], snap, FABLE, T18, F20) == [PC, PB, PA]
+    # A full 5-hour window takes an account out until it resets.
+    snap['profiles'][PC]['five_hour'] = {'pct': 100.0, 'resets_at': T18 + 3600_000}
+    assert not CU.live(snap['profiles'][PC], OPUS) and CU.order([PA, PB, PC], snap, OPUS, T18, F20)[0] == PC
+    # A changed answer: a percentage that is not a number is no reading; a Fable limit gone from the answer stops the
+    # computed Fable order, not the Opus one; grants not shown to this surface are an unknown count, not 0.
+    bad = usage_answer(50, T18 + DAY)
+    bad['limits'][0]['percent'] = bad['seven_day']['utilization'] = '50'
+    assert CU.parse(bad, T18)['weekly']['pct'] is None and not CU.usable(dict(CU.parse(bad, T18), ok=True,
+                                                                                  email_ok=True, t=T18, source='own'), T18, F20)
+    nofable = usage_answer(50, T18 + DAY)
+    nofable['limits'] = nofable['limits'][:1]
+    snap['profiles'][PA] = dict(CU.parse(nofable, T18), ok=True, email_ok=True, t=T18, source='own')
+    assert CU.order([PA, PB, PC], snap, FABLE, T18, F20) is None and CU.order([PA, PB, PC], snap, OPUS, T18, F20)
+    hidden = dict(REAL, cedar_ember={'eligible': False, 'ineligible_reason': 'surface', 'grants': []})
+    assert CU.parse(hidden, T18)['resets'] is None and 'resets available ?' in CU.rows(
+        {'profiles': {PA: dict(CU.parse(hidden, T18), ok=True, t=T18)}})[0]['text']
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:
