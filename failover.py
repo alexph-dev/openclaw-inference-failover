@@ -19,6 +19,10 @@ whole account: a probe that answers ok for one model says nothing about another 
          new unpinned chats and subagents start there. Without a preference for a model: no return between accounts.
          A disabled job moves too, after the chats, and stays disabled, so a run started by hand ('cron run') finds a
          live account. It never triggers a probe or a no-target problem; a disabled one-shot job is left alone.
+  usage  optional ('usage' logins in the settings, claude_usage.py): each Claude account's limits are read at most every
+         5 min; while every account named for a model has a fresh, verified reading, that model's preference is
+         computed from them: accounts with room for it first, earliest reset first (owner's rule: fill what resets
+         soonest), then the full ones, back soonest first. Else the settings' order. Never claims a free reset.
   chats  a pinned human chat (a model or account the user chose, or this script set) is moved the same way on the same
          passes, whatever its runs did.
   strict chats  session keys listed in OCF_STRICT_CHATS (comma-separated) never change model: they move only to
@@ -50,6 +54,8 @@ Settings (optional): ~/.config/openclaw-inference-failover/settings.json (OCF_SE
   {"prefer": {"provider/model": ["provider:account", ...]}}
 """
 import calendar, fcntl, glob, hashlib, json, os, pathlib, re, signal, sqlite3, subprocess, sys, time
+
+import claude_usage as CU      # sibling module: Claude subscription limits per account (optional 'usage' settings)
 
 # =====================================================================================================================
 # OPENCLAW SURFACE. Everything that depends on the installed OpenClaw version is named here and only here; the rest of
@@ -183,6 +189,7 @@ HOME = pathlib.Path.home()
 SDIR = pathlib.Path(os.environ.get('OCF_STATE') or os.environ.get('OCF_STATE_DIR')
                     or HOME / '.local/state/openclaw-inference-failover')
 STATE, JOURNAL = SDIR / 'state.json', SDIR / 'journal.jsonl'
+USAGE = SDIR / 'usage.json'   # claude_usage snapshot: limits, resets and free limit resets per account
 OC_DIR = pathlib.Path(os.environ.get('OCF_OPENCLAW_DIR') or os.environ.get('OPENCLAW_STATE_DIR') or HOME / '.openclaw')
 CONFIG = os.environ.get('OCF_CONFIG') or os.environ.get('OPENCLAW_CONFIG_PATH') or str(OC_DIR / 'openclaw.json')
 FAKE = json.load(open(os.environ['OCF_FAKE'])) if os.environ.get('OCF_FAKE') else None  # tests only
@@ -217,6 +224,11 @@ RETURN_EVERY_MS = 60 * 60_000  # a job or chat is moved by the preference at mos
 RETURN_CHATS_PER_PASS = 10     # chats moved by the preference per pass at most (~5 s each)
 RETURN_JOBS_PER_PASS = 10      # jobs moved by the preference per pass at most (the Gateway allows ~27 cron writes a window)
 ORDER_EVERY_MS = 15 * 60_000   # auth.order of a provider is rewritten at most once in this long
+USAGE_EVERY_MS = 5 * 60_000    # an account's limits are read at most once in this long
+USAGE_FRESH_MS = 20 * 60_000   # a reading older than this is stale: that model's order falls back to the settings
+USAGE_LOST_MS = 60 * 60_000    # an account whose own login read before and has had no usable reading this long: problem
+USAGE_INERT_MS = 24 * 3600_000 # the same for an account that never had one (no login yet, no email, only borrowed)
+USAGE_BUDGET_S = 30            # no further account is read in a pass after this many seconds of reading
 RERAISE_MS = 6 * 3600_000      # an unfixed problem fails the run once, then again only after this long
 DOWN_MS = 10 * 60_000          # OpenClaw not answering is a problem only after this long: one slow call is not
 PROF = lambda ref: ref.split('@', 1)[1]     # account ids may contain '@' (openai:name@example.com)
@@ -462,9 +474,11 @@ def cfg():
     if not m.get('primary'):
         raise Shape('config %s: no %s.primary' % (CONFIG, '.'.join(CFG_MODEL)))
     prefer, err = load_settings()
+    usage, uerr = load_usage()
+    eff, src = effective_prefer(prefer, usage)
     return {'primary': m['primary'], 'chain': m.get('fallbacks') or [], 'order': dig(c, CFG_ORDER) or {},
             'profiles': dig(c, CFG_PROFILES) or {}, 'allowed': dig(c, CFG_MODELS) or {},
-            'prefer': prefer, 'settings_err': err}
+            'prefer': eff, 'prefer_static': prefer, 'prefer_from': src, 'settings_err': err, 'usage_err': uerr}
 
 
 def load_settings():
@@ -483,6 +497,104 @@ def load_settings():
     if not ok:
         return {}, ('settings %s: "prefer" must map "provider/model" to a list of that provider\'s accounts' % SETTINGS)
     return {m: list(dict.fromkeys(a)) for m, a in p.items()}, None
+
+
+def load_usage():
+    """The settings' optional 'usage' logins: ({account: {'dir', 'borrow', 'email'}}, error or None). See
+    claude_usage.py. Missing is no usage reading; a wrong one is a problem and counts as none."""
+    try:
+        d = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    except (OSError, ValueError):
+        return {}, None                    # load_settings reports an unreadable file
+    u = d.get('usage', {}) if isinstance(d, dict) else {}
+    ok = isinstance(u, dict) and all(isinstance(a, str) and ':' in a and isinstance(s, dict)
+                                     and (isinstance(s.get('dir'), str) or isinstance(s.get('borrow'), str))
+                                     and all(isinstance(s.get(k), (str, type(None))) for k in ('dir', 'borrow', 'email'))
+                                     for a, s in u.items())
+    if not ok:
+        return {}, ('settings %s: "usage" must map "provider:account" to {"dir": ..., "borrow": ..., "email": ...}; '
+                    'the order follows "prefer" until it is fixed' % SETTINGS)
+    return u, None
+
+
+def effective_prefer(prefer, usage):
+    """The account order per model that the rest of the script follows, and where it came from ({model: 'usage'}).
+    Owner's rule (Alex, IT topic 6601 msg 6885, 18 Nov 2026): get the most out of what we pay, fill the account
+    that resets earliest first. So when every account the settings name for a model has a usable reading
+    (claude_usage.usable: fresh, verified), the order is computed from the readings: accounts with room left for
+    that model (weekly under 100 %, and for Fable its own weekly limit under 100 %) first, earliest reset first, then
+    the full ones, the one back soonest first. Otherwise the settings' order stands for that model."""
+    if not usage or not prefer:
+        return prefer, {}
+    snap, now, eff, src = CU.load(USAGE), NOW(), dict(prefer), {}
+    for model, accts in prefer.items():
+        if all(a in usage for a in accts):
+            o = CU.order(accts, snap, model, now, USAGE_FRESH_MS)
+            if o:
+                eff[model], src[model] = o, 'usage'
+    return eff, src
+
+
+def _fake_http(url, token=None, body=None, timeout=None):
+    """Tests: the claude_usage HTTP answers from the fixture (FAKE['usage_api'][token])."""
+    api = (FAKE or {}).get('usage_api', {})
+    if url == CU.TOKEN_URL:
+        new = api.get('refresh', {}).get(body.get('refresh_token'))
+        return (200, new) if new else (400, {'_error': 'invalid_grant'})
+    one = api.get(token)
+    if not one:
+        return 401, {'_error': 'unknown token'}
+    return 200, one['account' if url.endswith(CU.ACCOUNT_PATH) else 'usage']
+
+
+def usage_pass(state, out):
+    """Re-reads the accounts' limits (at most every USAGE_EVERY_MS each) before the pass decides anything, so the
+    order it follows is current. Never fails the pass: an account that cannot be read only makes its models fall
+    back to the settings' order. An account without a usable reading (claude_usage.usable) is a problem once that
+    lasts USAGE_LOST_MS when its own login read before, else USAGE_INERT_MS (never logged in, no email set, only a
+    borrowed login), so an order that never switches on does not go unnoticed."""
+    usage = load_usage()[0]
+    if not usage:
+        return
+    t = time.time()
+    try:
+        snap = CU.collect(usage, USAGE, USAGE_EVERY_MS, _fake_http if FAKE is not None else CU._http,
+                          budget_s=USAGE_BUDGET_S)
+    except OSError as e:
+        journal('usage_failed', error=str(e)[:200])
+        return
+    errs, inert = state.setdefault('usage_err', {}), state.setdefault('usage_inert', {})
+    for p, e in (snap.get('profiles') or {}).items():
+        err = None if e.get('ok') else e.get('error')
+        if err != errs.get(p):
+            journal('usage', account=p, ok=bool(e.get('ok')), error=err, took_s=round(time.time() - t, 1))
+        errs[p] = err
+        if CU.usable(e, NOW(), USAGE_FRESH_MS):
+            inert.pop(p, None)
+            continue
+        since = inert.setdefault(p, NOW())
+        good = CU.current(e)
+        if good.get('source') == 'own' and good.get('email_ok') is True and good.get('t'):   # it was usable once
+            since, limit = max(since, good['t']), USAGE_LOST_MS
+        else:
+            limit = USAGE_INERT_MS
+        if NOW() - since >= limit:
+            why = err or ('the login is not of a verified account: set its "email"' if good.get('email_ok') is not True
+                          else 'only a borrowed login: make its own one')
+            prob(out, 'usage:' + p, 'no usable reading of the limits of %s since %s (%s); models that name it follow '
+                 'the settings\' order' % (p, time.strftime('%d %b %H:%M', time.localtime(since / 1000)), why))
+    for d in (errs, inert):
+        for p in [p for p in d if p not in usage]:
+            d.pop(p)
+
+
+def note_prefer(state, conf):
+    """Journals each change of the order a model follows (prefer_order), with where it came from."""
+    now = {m: [a, (conf.get('prefer_from') or {}).get(m, 'settings')] for m, a in (conf.get('prefer') or {}).items()}
+    for m, v in now.items():
+        if (state.get('prefer_eff') or {}).get(m) != v:
+            journal('prefer_order', model=m, order=v[0], source=v[1])
+    state['prefer_eff'] = now
 
 
 class Health:
@@ -2083,6 +2195,8 @@ def save(state):
 
 def status(state):
     now = NOW()
+    static = load_settings()[0]
+    eff, src = effective_prefer(static, load_usage()[0])
     hm = lambda ms: time.strftime('%d %b %H:%M', time.localtime(ms / 1000))
     print(json.dumps({
         'last_pass': hm(state.get('last_pass', 0)),
@@ -2091,7 +2205,10 @@ def status(state):
         'held': {k: hm(u) for k, u in state.get('limited', {}).items() if u > now},   # model@account: until
         'hold_retested': {k: hm(t) for k, t in state.get('retested', {}).items()
                           if state.get('limited', {}).get(k, 0) > now},       # last real re-test of a held pair
-        'prefer': load_settings()[0],                                       # model: accounts, most preferred first
+        'prefer': eff,                                                      # model: accounts, most preferred first
+        'prefer_from': src,                                                 # model: 'usage' when computed
+        'prefer_settings': static,                                          # the settings' order (the fallback)
+        'usage': CU.rows(CU.load(USAGE)),                                   # per account: limits, resets, free resets
         'verified': {k: hm(t) for k, t in state.get('verified', {}).items()},  # last real answer of a return target
         'chats_owned': len(state.get('owned', {})),        # chats whose account this script set: the preference moves them
         'jobs_on_fallback_model': state.get('home', {}),
@@ -2142,11 +2259,15 @@ def main():
         state = load_state()   # read under the lock: an --adopt that just finished is not overwritten
         if JOURNAL.exists() and JOURNAL.stat().st_size > 5_000_000:
             JOURNAL.replace(JOURNAL.with_suffix('.jsonl.1'))
+    if APPLY:
+        usage_pass(state, out)  # before the order is computed from it
     t0, before = time.time(), json.dumps(state)
     try:
         conf, cfg_err = cfg(), None
     except Shape as e:
         conf, cfg_err = None, str(e)
+    if conf is not None and APPLY:
+        note_prefer(state, conf)
     if APPLY:                  # armed before the self-check: after an update it alone can take minutes on a slow Gateway
         signal.signal(signal.SIGALRM, _alarm)
         signal.alarm(max(1, int(PASS_HARD_S - (time.time() - T0))))
@@ -2160,6 +2281,8 @@ def main():
         return finish(state, out, {'providers': set()}, {}, Health(conf or {}, {}))
     if conf.get('settings_err'):
         prob(out, 'settings', conf['settings_err'] + '; no account is preferred until it is fixed')
+    if conf.get('usage_err'):
+        prob(out, 'settings-usage', conf['usage_err'])
     limited = state.setdefault('limited', {})
     for k in [k for k, u in limited.items() if u <= NOW() or '/' not in k.split('@', 1)[0]]:
         state.get('verified', {}).pop(k, None)   # a proof from before this limit says nothing about after it

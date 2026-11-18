@@ -2112,6 +2112,147 @@ def test_a_pass_with_fresh_limits_makes_no_return_check():
     go(d)
     assert not requests(d) and binding(d, 'a') == OPUS + '@' + PB
 
+
+# Account limits read from Claude (claude_usage.py) decide the order (Alex 6885: fill the earliest-reset account first).
+# The fixture is a real GET /api/oauth/usage?cedar_ember=1 answer of a Max 20x account at its weekly limit, 18 Nov 2026.
+import claude_usage as CU
+REAL = json.loads((HERE / 'fixtures' / 'usage-max20x-at-weekly-limit.json').read_text())
+T18 = CU.iso_ms('2026-11-18T10:00:00+00:00')
+DAY = 86400_000
+
+
+def usage_answer(weekly, wreset, fable=None, freset=None, grants=(1,)):
+    """An answer of the real shape with other numbers."""
+    d = json.loads(json.dumps(REAL))
+    iso = lambda t: time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime(t / 1000))
+    d['seven_day'].update(utilization=float(weekly), resets_at=iso(wreset))
+    d['limits'][0].update(percent=weekly, resets_at=iso(wreset))
+    d['limits'][1].update(percent=fable if fable is not None else 0, resets_at=iso(freset or wreset))
+    d['cedar_ember']['grants'] = [dict(d['cedar_ember']['grants'][0], id='g%d' % i, resets_left=n,
+                                       ends_at=iso(ms() + 20 * DAY)) for i, n in enumerate(grants)]
+    return d
+
+
+def test_usage_reading_of_the_real_answer():
+    r = CU.parse(REAL, T18)
+    assert r['weekly']['pct'] == 100 and abs(r['weekly']['resets_at'] - CU.iso_ms('2026-11-19T04:00:00+00:00')) < 1000, r
+    assert r['scoped']['Fable']['pct'] == 98 and r['five_hour'] is None, r
+    assert r['resets'] == 1, r['grants']                 # the weekly reset counts; the used Fable reset (left 0) not
+    assert CU.parse(REAL, CU.iso_ms('2026-12-11T00:00:00+00:00'))['resets'] == 0   # expired grants do not count
+    assert not CU.live(r, OPUS) and not CU.live(r, FABLE)
+    assert CU.scoped_for(r, FABLE) is r['scoped']['Fable'] and CU.scoped_for(r, OPUS) is None
+
+
+def test_usage_order_fills_the_earliest_reset_first():
+    def entry(*a, **kw):
+        return dict(CU.parse(usage_answer(*a, **kw), T18), ok=True, email_ok=True, t=T18, source='own')
+    snap = {'profiles': {PA: entry(85, T18 + 2 * DAY, 30), PB: entry(40, T18 + 5 * DAY, 10),
+                         PC: entry(100, T18 + DAY, 98)}}
+    assert CU.order([PB, PC, PA], snap, OPUS, T18, 20 * 60_000) == [PA, PB, PC]   # live by reset, then the full one
+    snap['profiles'][PA] = entry(85, T18 + 2 * DAY, 100, T18 + 2 * DAY)          # Fable out on PA, room for Opus
+    assert CU.order([PA, PB, PC], snap, FABLE, T18, 20 * 60_000) == [PB, PC, PA]  # full ones: back soonest first
+    assert CU.order([PA, PB, PC], snap, OPUS, T18, 20 * 60_000) == [PA, PB, PC]
+    assert CU.order([PA, PB, PC], snap, OPUS, T18 + 21 * 60_000, 20 * 60_000) is None   # stale: the caller's order
+    snap['profiles'][PB]['source'] = 'borrowed'
+    assert CU.order([PA, PB, PC], snap, OPUS, T18, 20 * 60_000) is None              # a borrowed login comes and goes
+    snap['profiles'][PB].update(source='own', email_ok=None)
+    assert CU.order([PA, PB, PC], snap, OPUS, T18, 20 * 60_000) is None              # an unverified login is not used
+
+
+def usage_setup(answers, emails=None, expiring=()):
+    """Logins for PA, PB, PC in a fixture dir, and the settings naming them; answers: {account: usage answer}."""
+    d = setup({'a': (OPUS, PB, 'trusted'), 'b': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    usage, api = {}, {'refresh': {}}
+    for p in (PA, PB, PC):
+        n = p.split(':')[1]
+        ld = d / 'logins' / n
+        ld.mkdir(parents=True)
+        exp = ms() + (60_000 if p in expiring else 3600_000)
+        (ld / '.credentials.json').write_text(json.dumps({'claudeAiOauth': {
+            'accessToken': 'tok-' + n, 'refreshToken': 'ref-' + n, 'expiresAt': exp, 'scopes': ['user:profile']}}))
+        usage[p] = {'dir': str(ld), 'email': n + '@example.com'}
+        acct = {'email_address': (emails or {}).get(p, n + '@example.com')}
+        if p in answers:
+            api['tok-' + n] = api['tok-' + n + '2'] = {'account': acct, 'usage': answers[p]}
+        api['refresh']['ref-' + n] = {'access_token': 'tok-' + n + '2', 'refresh_token': 'ref-' + n + '2', 'expires_in': 28800}
+    prefer(d, {'prefer': {OPUS: [PB, PA, PC]}, 'usage': usage})
+    fake(d, usage_api=api, retest={OPUS + '@' + PA: RT_OK})
+    return d
+
+
+def test_failover_follows_the_usage_order_and_returns_work_to_the_earliest_reset():
+    now = ms()
+    d = usage_setup({PA: usage_answer(85, now + 2 * DAY), PB: usage_answer(40, now + 5 * DAY),
+                     PC: usage_answer(100, now + DAY, 98)}, expiring=(PA,))
+    rc, err, j = go(d, True)
+    o, = [r for r in kinds(j, 'prefer_order') if r['model'] == OPUS]
+    assert o['order'] == [PA, PB, PC] and o['source'] == 'usage', o            # settings said PB first
+    assert {(m['job'], m['to'], m['why']) for m in kinds(j, 'job_move')} == {('a', OPUS + '@' + PA, 'preference'),
+                                                                            ('b', OPUS + '@' + PA, 'preference')}, j
+    assert order(d)[0] == PA, order(d)
+    creds = json.loads((d / 'logins' / 'a' / '.credentials.json').read_text())['claudeAiOauth']
+    assert creds['accessToken'] == 'tok-a2' and creds['refreshToken'] == 'ref-a2' and creds['scopes'] == ['user:profile']
+    assert 'tok-' not in (d / 'st' / 'journal.jsonl').read_text()             # no token in the journal
+    snap = json.loads((d / 'st' / 'usage.json').read_text())
+    assert snap['profiles'][PC]['resets'] == 1 and snap['profiles'][PA]['weekly']['pct'] == 85, snap
+    st = subprocess.run([sys.executable, str(HERE / 'failover.py'), '--status'], capture_output=True, text=True,
+                        env=dict(os.environ, OCF_STATE=str(d / 'st'), OCF_SETTINGS=str(d / 'settings.json')))
+    s = json.loads(st.stdout)
+    assert s['prefer'][OPUS] == [PA, PB, PC] and s['prefer_from'] == {OPUS: 'usage'}, s
+    assert [r['account'] for r in s['usage']] == [PA, PB, PC] and 'weekly 85%' in s['usage'][0]['text'], s['usage']
+    n = len(j)
+    j = go(d)[2][n:]                                                      # a minute later: nothing is read again
+    assert not kinds(j, 'usage') and not kinds(j, 'prefer_order'), j
+    assert json.loads((d / 'st' / 'usage.json').read_text())['t'] == snap['t']
+
+
+def test_without_a_usable_reading_the_settings_order_stands():
+    now = ms()
+    # PC has no answer (its login does not work): the order is the settings' one, and no problem is raised for a
+    # login that never read.
+    d = usage_setup({PA: usage_answer(85, now + 2 * DAY), PB: usage_answer(40, now + 5 * DAY)})
+    rc, err, j = go(d, True)
+    assert rc == 0 and kinds(j, 'prefer_order')[0]['source'] == 'settings', (err, j)
+    assert any(r['account'] == PC and not r['ok'] for r in kinds(j, 'usage')), j
+    assert not kinds(j, 'job_move') and order(d) == [PB, PA, PC]
+    # A login of another account is not used either.
+    d = usage_setup({p: usage_answer(50, now + DAY) for p in (PA, PB, PC)}, emails={PA: 'someone@example.com'})
+    rc, err, j = go(d, True)
+    assert kinds(j, 'prefer_order')[0]['source'] == 'settings', j
+    assert 'not a@example.com' in json.loads((d / 'st' / 'usage.json').read_text())['profiles'][PA]['error']
+
+
+def test_one_failed_read_keeps_the_order_and_a_reading_that_never_works_is_raised_once_it_lasts():
+    now = ms()
+    d = usage_setup({PA: usage_answer(85, now + 2 * DAY), PB: usage_answer(40, now + 5 * DAY),
+                     PC: usage_answer(100, now + DAY, 98)})
+    go(d, True)
+    s = json.loads((d / 'st' / 'usage.json').read_text())
+    for p in s['profiles'].values():
+        p['t'] -= 6 * 60_000                                              # due for a new read
+    (d / 'st' / 'usage.json').write_text(json.dumps(s))
+    api = json.loads((d / 'fake.json').read_text())['usage_api']
+    api.pop('tok-b')                                                      # PB's next read fails once
+    fake(d, usage_api=api)
+    j = go(d, True)[2]
+    assert [r['order'] for r in kinds(j, 'prefer_order')] == [[PA, PB, PC]], j   # no flip back to the settings
+    assert json.loads((d / 'st' / 'usage.json').read_text())['profiles'][PB]['last_ok']['weekly']['pct'] == 40
+    # ab-style account: a login of no verified account (no email set) never decides the order; after a day: problem.
+    d = usage_setup({p: usage_answer(50, now + DAY) for p in (PA, PB, PC)})
+    st = json.loads((d / 'settings.json').read_text())
+    st['usage'][PA]['email'] = None
+    (d / 'settings.json').write_text(json.dumps(st))
+    rc, err, j = go(d, True)
+    assert rc == 0 and kinds(j, 'prefer_order')[0]['source'] == 'settings', (err, j)
+    s = json.loads((d / 'st' / 'state.json').read_text())
+    s['usage_inert'][PA] = ms() - 25 * 3600_000
+    s['problems'] = {}
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+    for _ in range(2):                                                    # a problem fails the second pass in a row
+        rc, err, j = go(d, True)
+    assert rc == 1 and 'anthropic:a' in err and 'email' in err, err
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:
