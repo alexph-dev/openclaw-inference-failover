@@ -188,6 +188,9 @@ Requirements and limits:
   queue is empty, the watchdog still owns the selection, and the original model is not held on that account. Selecting
   the configured primary clears its model override in OpenClaw, including when the original session inherited that
   default.
+- If a chat's or job's original model leaves the non-empty `agents.defaults.models` allowlist, its saved return is
+  dropped (`home_gone` in the journal), leaving it on its current model without a problem. A permanent
+  `model not allowed` refusal during a return does the same.
 - Times in the journal and in `--status` are the host's local time; set `TZ` on the job (`--command-env`) if needed.
 
 ## Use

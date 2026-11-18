@@ -136,6 +136,7 @@ MS_USABLE = ('ok', 'expiring', 'static')                            # credential
 MS_TIMEOUT_S = 60                                                    # the command reads local files; ~8 s seen
 # Config file
 CFG_MODEL = ('agents', 'defaults', 'model')                         # {primary, fallbacks}
+CFG_MODELS = ('agents', 'defaults', 'models')                       # non-empty map: allowed model keys; empty: unrestricted
 CFG_ORDER = ('auth', 'order')                                       # account order per provider: its targets when not empty
 CFG_PROFILES = ('auth', 'profiles')                                 # optional: declared accounts {id: {provider, mode}}
 PROFILE_PROVIDER, PROFILE_MODE = 'provider', 'mode'
@@ -174,6 +175,8 @@ LIMIT_RE = re.compile(r"incompatible with its recorded inference account and rou
                       r"insufficient_quota", re.I)
 ERROR_TEXTS = (ROUTE_ERR, 'needs a short break', 'asking us to slow down', 'rate_limit_error', 'insufficient_quota')
 #   ^ the parts of LIMIT_RE that OpenClaw itself contains; "exceed your account's rate limit" is provider wording
+MODEL_NOT_ALLOWED = 'model not allowed:'                            # permanent model-selection refusal, not a limit
+RETRYABLE_RE = re.compile(r'[\"\']?retryable[\"\']?\s*:\s*true\b', re.I)
 # =====================================================================================================================
 
 HOME = pathlib.Path.home()
@@ -460,7 +463,8 @@ def cfg():
         raise Shape('config %s: no %s.primary' % (CONFIG, '.'.join(CFG_MODEL)))
     prefer, err = load_settings()
     return {'primary': m['primary'], 'chain': m.get('fallbacks') or [], 'order': dig(c, CFG_ORDER) or {},
-            'profiles': dig(c, CFG_PROFILES) or {}, 'prefer': prefer, 'settings_err': err}
+            'profiles': dig(c, CFG_PROFILES) or {}, 'allowed': dig(c, CFG_MODELS) or {},
+            'prefer': prefer, 'settings_err': err}
 
 
 def load_settings():
@@ -1114,6 +1118,35 @@ def park(state, kind, ident, own, tgt):
 ripe = lambda h: NOW() - h.get('at', 0) >= h.get('wait', 0)
 
 
+def forget_home(state, kind, ident, reason):
+    """A removed model cannot come back through a provider probe; keep the working fallback and retire its return."""
+    h = state.get(kind, {}).pop(ident, None)
+    if h is not None:
+        journal('home_gone', **{'session' if kind == 'chat_home' else 'job': ident}, model=h['model'], reason=reason)
+        for prefix in (('chat_return:', 'chat_move:') if kind == 'chat_home' else ('rebind:',)):
+            key = prefix + ident
+            text = state.get('problems', {}).get(key, {}).get('text', '')
+            if prefix == 'chat_return:' or 'to %s@' % h['model'] in text:
+                state.get('problems', {}).pop(key, None)   # a failure to move elsewhere is still a problem
+
+
+def prune_homes(state, kind, conf):
+    """The model allowlist, not a provider's health, decides whether a saved home still exists."""
+    allowed = conf.get('allowed')
+    for ident, h in list(state.get(kind, {}).items()):
+        if allowed and h['model'] not in allowed:
+            forget_home(state, kind, ident, 'model removed from ' + '.'.join(CFG_MODELS))
+
+
+def home_rejected(state, kind, ident, tgt, err):
+    """Backstop a config change after discovery without hiding transient or unrelated return failures."""
+    h = state.get(kind, {}).get(ident)
+    if h and MODEL(tgt) == h['model'] and MODEL_NOT_ALLOWED in err.lower() and not RETRYABLE_RE.search(err):
+        forget_home(state, kind, ident, err)
+        return True
+    return False
+
+
 def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
     """Every enabled job whose model@account is held or probed out moves to a live one, soonest-due first. A job parked
     on a fallback model goes back to its own model once an account of that model is live and not held for it. A job
@@ -1140,6 +1173,7 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
                 home.pop(jid, None)
             out['moved'].append((jid[:8], u['tgt']))            # counts as done: the pass state is not rolled back
             state.get('problems', {}).pop('rebind:' + jid, None)   # the failure reported last pass did not happen
+    prune_homes(state, 'home', conf)       # also covers disabled jobs and homes restored by an uncertain edit
     todo, pref_moved = [], state.setdefault('pref_moved', {})
     for jid, j in jobs.items():
         if j['enabled'] == disabled:
@@ -1193,6 +1227,10 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
         if r == 'write_limited':
             out['later' if disabled else 'deferred'] += 1
             break
+        if home_rejected(state, 'home', jid, tgt, r):
+            state.get('unsure', {}).pop(jid, None)
+            save(state)
+            continue
         if r in ('ok', 'dry-run'):
             out['moved'].append((jid[:8], tgt))
             if why == 'preference':
@@ -1470,6 +1508,7 @@ def chat_plan(state, health, key, e, unknown_dead=False):
     model it goes home to; tgt the first live target (None when nothing is live)."""
     model, acct = chat_ref(health.conf, e)
     ref = '%s@%s' % (model, acct)
+    prune_homes(state, 'chat_home', health.conf)   # recovery also plans from saved homes, before chats_home runs
     home = state.setdefault('chat_home', {})
     if key in home and home[key]['parked'] != ref:
         home.pop(key)                      # the user chose something else since: that choice stands
@@ -1485,7 +1524,10 @@ def move_chat(state, key, plan, e, out, why):
     res = err or ('ok' if APPLY else 'dry-run')
     journal('chat_move', session=key, frm=plan['ref'], to=plan['tgt'], why=why, result=res)
     if err:
-        prob(out, 'chat_move:' + key, 'chat %s: could not move to %s: %s' % (key[-40:], plan['tgt'], err[:120]))
+        if home_rejected(state, 'chat_home', key, plan['tgt'], err):
+            save(state)
+        else:
+            prob(out, 'chat_move:' + key, 'chat %s: could not move to %s: %s' % (key[-40:], plan['tgt'], err[:120]))
         return res
     home = state.setdefault('chat_home', {})
     if MODEL(plan['tgt']) != plan['own']:
@@ -1537,6 +1579,7 @@ def chats_pass(state, health, out):
 
 def chats_home(state, health, conf, out):
     """A chat parked on a fallback model goes home, without disturbing active work or new input."""
+    prune_homes(state, 'chat_home', conf)
     home = state.setdefault('chat_home', {})
     for key, h in list(home.items()):
         if not fits(60):
@@ -1562,7 +1605,7 @@ def chats_home(state, health, conf, out):
             state.setdefault('chat_moved', {})[key] = {'to': tgt, 't': NOW()}
             own(state, key, tgt, fresh_e)
             out['chats'].append((key[-40:], tgt))
-        else:
+        elif not home_rejected(state, 'chat_home', key, tgt, err):
             prob(out, 'chat_return:' + key, 'chat %s: could not move back to %s: %s' % (key[-40:], tgt, err[:120]))
 
 
