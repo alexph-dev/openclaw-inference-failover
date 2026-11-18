@@ -57,14 +57,27 @@ def iso_ms(s):
         return None
 
 
+EXPECT_SCOPED = ('fable',)   # models with their own weekly limit: a reading without it is not used for them
+
+
+def num(x):
+    """A percentage as a number, or None for anything else (a changed API shape must not pass as a number)."""
+    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and x == x else None
+
+
 def parse(d, now=None):
-    """The parts of a GET /api/oauth/usage?cedar_ember=1 answer that decide where work goes."""
+    """The parts of a GET /api/oauth/usage?cedar_ember=1 answer that decide where work goes. 'resets' is None when
+    the answer does not say (no grant list, or it was not shown to this surface), never a guessed 0."""
     now = NOW() if now is None else now
     out = {'weekly': None, 'scoped': {}, 'five_hour': None, 'resets': 0, 'grants': [], 'juniper': None}
+    ce = d.get('cedar_ember')
+    if not isinstance(ce, dict) or not isinstance(ce.get('grants'), list) \
+            or ce.get('ineligible_reason') in ('surface', 'unavailable'):
+        out['resets'] = None
     for lim in d.get('limits') or []:
         if not isinstance(lim, dict):
             continue
-        one = {'pct': lim.get('percent'), 'resets_at': iso_ms(lim.get('resets_at')), 'active': lim.get('is_active')}
+        one = {'pct': num(lim.get('percent')), 'resets_at': iso_ms(lim.get('resets_at')), 'active': lim.get('is_active')}
         if lim.get('kind') == 'weekly_all':
             out['weekly'] = one
         elif lim.get('kind') == 'weekly_scoped':
@@ -73,15 +86,15 @@ def parse(d, now=None):
                 out['scoped'][name] = one
     sd = d.get('seven_day')
     if out['weekly'] is None and isinstance(sd, dict):
-        out['weekly'] = {'pct': sd.get('utilization'), 'resets_at': iso_ms(sd.get('resets_at')), 'active': None}
+        out['weekly'] = {'pct': num(sd.get('utilization')), 'resets_at': iso_ms(sd.get('resets_at')), 'active': None}
     fh = d.get('five_hour')
     if isinstance(fh, dict):
-        out['five_hour'] = {'pct': fh.get('utilization'), 'resets_at': iso_ms(fh.get('resets_at'))}
-    for g in ((d.get('cedar_ember') or {}).get('grants') or []):
+        out['five_hour'] = {'pct': num(fh.get('utilization')), 'resets_at': iso_ms(fh.get('resets_at'))}
+    for g in ((ce or {}).get('grants') or []) if out['resets'] is not None else []:
         if not isinstance(g, dict):
             continue
         ends = iso_ms(g.get('ends_at'))
-        left = g.get('resets_left') or 0
+        left = g.get('resets_left') if isinstance(g.get('resets_left'), int) else 0
         out['grants'].append({'id': g.get('id'), 'label': g.get('label'), 'type': g.get('type'), 'left': left,
                               'ends_at': ends, 'usable_now': g.get('usable_now'), 'paused': g.get('paused'),
                               'clears': g.get('clears')})
@@ -103,22 +116,32 @@ def scoped_for(entry, model):
     return None
 
 
+def applicable(entry, model):
+    """The limits that bind this model on this account: weekly, the model's own weekly limit, the 5-hour window."""
+    e = entry or {}
+    return [x for x in (e.get('weekly'), scoped_for(e, model), e.get('five_hour')) if x]
+
+
 def live(entry, model):
-    """True when the reading leaves room for this model: weekly under 100 % and, for a model with its own weekly
-    limit (Fable), that one under 100 % too."""
+    """True when the reading leaves room for this model: every limit that binds it (weekly, its own weekly limit
+    such as Fable's, the 5-hour window) under 100 %."""
     w = (entry or {}).get('weekly') or {}
-    if w.get('pct') is None or w['pct'] >= 100:
+    if w.get('pct') is None:
         return False
-    s = scoped_for(entry, model)
-    return not (s and s.get('pct') is not None and s['pct'] >= 100)
+    return all(x.get('pct') is None or x['pct'] < 100 for x in applicable(entry, model))
 
 
 def reset_for(entry, model):
-    """When unused room for this model is lost: the model's own weekly limit resets when it has one, else the weekly."""
+    """For an account with room: when its unused room for this model is lost (the model's own weekly limit resets
+    when it has one, else the weekly). For a full one: when it is back, the latest reset of the limits it is at."""
+    inf = float('inf')
+    if not live(entry, model):
+        full = [x.get('resets_at') or inf for x in applicable(entry, model) if (x.get('pct') or 0) >= 100]
+        return max(full) if full else inf
     s = scoped_for(entry, model)
     if s and s.get('resets_at'):
         return s['resets_at']
-    return ((entry or {}).get('weekly') or {}).get('resets_at') or float('inf')
+    return ((entry or {}).get('weekly') or {}).get('resets_at') or inf
 
 
 def current(entry):
@@ -143,6 +166,8 @@ def order(accounts, snap, model, now, fresh_ms):
     if not accounts or not all(usable(prof.get(a), now, fresh_ms) for a in accounts):
         return None
     pos, cur = {a: i for i, a in enumerate(accounts)}, {a: current(prof[a]) for a in accounts}
+    if any(n in model.lower() for n in EXPECT_SCOPED) and not all(scoped_for(cur[a], model) for a in accounts):
+        return None                        # its own weekly limit is missing from a reading: the API changed
     key = lambda a: (not live(cur[a], model), reset_for(cur[a], model), pos[a])
     return sorted(accounts, key=key)
 
@@ -192,6 +217,11 @@ def _write_creds(path, oauth):
         f.flush()
         os.fsync(f.fileno())               # the old refresh token is already spent: the new one must survive
     os.replace(str(tmp), str(path))
+    dfd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 def _refresh(oauth, http, timeout):
@@ -225,7 +255,10 @@ def _token(spec, http, deadline=None):
     own = pathlib.Path(os.path.expanduser(spec['dir'])) / '.credentials.json' if spec.get('dir') else None
     if own and own.exists():
         with open(own.with_name('.usage.lock'), 'w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)              # one refresh at a time: a refresh token is used once
+            try:                                          # one refresh at a time: a refresh token is used once
+                fcntl.flock(lock, fcntl.LOCK_EX | (fcntl.LOCK_NB if deadline else 0))
+            except BlockingIOError:
+                raise RuntimeError('login %s is being refreshed by another reader' % own.parent)
             oauth = _creds(own)
             if not oauth:
                 raise RuntimeError('login %s is unreadable' % own.parent)
@@ -292,7 +325,10 @@ def collect(spec, path, every_ms, http=_http, now=None, budget_s=None):
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(str(path) + '.lock', 'w') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:                               # with a budget (the failover pass) never wait for a reading by hand
+            fcntl.flock(lock, fcntl.LOCK_EX | (fcntl.LOCK_NB if deadline else 0))
+        except BlockingIOError:
+            return load(path)
         return _collect(spec, path, every_ms, http, now, deadline)
 
 
@@ -325,6 +361,10 @@ def _collect(spec, path, every_ms, http, now, deadline):
 # --------------------------------------------------------------------------------------------------- table
 
 
+def pct(x):
+    return '?' if x is None else '%g' % x
+
+
 def hm(ms):
     return time.strftime('%a %d %b %H:%M %Z', time.localtime(ms / 1000)) if ms else '-'
 
@@ -337,13 +377,14 @@ def rows(snap, now=None):
         src = current(e)
         w, parts = src.get('weekly') or {}, []
         if w:
-            parts.append('weekly %s%% (resets %s)' % (w.get('pct'), hm(w.get('resets_at'))))
+            parts.append('weekly %s%% (resets %s)' % (pct(w.get('pct')), hm(w.get('resets_at'))))
         for name, s in sorted((src.get('scoped') or {}).items()):
-            parts.append('%s %s%% (resets %s)' % (name, s.get('pct'), hm(s.get('resets_at'))))
+            parts.append('%s %s%% (resets %s)' % (name, pct(s.get('pct')), hm(s.get('resets_at'))))
         if src.get('five_hour') and src['five_hour'].get('pct') is not None:
-            parts.append('5-hour %s%%' % src['five_hour']['pct'])
+            parts.append('5-hour %s%%' % pct(src['five_hour']['pct']))
         if src:
-            parts.append('resets available %d' % (src.get('resets') or 0))
+            n = src.get('resets')
+            parts.append('resets available %s' % ('?' if n is None else n))
         age = '%d min ago' % ((now - src['t']) // 60_000) if src.get('t') else 'never read'
         flag = '' if e.get('ok') else ' [last read failed: %s]' % e.get('error', '?')
         if e.get('ok') and e.get('email_ok') is None:

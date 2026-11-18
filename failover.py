@@ -529,7 +529,10 @@ def effective_prefer(prefer, usage):
     snap, now, eff, src = CU.load(USAGE), NOW(), dict(prefer), {}
     for model, accts in prefer.items():
         if all(a in usage for a in accts):
-            o = CU.order(accts, snap, model, now, USAGE_FRESH_MS)
+            try:
+                o = CU.order(accts, snap, model, now, USAGE_FRESH_MS)
+            except (TypeError, ValueError, AttributeError, KeyError):   # a reading of a shape no test has seen
+                o = None
             if o:
                 eff[model], src[model] = o, 'usage'
     return eff, src
