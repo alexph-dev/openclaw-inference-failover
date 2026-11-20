@@ -591,8 +591,16 @@ def usage_pass(state, out):
             d.pop(p)
 
 
-def note_prefer(state, conf):
-    """Journals each change of the order a model follows (prefer_order), with where it came from."""
+def note_prefer(state, conf, cfg_err=None):
+    """Journals each change of the order a model follows (prefer_order), with where it came from. state's prefer_eff is
+    read by others (the SLA judge) as the order the failover follows now, next to last_pass; a pass whose config check
+    failed (conf None) follows no order, so it drops prefer_eff, journaled once with the reason, and readers fall back
+    to the settings' order instead of a stale one. The next good pass journals every order again."""
+    if conf is None:
+        if state.pop('prefer_eff', None):
+            journal('prefer_order_dropped', why='config check failed: readers use the settings\' order',
+                    error=str(cfg_err or '')[:200])
+        return
     now = {m: [a, (conf.get('prefer_from') or {}).get(m, 'settings')] for m, a in (conf.get('prefer') or {}).items()}
     for m, v in now.items():
         if (state.get('prefer_eff') or {}).get(m) != v:
@@ -2269,8 +2277,13 @@ def main():
         conf, cfg_err = cfg(), None
     except Shape as e:
         conf, cfg_err = None, str(e)
-    if conf is not None and APPLY:
-        note_prefer(state, conf)
+    except (OSError, ValueError) as e:     # an unreadable config is a crash (the ledger below), but no order is
+        if APPLY:                          # followed either: drop prefer_eff first, saved, so it is journaled once
+            note_prefer(state, None, 'config %s not readable: %s' % (CONFIG, str(e)[:120]))
+            save(state)
+        raise
+    if APPLY:
+        note_prefer(state, conf, cfg_err)
     if APPLY:                  # armed before the self-check: after an update it alone can take minutes on a slow Gateway
         signal.signal(signal.SIGALRM, _alarm)
         signal.alarm(max(1, int(PASS_HARD_S - (time.time() - T0))))
@@ -2346,7 +2359,10 @@ def main():
              slow=True, part=part)
     except (Shape, Unreachable) as e:
         if not (out['moved'] or out['chats'] or out['continued'] or out['aborted'] or out['cleared']):
+            eff = state.get('prefer_eff')
             state = json.loads(before)    # nothing was done: keep log offsets and pending events for the next pass
+            if eff is not None:
+                state['prefer_eff'] = eff  # but the order this pass follows (and journaled), not the last pass's
         if isinstance(e, Unreachable):
             down(state, out, e)
         else:

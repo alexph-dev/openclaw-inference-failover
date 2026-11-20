@@ -77,8 +77,10 @@ limits). After those come the entries of
   accounts with room for that model (weekly under 100 %, and for Fable its own weekly limit under 100 %) first,
   earliest reset first, then the full ones, the one back soonest first. Otherwise the settings' order stands. All the
   rules of the preference above (moves, returns after a real request, at most once an hour, `auth.order`) apply to
-  the computed order unchanged; each change of it is journaled as `prefer_order`. `--status` and
-  `python3 claude_usage.py` show the readings.
+  the computed order unchanged; each change of it is journaled as `prefer_order`. The order a model follows now is
+  kept in the state as `prefer_eff`, next to `last_pass`, for other readers; a pass whose config check fails (wrong shape or
+  not readable) drops it (journal `prefer_order_dropped` with the error), so they fall back to the settings' order rather than an old one.
+  `--status` and `python3 claude_usage.py` show the readings.
 - **Problems** it cannot fix (no live account anywhere, a missing OpenClaw surface) fail the job run with the reason on
   stderr on two passes in a row, then stay quiet while open. It never fails every minute, so the scheduler does not
   disable it.
