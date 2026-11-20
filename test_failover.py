@@ -1598,6 +1598,21 @@ def test_stall_that_woke_up_or_was_stopped_by_a_person_is_left_alone():
         assert [m['to'] for m in kinds(j, 'chat_move')] == ([] if active else [FABLE + '@' + PA]), (status, j)
 
 
+def test_check_ignores_a_turn_that_rotated_accounts_and_ended_normally_after_a_limit():
+    # 21 Nov 04:27: run 747f56b7 hit a 429, the Gateway rotated the profile, finished with an isolated finalization and
+    # logged only the plain-text "[agent] run ... ended with stopReason=stop"; the check called the answered chat unanswered.
+    ended = line('[agent] run D5 ended with stopReason=stop', ago=3300)
+    d = setup(log=[req(K, 'D5', 3600), end('D5', 3600), ended], probe=ONE_LIVE,
+              sessions={K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'D5', 'status': 'done'}}, entries={K: PIN})
+    rc, err, j = go(d)
+    assert 'still unanswered' not in err and not kinds(j, 'chat_recover'), (rc, err)
+    d = setup(log=[req(K, 'D6', 3600), end('D6', 3600), line('[agent] run D5 ended with stopReason=stop', ago=3300)],
+              probe=ONE_LIVE, sessions={K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'D6', 'status': 'failed'}},
+              entries={K: PIN})
+    rc, err, j = go(d)
+    assert rc == 1 and 'still unanswered' in err, (rc, err)          # another run's end does not count
+
+
 def test_check_reports_a_turn_killed_after_a_limit_that_is_still_unanswered():
     d = setup(log=[req(K, 'D4', 3600), end('D4', 3600)] + aborted_lines('D4', ago=3590), probe=ONE_LIVE,
               sessions={K: killed('D4')}, entries={K: PIN})
