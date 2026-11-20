@@ -157,6 +157,7 @@ L1, L2, L_META, L_DATE = '1', '2', '_meta', 'date'
 L_HTTP, L_BODY, L_PROV, L_MODEL = 'status', 'body', 'provider', 'model'   # fields of a failed model request / run end
 EV_END = 'embedded_run_agent_end'                                   # a run ended: {runId, isError, failoverReason, provider, model}
 L_EVENT, L_RUN, L_ERROR, L_REASON, L_STATUS, L_DONE, L_MILESTONE = 'event', 'runId', 'isError', 'failoverReason', 'runStatus', 'completed', 'milestone'
+RUN_END_RE = re.compile(r'\[agent\] run (\S+) ended with stopReason=(\w+)')   # agent-command's plain-text run end
 LIMITED = ('rate_limit', 'billing')                                 # failoverReason values that mean a usage limit
 RETRY_RE = re.compile(r'transient same-model retry \d+/\d+ for (\S+) reason=rate_limit: delayMs=(\d+) '
                       r'runId="([^"]+)" sessionId="([^"]*)"')      # a run sleeping out a same-model rate-limit wait
@@ -1531,6 +1532,9 @@ def died_on_limit(run_id, t):
     """The limit was the run's last word: no later progress and no completed outcome after it."""
     for rec in log_lines(run_id):
         one = rec.get(L1)
+        m = RUN_END_RE.search(one) if isinstance(one, str) else None
+        if m and m.group(1) == run_id and m.group(2) != 'error' and ts_ms(rec) > t + 2000:
+            return False                   # the run rotated to another account and ended normally after the limit
         if not isinstance(one, dict):
             continue
         if one.get(L_STATUS) == L_DONE:
