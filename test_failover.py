@@ -2280,6 +2280,55 @@ def test_usage_rules_for_full_accounts_five_hour_window_and_changed_answers():
         {'profiles': {PA: dict(CU.parse(hidden, T18), ok=True, t=T18)}})[0]['text']
 
 
+def test_a_failed_config_check_drops_the_live_order_once_and_says_why():
+    """Fresh-eyes 20 Nov: a pass whose config check fails stamps last_pass but follows no order, so the order others
+    read (prefer_eff, the SLA judge) is dropped with the reason, not left at an old value; a good pass writes it again."""
+    d = setup(JOBS, probe={'anthropic': {PA: 'ok', PB: 'ok', PC: 'ok'}})
+    prefer(d, {'prefer': {OPUS: [PB, PA, PC]}})
+    j = go(d, True)[2]
+    st = lambda: json.loads((d / 'st' / 'state.json').read_text())
+    assert st()['prefer_eff'][OPUS] == [[PB, PA, PC], 'settings'] and not kinds(j, 'prefer_order_dropped'), j
+    good = (d / 'cfg.json').read_text()
+    c = json.loads(good)
+    del c['agents']['defaults']['model']['primary']
+    (d / 'cfg.json').write_text(json.dumps(c))
+    n, before = len(j), st()['last_pass']
+    time.sleep(0.01)
+    j = go(d, True)[2]
+    dropped = kinds(j[n:], 'prefer_order_dropped')
+    assert len(dropped) == 1 and 'primary' in dropped[0]['error'] and 'settings' in dropped[0]['why'], j[n:]
+    assert 'prefer_eff' not in st() and st()['last_pass'] > before, st()
+    n = len(j)
+    j = go(d, True)[2]
+    assert not kinds(j[n:], 'prefer_order_dropped') and 'prefer_eff' not in st(), j[n:]   # journaled once
+    (d / 'cfg.json').write_text(good)
+    n = len(j)
+    j = go(d, True)[2]
+    assert [r['order'] for r in kinds(j[n:], 'prefer_order')] == [[PB, PA, PC]], j[n:]
+    assert st()['prefer_eff'][OPUS] == [[PB, PA, PC], 'settings']
+
+
+def test_an_unreadable_config_also_drops_the_live_order_once():
+    d = setup(JOBS, probe={'anthropic': {PA: 'ok', PB: 'ok', PC: 'ok'}})
+    prefer(d, {'prefer': {OPUS: [PB, PA, PC]}})
+    j = go(d, True)[2]
+    st = lambda: json.loads((d / 'st' / 'state.json').read_text())
+    assert 'prefer_eff' in st()
+    good = (d / 'cfg.json').read_text()
+    (d / 'cfg.json').write_text(good[:40])                                 # half written
+    n = len(j)
+    rc, err, j = go(d, True)
+    dropped = kinds(j[n:], 'prefer_order_dropped')
+    assert len(dropped) == 1 and 'not readable' in dropped[0]['error'] and 'prefer_eff' not in st(), j[n:]
+    n = len(j)
+    j = go(d, True)[2]
+    assert not kinds(j[n:], 'prefer_order_dropped'), j[n:]
+    (d / 'cfg.json').write_text(good)
+    n = len(j)
+    j = go(d, True)[2]
+    assert [r['order'] for r in kinds(j[n:], 'prefer_order')] == [[PB, PA, PC]] and 'prefer_eff' in st(), j[n:]
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:
