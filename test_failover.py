@@ -508,6 +508,44 @@ def test_log_format_drift_after_an_update_is_reported():
     assert rc == 1 and 'anchor "embedded_run_agent_end"' in err and 'Model request failed' not in err, err
 
 
+def test_beta_runtime_account_refusal_surface_accepts_the_new_mjs_artifact():
+    d = setup()
+    strings = tuple(s for s in F.ANCHORS + F.ERROR_TEXTS if s != F.ROUTE_ERR) + F.ROUTE_ERROR_TEXTS + \
+        (F.RPC_PROBE, F.RPC_DESCRIBE, F.RPC_PATCH, F.RPC_ABORT)
+    pkg_strings(d / 'pkg', strings)
+    (d / 'pkg' / 'dist' / 'a.js').rename(d / 'pkg' / 'dist' / 'a.mjs')
+    rc, err, _ = go(d, False, '--check', env={'OCF_FAKE_VERSION': '2026.11.10-beta.1'})
+    assert rc == 0 and not err, (rc, err)
+
+
+def test_partial_beta_refusal_guidance_still_blocks_all_changes():
+    for missing in F.ROUTE_ERROR_TEXTS:
+        d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
+        strings = tuple(s for s in F.ANCHORS + F.ERROR_TEXTS if s != F.ROUTE_ERR) + \
+            tuple(s for s in F.ROUTE_ERROR_TEXTS if s != missing) + \
+            (F.RPC_PROBE, F.RPC_DESCRIBE, F.RPC_PATCH, F.RPC_ABORT)
+        pkg_strings(d / 'pkg', strings)
+        rc, err, j = go(d, True, env={'OCF_FAKE_VERSION': '2026.11.10-beta.1'})
+        assert rc == 1 and 'complete runtime/account refusal guidance' in err, (rc, err)
+        assert not kinds(j, 'job_move'), j
+
+
+@offline
+def test_beta_runtime_refusals_are_not_usage_limits_and_legacy_receipts_still_are():
+    refusals = [
+        "Automation test runs anthropic on account anthropic:a and can't run it on runtime codex. "
+        "That account was recorded for runtime openclaw, which this run can no longer use.",
+        F.ROUTE_ERROR_TEXTS[0], F.ROUTE_ERROR_TEXTS[2],
+        'Automation test runs on account anthropic:a, which was signed in again or replaced since the job recorded it.',
+        'Automation test runs on account anthropic:a, which was removed or signed out.',
+    ]
+    for message in refusals + [ERR]:
+        with patch.object(F, 'FAKE', {'retest': {OPUS + '@' + PA: {'rc': 1, 'err': message}}}), \
+                patch.dict(os.environ, {'OCF_FAKE_CALLS': str(F.SDIR / 'calls')}):
+            result, _, _ = F.retest_one(OPUS + '@' + PA)
+        assert result == ('limit' if message == ERR else 'error'), (message, result)
+
+
 def test_after_an_update_with_a_missing_item_nothing_changes_and_it_is_reported_once():
     d = setup(JOBS, [], {'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
     pkg_strings(d / 'pkg', F.ANCHORS + F.ERROR_TEXTS + (F.RPC_PROBE, F.RPC_DESCRIBE, F.RPC_PATCH))   # no sessions.abort
