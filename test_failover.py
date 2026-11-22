@@ -2403,6 +2403,17 @@ def test_native_rotation_success_and_nonquota_errors_are_not_failed_limit_turns(
         assert F.native_limit_terminal(failed) is None
 
 
+@offline
+def test_local_model_checks_can_be_disabled_without_accepting_unverified_returns():
+    state = {'limited': {FABLE + '@' + PA: ms() + 86400000}}
+    health = F.Health({'primary': OPUS, 'chain': [], 'order': {}})
+    with patch.object(F, 'LOCAL_MODEL_CHECKS', False), patch.object(F, 'APPLY', True), \
+            patch.object(F, 'retest_one', side_effect=AssertionError('must not run a local request')):
+        F.retest_holds(state, health, {})
+        assert not F.verify(state, health, FABLE + '@' + PA, {})
+        assert state['limited'][FABLE + '@' + PA] > ms()
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:

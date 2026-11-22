@@ -218,6 +218,7 @@ CHAT_MAX_PER_HOUR = 2
 HOLD_MS = 3600_000             # a model@account that failed on a limit without naming a wait is not a target this long
 RETEST_LEFT_MS = 3600_000      # a hold with more than this left is re-tested with a real request (a provider may reset early)
 RETEST_EVERY_MS = 60 * 60_000  # at most one re-test per hold this often
+LOCAL_MODEL_CHECKS = os.environ.get('OCF_LOCAL_MODEL_CHECKS', '1') != '0'  # opt out of isolated --local requests
 RETEST_PER_PASS = 2            # re-tests per pass at most (one takes ~15 s)
 RETEST_TIMEOUT_S = 60
 RETEST_ERRORS = 3              # re-tests in a row that failed other than on a limit before it is a problem
@@ -841,6 +842,8 @@ def retest_holds(state, health, out):
     of that model on that account, at most once per RETEST_EVERY_MS and RETEST_PER_PASS per pass, only while the pass
     has time. An answer clears the hold (the next pass moves work back by the usual rules); a limit keeps it, at the
     newly named time if any; anything else keeps it and becomes a problem after RETEST_ERRORS in a row."""
+    if not LOCAL_MODEL_CHECKS:
+        return
     hm = lambda t: time.strftime('%d %b %H:%M', time.localtime(t / 1000))
     limited, now = health.limited, NOW()
     tested, errs = state.setdefault('retested', {}), state.setdefault('retest_errors', {})
@@ -891,7 +894,7 @@ def verify(state, health, ref, out, request=True):
     v, tried = state.setdefault('verified', {}), state.setdefault('verify_tried', {})
     if NOW() - v.get(ref, 0) < VERIFY_MS:
         return True
-    if not request or _VERIFY.get('busy') or ref in _VERIFY['failed'] or NOW() - tried.get(ref, 0) < RETEST_EVERY_MS:
+    if not LOCAL_MODEL_CHECKS or not request or _VERIFY.get('busy') or ref in _VERIFY['failed'] or NOW() - tried.get(ref, 0) < RETEST_EVERY_MS:
         return False                       # busy: a pass with fresh limits keeps its time for them; returns wait
     if not APPLY:
         if ref not in out['verify_due']:
