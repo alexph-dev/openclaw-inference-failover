@@ -228,6 +228,11 @@ Requirements and limits:
   `model not allowed` refusal during a return does the same.
 - Times in the journal and in `--status` are the host's local time; set `TZ` on the job (`--command-env`) if needed.
 
+Set `OCF_LOCAL_MODEL_CHECKS=0` in the job environment to disable isolated local model requests. Regular account
+probes, holds and their recorded expiry, urgent failover, and native terminal detection continue. Early clearing
+of long holds and unverified returns to preferred accounts wait; the script never treats an untested account as
+verified. The default remains enabled for installations that allow local model checks.
+
 ## Use
 
 - `failover.py`: dry run. Prints what a pass would do as JSON; takes no lock and writes no state.
