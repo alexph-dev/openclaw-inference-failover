@@ -18,7 +18,8 @@ whole account: a probe that answers ok for one model says nothing about another 
          per item an hour. The first account of auth.order follows the preferred live account of the most used models, so
          new unpinned chats and subagents start there. Without a preference for a model: no return between accounts.
          A disabled job moves too, after the chats, and stays disabled, so a run started by hand ('cron run') finds a
-         live account. It never triggers a probe or a no-target problem; a disabled one-shot job is left alone.
+         live account. On probing passes it discovers its own accounts and fallbacks; other passes use existing
+         answers only. No target is not a problem; disabled one-shot and legacy account-mode jobs are left alone.
   usage  optional ('usage' logins in the settings, claude_usage.py): each Claude account's limits are read at most every
          5 min; while every account named for a model has a fresh, verified reading, that model's preference is
          computed from them: accounts with room for it first, earliest reset first (owner's rule: fill what resets
@@ -1268,7 +1269,7 @@ def streaks(jobs):
     return out
 
 
-def cron_edit(jid, model):
+def cron_edit(jid, model, timeout=180):
     if not APPLY:
         return 'dry-run'
     if FAKE is not None:          # tests: rebind in the fixture database
@@ -1279,7 +1280,7 @@ def cron_edit(jid, model):
         c.execute('update cron_jobs set job_json=?, updated_at=? where job_id=?', (json.dumps(d), NOW(), jid))
         c.commit()
         return FAKE.get('edit_result', 'ok')
-    rc, out, err = run(['openclaw'] + CLI_EDIT(jid, model), 180)
+    rc, out, err = run(['openclaw'] + CLI_EDIT(jid, model), timeout)
     return 'ok' if rc == 0 else ('write_limited' if 'retry after' in (err + out).lower() else 'rc=%s %s' % (rc, (err or out).strip()[-200:]))
 
 
@@ -1331,12 +1332,12 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
     """Every enabled job whose model@account is held or probed out moves to a live one, soonest-due first. A job parked
     on a fallback model goes back to its own model once an account of that model is live and not held for it. A job
     is only rebound, never run: its next scheduled run uses the new binding.
-    disabled=True runs the same for disabled jobs, after all other work of a pass that asked the accounts, so a run started by hand ('cron run') finds a live
-    account; they stay disabled. It costs the other work nothing: the caller sets health.no_probe, so only what the
-    pass already learned counts (an unasked provider is neither dead nor live), the moves get DISABLED_BUDGET_S from
-    the start of this call, and no target or a legacy mode is not a problem. A failed edit is still reported. A
-    disabled one-shot (at) job has run already and is left alone."""
-    t1 = time.time()
+    disabled=True covers trusted recurring disabled jobs after the enabled work and chats; they stay disabled.
+    On probing passes they may discover missing source and fallback providers, otherwise the caller sets
+    health.no_probe to use existing answers only. Their edits get DISABLED_BUDGET_S, excluding discovery, so a
+    slow probe cannot spend every pass's edit allowance. No target is not a problem; a failed edit still is.
+    Disabled one-shot (at) and legacy account-mode jobs are left alone."""
+    edit_s = 0
     home = state.setdefault('home', {})      # {job: {'model': its own model, 'parked': 'fallback@account'}}
     for jid, u in list(state.setdefault('unsure', {}).items()) if not disabled else ():   # once, before any edit
         state['unsure'].pop(jid)             # an edit that reported failure (a timeout) may still have landed
@@ -1358,6 +1359,8 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
     for jid, j in jobs.items():
         if j['enabled'] == disabled:
             continue                         # the other call's job
+        if disabled and j['mode'] != JOB_TRUSTED:
+            continue                         # no discovery or edits for legacy account-mode jobs
         if not j['profile'] or disabled and j['kind'] == AT_KIND:
             home.pop(jid, None)
             continue
@@ -1381,7 +1384,7 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
             prob(out, 'legacy:' + jid, 'legacy account-mode job %s (%s) is on exhausted %s; recreate it as an operator job'
                  % (jid[:8], j['name'][:40], j['profile']))
             continue
-        if (time.time() - t1 > DISABLED_BUDGET_S) if disabled else (time.time() - t0 > PASS_BUDGET_S):
+        if (edit_s >= DISABLED_BUDGET_S) if disabled else (time.time() - t0 > PASS_BUDGET_S):
             if why != 'preference':          # a return may wait for the next probing pass; it forces no early one
                 out['later' if disabled else 'deferred'] += 1
             continue
@@ -1399,10 +1402,13 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
             if not disabled:
                 out['no_target'].append((jid[:8], own))
             continue
-        if not fits(180):
+        timeout = min(180, DISABLED_BUDGET_S - edit_s) if disabled else 180
+        if not fits(timeout):
             out['later' if disabled else 'deferred'] += 1
             continue
-        r = cron_edit(jid, tgt)
+        edit_start = time.time()
+        r = cron_edit(jid, tgt, timeout=timeout)
+        edit_s += time.time() - edit_start
         journal('job_move', job=jid, name=j['name'][:60], frm=model + '@' + j['profile'], to=tgt, why=why, result=r)
         if r == 'write_limited':
             out['later' if disabled else 'deferred'] += 1
@@ -2396,8 +2402,9 @@ def main():
         # Ask the accounts when there is a fresh limit signal, an unfinished pass, or every 5 min while work uses them.
         _VERIFY['busy'] = bool(ev['providers'] or any(NOW() - p.get('t', 0) < 600_000            # fresh limits first:
                                                       for p in (state.get('pending') or {}).values()))   # no return checks now
-        if ev['providers'] or streak or state.get('retry') or state.get('unsure') \
-                or NOW() - state.get('probed_at', 0) >= PROBE_EVERY_MS:
+        probe_due = bool(ev['providers'] or streak or state.get('retry') or state.get('unsure')
+                         or NOW() - state.get('probed_at', 0) >= PROBE_EVERY_MS)
+        if probe_due:
             jobs_pass(conf, jobs, health, state, t0, out)
             chats_pass(state, health, out)
             chats_home(state, health, conf, out)
@@ -2409,8 +2416,8 @@ def main():
         _VERIFY['busy'] = False
         continued_check(state, out)
         retest_holds(state, health, out)
-        if health.cache:                     # disabled jobs last, on what this pass already asked; their wait ('later')
-            health.no_probe = True           # does not make the next pass probe
+        if probe_due or health.cache:        # disabled jobs last, including providers no enabled work uses
+            health.no_probe = not probe_due  # discover only on probing passes; 'later' forces no early probe
             part = 'disabled'
             try:
                 jobs_pass(conf, jobs, health, state, t0, out, disabled=True)

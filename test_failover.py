@@ -1733,11 +1733,11 @@ def test_disabled_job_started_by_hand_moves_after_enabled_ones_and_is_never_a_pr
     assert rc == 0 and 'no live account' not in err and not kinds(j, 'job_move'), (rc, err)
 
 
-def test_disabled_jobs_never_probe_skip_one_shots_and_keep_to_their_budget():
-    # A provider only a disabled job uses is never probed for it; a disabled one-shot is left alone.
-    d = setup({'e': (OPUS, PA, 'trusted'), 'x': ('xai/grok-4.7', 'xai:x', 'trusted'), 'o': (OPUS, PA, 'trusted')},
-              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}, 'xai': {'xai:x': 'rate_limit'}},
-              sched={'o': ('at', 0)})
+def test_disabled_exclusions_and_edit_budget_preserve_enabled_priority():
+    # Neither a disabled one-shot nor a legacy account-mode job warrants discovery or a move.
+    d = setup({'e': (OPUS, PA, 'trusted'), 'x': ('xai/grok-4.7', 'xai:x', 'account'),
+               'o': ('openai/gpt-6.1-sol', OA, 'trusted')},
+              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}}, sched={'o': ('at', 0)})
     c = sqlite3.connect(d / 'state.sqlite')
     c.execute("update cron_jobs set enabled=0 where job_id in ('x','o')")
     c.commit()
@@ -1745,14 +1745,8 @@ def test_disabled_jobs_never_probe_skip_one_shots_and_keep_to_their_budget():
     rc, err, j = go(d, True)
     assert [m['job'] for m in kinds(j, 'job_move')] == ['e'], j
     assert {r['provider'] for r in kinds(j, 'probe')} == {'anthropic'}, kinds(j, 'probe')
+    assert binding(d, 'x') == 'xai/grok-4.7@xai:x' and binding(d, 'o') == 'openai/gpt-6.1-sol@' + OA
     assert rc == 0, err
-    # Held on a provider nobody else uses: still no probe for it, and no problem.
-    st = json.loads((d / 'st' / 'state.json').read_text())
-    st['limited'] = {'xai/grok-4.7@xai:x': ms() + 3600_000}
-    (d / 'st' / 'state.json').write_text(json.dumps(st))
-    fake(d, probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}, 'xai': {'xai:x': 'ok', 'xai:y': 'ok'}})
-    rc, err, j = go(d, True)
-    assert {r['provider'] for r in kinds(j, 'probe')} == {'anthropic'} and rc == 0, (err, kinds(j, 'probe'))
     # Past DISABLED_BUDGET_S (here: spent at once) a disabled move waits for the next pass; an enabled one still goes.
     d = setup({'e': (OPUS, PA, 'trusted'), 'x': (OPUS, PA, 'trusted')},
               probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'}})
@@ -1768,6 +1762,130 @@ def test_disabled_jobs_never_probe_skip_one_shots_and_keep_to_their_budget():
     rc, err, j = go(d, True)                                          # next probing pass: the disabled job moves
     assert [m['job'] for m in kinds(j, 'job_move')] == ['e', 'x'], j   # the journal holds both passes
     assert binding(d, 'x') == OPUS + '@' + PB
+
+
+def test_disabled_recurring_coverage_discovers_missing_providers_and_refreshes_each_pass():
+    # Cold, unrelated-provider cache, and source-provider cache. None may depend on enabled work discovering xAI.
+    for seed in ('cold', 'unrelated', 'source', 'saved'):
+        enabled = {} if seed in ('cold', 'saved') else {'e': (OPUS, PB, 'trusted')} if seed == 'source' else {
+            'e': ('openai/gpt-6.1-sol', OA, 'trusted')}
+        probe = {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'},
+                 'xai': {'xai:x': 'ok'}, 'openai': {OA: 'ok'}}
+        d = setup(dict(enabled, x=(FABLE, PA, 'trusted')), probe=probe)
+        if seed == 'saved':
+            cfg = json.loads((d / 'cfg.json').read_text())
+            cfg['auth']['order'].pop('xai')
+            (d / 'cfg.json').write_text(json.dumps(cfg))
+            fake(d, models_status=models_status([('xai:x', 'oauth')]))
+        c = sqlite3.connect(d / 'state.sqlite')
+        c.execute("update cron_jobs set enabled=0 where job_id='x'")
+        c.commit()
+        c.close()
+        (d / 'st').mkdir()
+        initial = {'started': 0, 'checked_at': ms(), 'limited': {
+            FABLE + '@' + PB: ms() + 1800_000, FABLE + '@' + PC: ms() + 1800_000}}
+        (d / 'st' / 'state.json').write_text(json.dumps(initial))
+        rc, err, j = go(d, True)
+        moves = kinds(j, 'job_move')
+        assert rc == 0 and [(m['job'], m['to']) for m in moves] == [('x', 'xai/grok-4.7@xai:x')], (seed, err, j)
+        st = state_of(d)
+        assert st['home']['x']['model'] == FABLE and st['bindings']['x']['model'] == binding(d, 'x')
+        assert st['limited'] == initial['limited'] and not st.get('verified')
+        assert not kinds(j, 'chat_recover') and not kinds(j, 'cron_stall_abort')
+        # The following invocation has no fresh evidence: no rediscovery until the usual cadence is due.
+        assert len(kinds(go(d)[2], 'probe')) == len(kinds(j, 'probe'))
+        # A fresh pass must not reuse the old live answer. It moves off a newly exhausted fallback.
+        fake(d, probe={'anthropic': DEAD, 'xai': {'xai:x': 'rate_limit'}, 'openai': {OA: 'ok'}})
+        rc, err, j = go(d, True)
+        assert rc == 0 and binding(d, 'x') == 'openai/gpt-6.1-sol@' + OA, (seed, err, j)
+        # Own-model return still honors its model-specific holds, then returns without running the job.
+        fake(d, probe=probe)
+        rc, err, j = go(d, True)
+        assert binding(d, 'x') == 'openai/gpt-6.1-sol@' + OA
+        fake(d, probe=dict(probe, anthropic={PA: 'ok', PB: 'ok', PC: 'ok'}))
+        st = state_of(d)
+        st['home']['x']['at'] = 0               # the repeated-park wait has elapsed
+        (d / 'st' / 'state.json').write_text(json.dumps(st))
+        rc, err, j = go(d, True)
+        assert rc == 0 and binding(d, 'x') == FABLE + '@' + PA and 'x' not in state_of(d)['home'], (seed, err, j)
+        c = sqlite3.connect(d / 'state.sqlite')
+        assert c.execute("select enabled from cron_jobs where job_id='x'").fetchone()[0] == 0
+        c.close()
+
+
+def test_disabled_recurring_probe_failure_waits_and_later_pass_repairs_without_a_streak():
+    # No enabled jobs or run history can seed discovery. Unknown source health is not an outage decision.
+    d = setup({'x': (OPUS, PA, 'trusted')}, probe={'anthropic': {PA: 'timeout'}})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute('update cron_jobs set enabled=0')
+    c.commit()
+    c.close()
+    rc, err, j = go(d, True)
+    assert rc == 0 and not kinds(j, 'job_move') and binding(d, 'x') == OPUS + '@' + PA
+    # Failed first fallback is independent: the next configured provider can still repair the binding.
+    fake(d, probe={'anthropic': DEAD, 'xai': {'xai:x': 'timeout'}, 'openai': {OA: 'ok'}})
+    rc, err, j = go(d, True)
+    assert rc == 0 and binding(d, 'x') == 'openai/gpt-6.1-sol@' + OA, (err, j)
+
+
+def test_disabled_discovery_does_not_spend_edit_budget_and_deferred_work_progresses():
+    d = setup({'e': ('openai/gpt-6.1-sol', 'openai:default', 'trusted'),
+               'x': (OPUS, PA, 'trusted'), 'y': (OPUS, PA, 'trusted')},
+              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'rate_limit'},
+                     'openai': {'openai:default': 'rate_limit', OA: 'ok'}})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute("update cron_jobs set enabled=0 where job_id in ('x','y')")
+    c.commit()
+    c.close()
+    fake(d, slow_probe=0.04, slow_edit=0.04)
+    rc, err, j = go(d, True, env={'OCF_DISABLED_BUDGET_S': '0.01'})
+    assert rc == 0 and [m['job'] for m in kinds(j, 'job_move')] == ['e', 'x'], (err, j)
+    assert binding(d, 'y') == OPUS + '@' + PA and not state_of(d)['retry']
+    rc, err, j = go(d, True, env={'OCF_DISABLED_BUDGET_S': '0.01'})
+    assert rc == 0 and [m['job'] for m in kinds(j, 'job_move')] == ['e', 'x', 'y'], (err, j)
+
+
+def test_disabled_late_edit_fits_its_budget_and_uncertain_result_is_reconciled():
+    # Less than 180 s remain after enabled work: a disabled edit can still fit its own 10 s allowance.
+    # The timeout is uncertain: the Gateway applied the edit, and the next pass must adopt it once.
+    d = setup({'x': (OPUS, PA, 'trusted')}, probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute('update cron_jobs set enabled=0')
+    c.commit()
+    c.close()
+    fake(d, edit_result='rc=124 timeout')
+    rc, err, j = go(d, True, env={'OCF_PASS_HARD_S': '100'})
+    assert rc == 1 and binding(d, 'x') == 'xai/grok-4.7@xai:x', (err, j)
+    st = state_of(d)
+    assert st['unsure']['x']['tgt'] == binding(d, 'x') and 'rebind:x' in st['problems']
+    assert 'x' not in st['home']
+    fake(d, edit_result='ok')
+    rc, err, j = go(d, env={'OCF_PASS_HARD_S': '100'})
+    st = state_of(d)
+    assert rc == 0 and not st['unsure'] and 'rebind:x' not in st['problems'], (err, st)
+    assert st['home']['x']['model'] == OPUS and st['home']['x']['parked'] == binding(d, 'x')
+    assert [m['result'] for m in kinds(j, 'job_move')] == ['rc=124 timeout', 'ok']
+    # No room for even the bounded edit plus the existing safety margin: leave the job and state unparked.
+    d = setup({'x': (OPUS, PA, 'trusted')}, probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute('update cron_jobs set enabled=0')
+    c.commit()
+    c.close()
+    rc, err, j = go(d, True, env={'OCF_PASS_HARD_S': '15'})
+    assert rc == 0 and binding(d, 'x') == OPUS + '@' + PA and not kinds(j, 'job_move'), (err, j)
+    assert not state_of(d)['home'] and not state_of(d)['unsure']
+
+
+@offline
+def test_cron_edit_bounds_a_stalled_cli_call_by_the_supplied_timeout():
+    # Exercise the real subprocess timeout, independently of the fixture edit backend.
+    with tempfile.TemporaryDirectory(prefix='ocf-edit-') as tmp:
+        executable = pathlib.Path(tmp) / 'openclaw'
+        executable.write_text('#!%s\nimport time\ntime.sleep(1)\n' % sys.executable)
+        executable.chmod(0o755)
+        with patch.dict(os.environ, PATH=tmp + os.pathsep + os.environ.get('PATH', '')), \
+                patch.object(F, 'FAKE', None), patch.object(F, 'APPLY', True):
+            assert F.cron_edit('x', OPUS + '@' + PB, timeout=0.01) == 'rc=124 timeout'
 
 
 def test_stalled_subagent_run_is_aborted_not_moved_or_continued():
@@ -2068,6 +2186,24 @@ def test_dry_run_makes_no_request_and_no_edit():
     out = go_dry(d)
     assert out['verify_due'] == [OPUS + '@' + PA] and not out['moved'] and not requests(d), out
     assert binding(d, 'a') == OPUS + '@' + PB
+
+
+def test_disabled_recurring_dry_run_plans_binding_without_writing_state_or_dispatching():
+    d = setup({'x': (OPUS, PA, 'trusted')}, probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute('update cron_jobs set enabled=0')
+    c.commit()
+    c.close()
+    (d / 'st').mkdir()
+    st = d / 'st' / 'state.json'
+    st.write_text(json.dumps({'started': 0, 'probed_at': 0}))
+    before = {p: p.read_bytes() for p in (st, d / 'state.sqlite', d / 'cfg.json')}
+    out = go_dry(d)
+    assert out['moved'] == [['x', 'xai/grok-4.7@xai:x']], out
+    assert all(p.read_bytes() == data for p, data in before.items())
+    assert not (d / 'st' / 'journal.jsonl').exists() and not requests(d)
+    calls = (d / 'calls.log').read_text().splitlines()
+    assert not any(call.startswith(('cron run ', 'cron edit ', 'agent ', 'config set ')) for call in calls)
 
 
 def test_disabled_jobs_return_only_on_proof_the_pass_already_has():
