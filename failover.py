@@ -180,6 +180,11 @@ CRON_RE = re.compile(r'^agent:[^:]+:cron:([0-9a-f-]{36}):run:')      # a cron ru
 # Error wording. LIMIT_RE: OpenClaw's and the providers' own limit wording only ("quota exceeded" or "429" also appear
 # in business errors). Name and pattern are used by other scripts that import this file.
 ROUTE_ERR = 'incompatible with its recorded inference account and route'   # raised before the run does anything
+# Beta 2026.11.10 replaced the generic refusal with runtime/account-specific guidance. These are compatibility
+# anchors, not limit signals: a CLI login mismatch or replaced authorization must not create a usage-limit hold.
+ROUTE_ERROR_TEXTS = ("The selected runtime signs in through its own CLI login and can't use that account.",
+                    'To choose an account explicitly: openclaw automations edit',
+                    'Automation inference account changed during execution.')
 LIMIT_RE = re.compile(r"incompatible with its recorded inference account and route|rate_limit_error|"
                       r"exceed your account's rate limit|needs a short break|asking us to slow down|"
                       r"insufficient_quota", re.I)
@@ -1142,13 +1147,15 @@ def selfcheck():
         dirs = [str(pkg / d) for d in ANCHOR_DIRS if pkg and (pkg / d).is_dir()]
         if not dirs:
             return miss.append('package: installed OpenClaw package (dist) not found')
-        want = ANCHORS + ERROR_TEXTS + (RPC_PROBE, RPC_DESCRIBE, RPC_PATCH, RPC_ABORT)
+        want = ANCHORS + ERROR_TEXTS + ROUTE_ERROR_TEXTS + (RPC_PROBE, RPC_DESCRIBE, RPC_PATCH, RPC_ABORT)
         rc, o, _ = run(['grep', '-rhoF'] + [x for a in want for x in ('-e', a)] + ['--include=*.js', '--include=*.mjs'] + dirs, 120)
         if rc == 124:
             raise Unreachable('package search timed out')
         found = set(o.split('\n'))
         miss.extend('log: anchor "%s"' % a for a in ANCHORS if a not in found)
-        miss.extend('error text: "%s"' % a for a in ERROR_TEXTS if a not in found)
+        miss.extend('error text: "%s"' % a for a in ERROR_TEXTS if a != ROUTE_ERR and a not in found)
+        if ROUTE_ERR not in found and not all(a in found for a in ROUTE_ERROR_TEXTS):
+            miss.append('error text: "%s" or complete runtime/account refusal guidance' % ROUTE_ERR)
         miss.extend('rpc: %s' % a for a in (RPC_PROBE, RPC_DESCRIBE, RPC_PATCH, RPC_ABORT) if a not in found)
 
     def retest_ok():
