@@ -2344,6 +2344,65 @@ def test_an_unreadable_config_also_drops_the_live_order_once():
     assert [r['order'] for r in kinds(j[n:], 'prefer_order')] == [[PB, PA, PC]] and 'prefer_eff' in st(), j[n:]
 
 
+def native_limit(run, profile=PB, ago=45):
+    import hashlib
+    return line({'event': F.EV_AUTH_LIMIT, 'runId': run, 'provider': 'openai', 'reason': 'rate_limit',
+                 'profileId': 'sha256:' + hashlib.sha256(profile.encode()).hexdigest()[:12]}, ago=ago)
+
+
+def native_outcome(run, status='errored', ago=40):
+    return line({'runId': run, 'sessionKey': K, 'provider': 'openai', 'model': 'gpt-6-astra',
+                 'outcome': 'mute' if status == 'errored' else 'tool_delivered', 'runStatus': status},
+                F.NATIVE_OUTCOME, ago=ago)
+
+
+def test_native_quota_terminal_is_detected_across_pass_boundaries_and_never_replayed():
+    # No Model request failed or embedded_run_agent_end: the native Codex path from the real incident.
+    account, other = 'openai:b', 'openai:a'
+    pin = dict(PIN, providerOverride='openai', modelOverride='gpt-6-astra', authProfileOverride=account)
+    d = setup(log=[native_limit('N1', account)], entries={K: pin},
+              sessions={K: {'key': K, 'hasActiveRun': False, 'lastRunId': 'N1'}},
+              probe={'openai': {account: 'ok', other: 'ok'}})
+    # Explicit subscription targets avoid relying on any real store.
+    config = json.loads((d / 'cfg.json').read_text())
+    config.setdefault('auth', {}).setdefault('order', {})['openai'] = [account, other]
+    (d / 'cfg.json').write_text(json.dumps(config))
+    go(d)
+    logfile = next((d / 'logs').glob('*.log'))
+    with logfile.open('a') as f:
+        f.write(json.dumps(native_outcome('N1')) + '\n')
+    rc, err, j = go(d)
+    moves = kinds(j, 'chat_move')
+    assert moves and moves[-1]['to'] == 'openai/gpt-6-astra@' + other, (rc, err, j)
+    recover, = kinds(j, 'chat_recover')
+    assert recover['continue'].startswith('not replayed:'), recover
+    assert not json.loads((d / 'st/state.json').read_text()).get('continued'), j
+    assert len(kinds(go(d)[2], 'chat_recover')) == 1
+
+
+@offline
+def test_native_rotation_success_and_nonquota_errors_are_not_failed_limit_turns():
+    quota, completed = native_limit('N2'), native_outcome('N2', 'completed')
+    with patch.object(F, 'log_lines', return_value=[quota, completed]):
+        assert F.native_limit_terminal(completed) is None
+    unrelated = native_outcome('N3')
+    with patch.object(F, 'log_lines', return_value=[quota, unrelated]):
+        assert F.native_limit_terminal(unrelated) is None
+    failed = native_outcome('N2')
+    with patch.object(F, 'log_lines', return_value=[quota, failed]):
+        result = F.native_limit_terminal(failed)
+        assert result['model'] == 'openai/gpt-6-astra' and result['no_continue'] is True
+    success = line('post-run auth-profile success bookkeeping completed after 1ms: runId=N2 provider=openai', ago=42)
+    with patch.object(F, 'log_lines', return_value=[quota, success, failed]):
+        assert F.native_limit_terminal(failed) is None
+    nonlimit = line({'event': F.EV_END, 'runId': 'N2', 'isError': True, 'failoverReason': 'tool_error'}, ago=42)
+    with patch.object(F, 'log_lines', return_value=[quota, nonlimit, failed]):
+        assert F.native_limit_terminal(failed) is None
+    # A successful terminal receipt wins even when another error receipt also exists for the same run.
+    with patch.object(F, 'log_lines', return_value=[quota, failed, completed]):
+        assert F.native_limit_terminal(failed) is None
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:

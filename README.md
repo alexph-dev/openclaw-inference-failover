@@ -81,6 +81,11 @@ limits). After those come the entries of
   kept in the state as `prefer_eff`, next to `last_pass`, for other readers; a pass whose config check fails (wrong shape or
   not readable) drops it (journal `prefer_order_dropped` with the error), so they fall back to the settings' order rather than an old one.
   `--status` and `python3 claude_usage.py` show the readings.
+- **Native Codex failures after tools.** An OpenAI account-limit bookkeeping event and an errored terminal
+  delivery receipt for the same run are joined, including across polling passes. Only accounts whose identifiers
+  match the log's SHA-256 profile labels are held. The session is rebound for its next turn; the interrupted turn
+  is never automatically continued because its tools may already have changed external state. A completed run
+  after account rotation and an incomplete turn without its own quota evidence are excluded.
 - **Problems** it cannot fix (no live account anywhere, a missing OpenClaw surface) fail the job run with the reason on
   stderr on two passes in a row, then stay quiet while open. It never fails every minute, so the scheduler does not
   disable it.

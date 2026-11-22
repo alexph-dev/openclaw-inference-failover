@@ -155,6 +155,8 @@ LOG_GLOB = 'openclaw-*.log'                                         # daily log 
 LOG_TMP_DIRS = ('/tmp/openclaw', '/tmp/openclaw-{uid}')             # default log directories
 L1, L2, L_META, L_DATE = '1', '2', '_meta', 'date'
 L_HTTP, L_BODY, L_PROV, L_MODEL = 'status', 'body', 'provider', 'model'   # fields of a failed model request / run end
+EV_AUTH_LIMIT = 'auth_profile_failure_state_updated'              # native-runtime account bookkeeping
+NATIVE_OUTCOME = 'recorded message-tool-only run outcome'           # terminal delivery receipt
 EV_END = 'embedded_run_agent_end'                                   # a run ended: {runId, isError, failoverReason, provider, model}
 L_EVENT, L_RUN, L_ERROR, L_REASON, L_STATUS, L_DONE, L_MILESTONE = 'event', 'runId', 'isError', 'failoverReason', 'runStatus', 'completed', 'milestone'
 RUN_END_RE = re.compile(r'\[agent\] run (\S+) ended with stopReason=(\w+)')   # agent-command's plain-text run end
@@ -426,6 +428,51 @@ def log_lines(needle):
     return out
 
 
+def native_limit_terminal(rec):
+    """Exact native run quota + failed terminal receipt. Never infer quota from a missing assistant alone.
+    Native runs can already have performed tools; only rebind their next turn, never launch a continuation.
+    Read matching run metadata across pass/file boundaries; a completed run after profile rotation is excluded.
+    """
+    one = rec.get(L1)
+    if not isinstance(one, dict) or one.get(L_PROV) != 'openai' or one.get(L_STATUS) != 'errored':
+        return None
+    run_id, key = one.get(L_RUN), one.get('sessionKey')
+    if not run_id or not key or not one.get(L_MODEL):
+        return None
+    t = ts_ms(rec)
+    limits, rows = [], log_lines(run_id)
+    for row in rows:
+        data = row.get(L1)
+        if not isinstance(data, dict) or data.get(L_RUN) != run_id:
+            continue
+        if data.get(L_STATUS) == L_DONE:
+            return None
+        if (data.get(L_EVENT) == EV_AUTH_LIMIT and data.get(L_PROV) == one[L_PROV]
+                and data.get('reason') in LIMITED and ts_ms(row) <= t
+                and data.get(L_MODEL, one[L_MODEL]) == one[L_MODEL]):
+            limits.append((ts_ms(row), data.get('profileId')))
+    if not limits:
+        return None
+    last_limit = max(at for at, _ in limits)
+    for row in rows:
+        if ts_ms(row) <= last_limit:
+            continue
+        data = row.get(L1)
+        if isinstance(data, str) and 'post-run auth-profile success bookkeeping completed' in data:
+            return None
+        if isinstance(data, dict) and data.get(L_RUN) == run_id:
+            if data.get(L_MILESTONE) and ts_ms(row) > last_limit + 2000:
+                return None
+            if data.get(L_EVENT) == EV_END and data.get(L_REASON) not in LIMITED:
+                return None
+            if (data.get(L_EVENT) == EV_AUTH_LIMIT and data.get(L_PROV) == one[L_PROV]
+                    and data.get('reason') not in LIMITED):
+                return None
+    return {'t': t, 'model': '%s/%s' % (one[L_PROV], one[L_MODEL]),
+            'profile_hashes': list(dict.fromkeys(p for _, p in limits if isinstance(p, str))),
+            'no_continue': True, 'key': key}
+
+
 def scan_logs(state):
     """New complete log lines since the last pass -> stalls, failed turns, run->session keys, providers seen limited."""
     ev = {'stalls': [], 'failed': {}, 'run_key': {}, 'providers': set()}
@@ -440,13 +487,19 @@ def scan_logs(state):
         chunk = chunk[:chunk.rfind(b'\n') + 1]       # a half-written last line is read next pass
         offs[f] = start + len(chunk)
         for raw in chunk.split(b'\n'):
-            if not any(x.encode() in raw for x in LIMITED + (ANCHORS[1],)):
+            if not any(x.encode() in raw for x in LIMITED + (ANCHORS[1], NATIVE_OUTCOME)):
                 continue
             try:
                 rec = json.loads(raw)
             except Exception:
                 continue
             one, two, t = rec.get(L1), rec.get(L2), ts_ms(rec)
+            if two == NATIVE_OUTCOME:
+                native = native_limit_terminal(rec)
+                if native:
+                    ev['failed'][one[L_RUN]] = native
+                    ev['run_key'][one[L_RUN]] = native['key']
+                    ev['providers'].add(one[L_PROV])
             m = REQ_RE.search(two) if isinstance(two, str) else None
             if m and isinstance(one, dict):
                 ev['run_key'][m.group(2)] = m.group(1)
@@ -1924,7 +1977,8 @@ def recover_chat(state, health, key, s, run_id, p, out):
         prob(out, 'chat_loop:' + key, 'chat %s keeps failing on a limit after recovery (%d times within an hour)'
              % (key[-40:], len(hits) + 1))
         return dropped('it died on a limit again after %d continuations within an hour' % len(hits))
-    if p.get('profile'):                   # the limit is this model on this account, until the time the provider named
+    # Native holds use exact logged profile hashes; the current selection may already be another account.
+    if p.get('profile') and not p.get('no_continue'):
         health.hold(p['profile'], p['until'] if p['kind'] == 'stall' else NOW() + HOLD_MS, p['model'])
     plan = chat_plan(state, health, key, e, unknown_dead=True)
     if plan['needed'] and not plan['tgt']:
@@ -1979,6 +2033,8 @@ def recover_chat(state, health, key, s, run_id, p, out):
         (not latest.get(S_ACTIVE) and last_run(latest, latest_e) not in (run_id, None))
     if not latest or newer or newer_input(latest, latest_e, queued, p['t']) or not human_chat(key, latest, latest_e):
         res['continue'] = 'user already wrote'
+    elif p.get('no_continue'):
+        res['continue'] = 'not replayed: native run may have completed tool actions'
     elif not has_chat(key, s):
         res['continue'] = 'no chat'
     else:
@@ -1990,11 +2046,12 @@ def recover_chat(state, health, key, s, run_id, p, out):
             journal('chat_recover', session=key, run=run_id, why=p['kind'], to=now, **res)
             return False
     state['handled'][run_id] = {'t': NOW()}
-    state['chat_hits'][key] = hits + [NOW()]
+    if not p.get('no_continue'):
+        state['chat_hits'][key] = hits + [NOW()]
     save(state)
     journal('chat_recover', session=key, run=run_id, why=p['kind'], frm='%s@%s' % (p['model'], p.get('profile')),
             to=now, **res)
-    out.setdefault('continued', []).append((key[-40:], now))
+    out.setdefault('rebound' if p.get('no_continue') else 'continued', []).append((key[-40:], now))
     return True
 
 
@@ -2036,6 +2093,13 @@ def note_events(state, ev, jobs, health):
         if (pend.get(r) or {}).get('kind') != 'stall' and NOW() - f['t'] < FRESH_MS:
             old = pend.get(r) or {}
             p = pend[r] = {'kind': 'failed', 't': f['t'], 'until': f['t'] + WAIT_MS, 'model': f['model']}
+            if f.get('no_continue'):
+                p['no_continue'] = True
+                matches = [a for a in health.accounts(f['model'].split('/')[0])
+                           if ('sha256:' + hashlib.sha256(a.strip().encode()).hexdigest()[:12])
+                           in f.get('profile_hashes', []) or a in f.get('profile_hashes', [])]
+                for account in matches:
+                    health.hold(account, f['t'] + HOLD_MS, f['model'])
             new.append((p, key_of(rk, r), old))
     for p, key, old in new:
         if old.get('ref'):                 # the same run seen again: it was on the route noted the first time
