@@ -344,7 +344,8 @@ T0 = time.time()
 late = lambda: time.time() - T0 > PASS_SOFT_S
 # A call that changes something starts only when its whole timeout fits before the pass deadline: a call cut off
 # half-way may still be applied by the Gateway while this script never records it.
-fits = lambda timeout_s: PASS_HARD_S - (time.time() - T0) > timeout_s + 10
+remaining_s = lambda: PASS_HARD_S - (time.time() - T0) - 10
+fits = lambda timeout_s: remaining_s() > timeout_s
 
 
 class Deadline(BaseException):
@@ -396,8 +397,9 @@ def run(argv, timeout=120):
         return 127, '', str(e)
 
 
-def gw(method, params, timeout=120):
-    rc, out, err = run(['openclaw'] + CLI_CALL(method, params, timeout * 1000 - 5000), timeout)
+def gw(method, params, timeout=120, cli_allowance=5):
+    ms = max(1, int((timeout - cli_allowance) * 1000))
+    rc, out, err = run(['openclaw'] + CLI_CALL(method, params, ms), timeout)
     try:
         d = json.loads(out[out.index('{'):])
     except Exception:
@@ -677,16 +679,43 @@ class Health:
         self.saved, self.saved_err = None, None    # the agent's saved accounts, read once per pass when first needed
         self.saved_state, self.saved_skipped = {}, False   # {profile: credential status}; read skipped for time
         self.no_probe = False                # True: a provider not asked yet this pass answers nothing, unasked
+        self.probe_pending = None            # disabled discovery only: providers still owed a share of the pass
+
+    def budget_disabled(self, jobs, state):
+        """Share remaining discovery time across eligible sources, homes and fallbacks, plus the saved-store read.
+        No cross-pass health cache: each probing pass gives later candidates time even when earlier ones time out.
+        The existing edit allowance and hard-deadline safety margin remain reserved."""
+        eligible = {jid: j for jid, j in jobs.items() if not j['enabled'] and j['mode'] == JOB_TRUSTED
+                    and j['kind'] != AT_KIND and j['profile']}
+        models = {MODEL(j['model'] or self.conf['primary']) for j in eligible.values()}
+        models.update(h['model'] for jid, h in state.get('home', {}).items() if jid in eligible)
+        providers = {m.split('/')[0] for m in models | (set(self.conf['chain']) if models else set())}
+        self.probe_pending = providers - self.cache.keys()
+        if self.saved is None and any(not self.ordered(p) for p in providers):
+            self.probe_pending.add(None)      # the one saved-store read also needs a bounded chance
+
+    def discovery_timeout(self, key, normal):
+        if self.probe_pending is None:
+            return normal                    # enabled work retains its normal probe policy
+        left = min(PASS_SOFT_S - (time.time() - T0), remaining_s()) - max(0, DISABLED_BUDGET_S)
+        timeout = max(0, min(normal, left / max(1, len(self.probe_pending))))
+        self.probe_pending.discard(key)
+        return timeout
 
     def probe(self, provider):
         if provider not in self.cache and self.no_probe:
             return {}
         if provider not in self.cache:
+            timeout = self.discovery_timeout(provider, 120)
+            if timeout <= 0:
+                return {}                    # unasked, not unavailable; never cache a budget deferral
             if FAKE is not None:
                 time.sleep(FAKE.get('slow_probe', 0))
                 res = dict(FAKE.get('probe', {}).get(provider, {}))
             else:
-                d, err = gw(RPC_PROBE, PROBE_ARGS(provider, default_agent()), 120)
+                # Bounded read-only discovery needs its full RPC share; the outer CLI timeout still enforces it.
+                allowance = 0 if self.probe_pending is not None else 5
+                d, err = gw(RPC_PROBE, PROBE_ARGS(provider, default_agent()), timeout, cli_allowance=allowance)
                 res = {r[PROBE_PROFILE]: r.get(PROBE_STATUS) for r in (d or {}).get(PROBE_RESULTS, []) if r.get(PROBE_PROFILE)}
                 if d is None:
                     self.failed.append(provider)
@@ -735,12 +764,13 @@ class Health:
             return []
         if self.saved is None:
             self.saved = []
-            if not fits(MS_TIMEOUT_S):       # a late pass: the config profiles serve this once, the next pass reads it
+            timeout = self.discovery_timeout(None, MS_TIMEOUT_S)
+            if timeout <= 0 or not fits(timeout):   # config profiles serve this once; the next pass reads it
                 journal('saved_profiles_skipped', why='no time left in this pass')
                 self.saved_skipped = True
                 return self.saved
             try:
-                self.saved, bad, self.saved_state = saved_profiles()
+                self.saved, bad, self.saved_state = saved_profiles(timeout)
                 if bad:
                     self.saved_err = 'saved types disagree with the store for %s' % ', '.join(bad)
                     journal('saved_profiles_failed', error=self.saved_err)
@@ -973,14 +1003,14 @@ def cli_json(argv, timeout=75):
     return _CACHE[k]
 
 
-def saved_profiles():
+def saved_profiles(timeout=MS_TIMEOUT_S):
     """[(profile id, provider, type)] of every account in the default agent's auth store, saved-only ones included.
     Reads id, provider and type only: a profile's label shows a masked key or an email.
     Returns (rows, providers whose rows were dropped). A plugin's runtime credential can override the reported type for
     a whole provider (e.g. an API key in the environment), so a provider's rows are kept only when their types match
     the raw store counts in auth.providers[].profiles; a row whose id prefix is not its provider is skipped, because
     the probe of that account would ask another provider."""
-    d = cli_json(CLI_MODELS(default_agent()), MS_TIMEOUT_S)
+    d = cli_json(CLI_MODELS(default_agent()), timeout)
     rows = dig(d, MS_PROFILES)
     if not isinstance(rows, list) or not all(isinstance(r, dict) and all(isinstance(r.get(k), str) for k in
                                                                          (MS_ID, MS_PROVIDER, MS_TYPE)) for r in rows):
@@ -1334,10 +1364,12 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
     is only rebound, never run: its next scheduled run uses the new binding.
     disabled=True covers trusted recurring disabled jobs after the enabled work and chats; they stay disabled.
     On probing passes they may discover missing source and fallback providers, otherwise the caller sets
-    health.no_probe to use existing answers only. Their edits get DISABLED_BUDGET_S, excluding discovery, so a
-    slow probe cannot spend every pass's edit allowance. No target is not a problem; a failed edit still is.
+    health.no_probe to use existing answers only. Discovery shares the remaining pass time across missing providers
+    while reserving DISABLED_BUDGET_S for edits. No target is not a problem; a failed edit still is.
     Disabled one-shot (at) and legacy account-mode jobs are left alone."""
     edit_s = 0
+    if disabled:
+        health.budget_disabled(jobs, state)
     home = state.setdefault('home', {})      # {job: {'model': its own model, 'parked': 'fallback@account'}}
     for jid, u in list(state.setdefault('unsure', {}).items()) if not disabled else ():   # once, before any edit
         state['unsure'].pop(jid)             # an edit that reported failure (a timeout) may still have landed
@@ -1384,7 +1416,7 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
             prob(out, 'legacy:' + jid, 'legacy account-mode job %s (%s) is on exhausted %s; recreate it as an operator job'
                  % (jid[:8], j['name'][:40], j['profile']))
             continue
-        if (edit_s >= DISABLED_BUDGET_S) if disabled else (time.time() - t0 > PASS_BUDGET_S):
+        if (late() or edit_s >= DISABLED_BUDGET_S) if disabled else (time.time() - t0 > PASS_BUDGET_S):
             if why != 'preference':          # a return may wait for the next probing pass; it forces no early one
                 out['later' if disabled else 'deferred'] += 1
             continue
@@ -1403,7 +1435,7 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
                 out['no_target'].append((jid[:8], own))
             continue
         timeout = min(180, DISABLED_BUDGET_S - edit_s) if disabled else 180
-        if not fits(timeout):
+        if (disabled and late()) or not fits(timeout):
             out['later' if disabled else 'deferred'] += 1
             continue
         edit_start = time.time()
@@ -2385,6 +2417,7 @@ def main():
     for k in ('rerun', 'rerun_wanted', 'run_req'):
         state.pop(k, None)     # an older version's rerun bookkeeping
     ev, streak, health = {'providers': set()}, {}, Health(conf, limited)
+    no_target_unknown = None
     part = None                # the part running now that does not run every pass: a cut-off there keeps its own clock
     try:
         del CRON_STORE_ERR[:]
@@ -2417,12 +2450,15 @@ def main():
         continued_check(state, out)
         retest_holds(state, health, out)
         if probe_due or health.cache:        # disabled jobs last, including providers no enabled work uses
+            if out['no_target']:
+                no_target_unknown = health.unknown()   # disabled-only uncertainty cannot undo an enabled outage
             health.no_probe = not probe_due  # discover only on probing passes; 'later' forces no early probe
             part = 'disabled'
             try:
                 jobs_pass(conf, jobs, health, state, t0, out, disabled=True)
             finally:
                 health.no_probe = False
+                health.probe_pending = None
             part_done(state, part)
             part = None
         if APPLY and not late() and NOW() - state.get('checked_at', 0) >= CHECK_EVERY_MS:
@@ -2449,7 +2485,7 @@ def main():
             surface_ok(state, out, str(e))
     finally:
         signal.alarm(0)
-    return finish(state, out, ev, streak, health)
+    return finish(state, out, ev, streak, health, no_target_unknown)
 
 
 def surface_ok(state, out, shape_error=None):
@@ -2473,8 +2509,8 @@ def surface_ok(state, out, shape_error=None):
     return not missing
 
 
-def finish(state, out, ev, streak, health):
-    if out['no_target'] and not health.unknown():
+def finish(state, out, ev, streak, health, no_target_unknown=None):
+    if out['no_target'] and not (health.unknown() if no_target_unknown is None else no_target_unknown):
         models = sorted({m for _, m in out['no_target']})
         prob(out, 'no_target:' + ','.join(models), 'no live account or fallback model for %s: %s'
              % (', '.join(models), ', '.join(i for i, _ in out['no_target'][:8])))

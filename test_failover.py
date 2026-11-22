@@ -1813,6 +1813,146 @@ def test_disabled_recurring_coverage_discovers_missing_providers_and_refreshes_e
         c.close()
 
 
+def test_disabled_uncertainty_does_not_hide_an_enabled_no_target_alert():
+    probe = {'anthropic': DEAD, 'xai': {'xai:x': 'rate_limit'},
+             'openai': {'openai:default': 'rate_limit', OA: 'rate_limit', 'openai:b': 'rate_limit'},
+             'custom': {'custom:a': 'timeout'}}
+    for disabled in (False, True):
+        jobs = {'e': (OPUS, PA, 'trusted')}
+        if disabled:
+            jobs['x'] = ('custom/model', 'custom:a', 'trusted')
+        d = setup(jobs, probe=probe)
+        cfg = json.loads((d / 'cfg.json').read_text())
+        cfg['auth']['order']['custom'] = ['custom:a']
+        (d / 'cfg.json').write_text(json.dumps(cfg))
+        c = sqlite3.connect(d / 'state.sqlite')
+        c.execute("update cron_jobs set enabled=0 where job_id='x'")
+        c.commit()
+        c.close()
+        rc, err, j = go(d, True)
+        assert rc == 1 and 'no live account or fallback model' in err, (disabled, rc, err)
+        assert 'no_target:' + OPUS in state_of(d)['problems']
+        assert not kinds(j, 'job_move')
+
+
+@offline
+def test_slow_disabled_discovery_reaches_a_healthy_fallback_on_repeated_passes():
+    # Advance elapsed time by the actual timeout a slow transport would consume. Each fresh pass
+    # starts with the same two slow providers, not a lucky cache, provider order, or later recovery.
+    conf = {'primary': 'source/model', 'chain': ['slow/model', 'healthy/model'],
+            'order': {'source': ['source:a', 'source:b'], 'slow': ['slow:a'], 'healthy': ['healthy:a']}}
+    base = 1700000000.0
+    for start in (25, 180):
+        for attempt in range(3):
+            clock, requests, edits = [base + start], [], []
+            def gateway(method, params, timeout=120, cli_allowance=5):
+                assert method == F.RPC_PROBE
+                provider = params['provider']
+                requests.append((provider, clock[0] - base, timeout))
+                if provider != 'healthy':
+                    clock[0] += timeout
+                    return None, 'timeout'
+                clock[0] += min(1, timeout)
+                return {'results': [{'profileId': 'healthy:a', 'status': 'ok'}]}, ''
+            def cli(argv, timeout=120):
+                assert argv[1:3] == ['cron', 'edit'], argv
+                edits.append((argv[3], argv[5], clock[0] - base, timeout))
+                clock[0] += timeout     # even an edit taking its entire reservation must fit
+                return 0, '', ''
+            state = {'limited': {'source/model@source:a': int((base + 3600) * 1000)}}
+            jobs = {'x': {'enabled': False, 'mode': 'trusted', 'kind': 'cron', 'next': 0,
+                          'model': 'source/model@source:a', 'profile': 'source:a', 'name': 'x'}}
+            out = {'moved': [], 'no_target': [], 'problems': [], 'later': 0, 'deferred': 0}
+            with patch.object(F, 'FAKE', None), patch.object(F, 'APPLY', True), \
+                    patch.object(F, 'T0', base), patch.object(F.time, 'time', lambda: clock[0]), \
+                    patch.object(F, 'default_agent', return_value='fixture'), \
+                    patch.object(F, 'gw', side_effect=gateway), patch.object(F, 'run', side_effect=cli):
+                health = F.Health(conf, state['limited'])
+                F.jobs_pass(conf, jobs, health, state, base, out, disabled=True)
+            assert clock[0] - base <= F.PASS_SOFT_S, (start, attempt, clock, requests, edits)
+            assert out['moved'] == [('x', 'healthy/model@healthy:a')], (start, attempt, out, requests)
+            assert [p for p, _, _ in requests] == ['source', 'slow', 'healthy']
+            assert state['home']['x']['model'] == 'source/model'
+            assert not jobs['x']['enabled'] and not out['problems'] and not out['no_target']
+
+
+@offline
+def test_disabled_discovery_bounds_real_slow_transports_including_saved_accounts():
+    # Distinct transport proof: subprocesses really sleep, and only their supplied timeouts stop them.
+    # The saved-store read is slow too; a declared subscription still lets the healthy fallback serve.
+    with tempfile.TemporaryDirectory(prefix='ocf-probes-') as tmp:
+        executable = pathlib.Path(tmp) / 'openclaw'
+        executable.write_text('#!%s\n' % sys.executable + r'''
+import json, sys, time
+a = sys.argv[1:]
+if a[:2] == ['cron', 'edit']:
+    sys.exit(0)
+if a[:2] == ['models', 'status']:
+    time.sleep(3)
+    print(json.dumps({'auth': {'oauth': {'profiles': []}}}))
+else:
+    assert a[:3] == ['gateway', 'call', 'models.probe'], a
+    assert float(a[a.index('--timeout') + 1]) > 0
+    provider = json.loads(a[a.index('--params') + 1])['provider']
+    if provider != 'healthy':
+        time.sleep(3)
+    else:
+        # A healthy provider needs real response time inside the RPC deadline, not just the outer process timeout.
+        if float(a[a.index('--timeout') + 1]) < 50:
+            print(json.dumps({'ok': False, 'error': 'timeout'}))
+            sys.exit(0)
+        time.sleep(0.05)
+    print(json.dumps({'results': [{'profileId': provider + ':a',
+                                    'status': 'ok' if provider == 'healthy' else 'rate_limit'}]}))
+''')
+        executable.chmod(0o755)
+        conf = {'primary': 'source/model', 'chain': ['slow/model', 'healthy/model'],
+                'order': {'source': ['source:a', 'source:b'], 'slow': ['slow:a']},
+                'profiles': {'healthy:a': {'provider': 'healthy', 'mode': 'oauth'}}}
+        jobs = {'x': {'enabled': False, 'mode': 'trusted', 'kind': 'cron', 'next': 0, 'name': 'x',
+                      'model': 'source/model@source:a', 'profile': 'source:a'}}
+        start = time.time()
+        state = {'limited': {'source/model@source:a': ms() + 3600000}}
+        out = {'moved': [], 'no_target': [], 'problems': [], 'later': 0, 'deferred': 0}
+        with patch.dict(os.environ, PATH=tmp + os.pathsep + os.environ.get('PATH', '')), \
+                patch.object(F, 'FAKE', None), patch.object(F, 'APPLY', True), \
+                patch.object(F, 'run', _run), patch.object(F, '_CACHE', {}), \
+                patch.object(F, 'T0', start - 0.5), patch.object(F, 'PASS_SOFT_S', 6), \
+                patch.object(F, 'PASS_HARD_S', 30), patch.object(F, 'DISABLED_BUDGET_S', 1), \
+                patch.object(F, 'default_agent', return_value='fixture'):
+            health = F.Health(conf, state['limited'])
+            F.jobs_pass(conf, jobs, health, state, F.T0, out, disabled=True)
+            elapsed = time.time() - F.T0
+            assert elapsed <= F.PASS_SOFT_S - F.DISABLED_BUDGET_S, elapsed
+            assert out['moved'] == [('x', 'healthy/model@healthy:a')], out
+            assert set(health.failed) == {'source', 'slow'} and health.saved_err == 'timeout'
+
+
+@offline
+def test_disabled_work_past_the_pass_stop_leaves_unasked_accounts_and_bindings_alone():
+    conf = {'primary': OPUS, 'chain': [], 'order': {'anthropic': [PA, PB]}}
+    # Both discovery and a move using already-known health must respect the stop.
+    for cached in (False, True):
+        jobs = {'x': {'enabled': False, 'mode': 'trusted', 'kind': 'cron', 'next': 0,
+                      'model': OPUS + '@' + PA, 'profile': PA, 'name': 'x'}}
+        state, out = {}, {'moved': [], 'no_target': [], 'problems': [], 'later': 0, 'deferred': 0}
+        health = F.Health(conf)
+        if cached:
+            health.cache['anthropic'] = {PA: 'rate_limit', PB: 'ok'}
+        def gateway(method, params, timeout=120):
+            return {'results': [{'profileId': PA, 'status': 'rate_limit'}, {'profileId': PB, 'status': 'ok'}]}, ''
+        with patch.object(F, 'FAKE', None), patch.object(F, 'APPLY', True), \
+                patch.object(F, 'T0', 1000), patch.object(F.time, 'time', return_value=1201), \
+                patch.object(F, 'default_agent', return_value='fixture'), \
+                patch.object(F, 'gw', side_effect=gateway) as probe, \
+                patch.object(F, 'run', return_value=(0, '', '')) as edit:
+            F.jobs_pass(conf, jobs, health, state, 1000, out, disabled=True)
+            assert not probe.called and not edit.called, (cached, probe.call_args_list, edit.call_args_list)
+        assert jobs['x']['model'] == OPUS + '@' + PA and not out['moved']
+        if not cached:
+            assert 'anthropic' not in health.cache and not health.failed
+
+
 def test_disabled_recurring_probe_failure_waits_and_later_pass_repairs_without_a_streak():
     # No enabled jobs or run history can seed discovery. Unknown source health is not an outage decision.
     d = setup({'x': (OPUS, PA, 'trusted')}, probe={'anthropic': {PA: 'timeout'}})
