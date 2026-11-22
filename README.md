@@ -255,6 +255,11 @@ verified. The default remains enabled for installations that allow local model c
 
 Tests: `python3 test_failover.py`. They use a fake `openclaw` and fixture files and never touch a Gateway.
 
+The package compatibility check accepts the older generic automation account/route refusal or the complete
+runtime/account guidance introduced in 2026.11.10-beta.1. Legacy refusal receipts remain recognized. New runtime,
+CLI-login, and replaced-authorization refusals are operational errors, not usage-limit signals; they do not cause
+a model/account limit hold. Provider rate-limit detection keeps its existing checks.
+
 ## Removal
 
 Remove the job (`openclaw cron list` shows its id, then `openclaw cron rm <id>`), then delete the clone and
