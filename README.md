@@ -26,8 +26,12 @@ limits). After those come the entries of
   pass, and stay disabled, so a run started by hand (`openclaw cron run`) finds a live account. On probing passes
   (at least every 5 min) they discover missing source and fallback providers, even when no enabled work uses them;
   on other passes they use only answers already obtained that pass. Answers are shared within a pass and refreshed
-  on the next probing pass. Their edits get at most 10 s per pass, excluding discovery, within the pass deadline;
-  each edit's timeout fits the remaining edit allowance, so late passes need not reserve the enabled jobs' 180 s.
+  on the next probing pass. Missing providers and the saved-account read share the time remaining before the
+  200 s soft stop or the hard deadline's safety margin, reserving the existing 10 s disabled edit allowance.
+  Slow providers cannot consume later candidates' shares on every pass. Unasked providers remain unknown;
+  disabled discovery uncertainty cannot suppress an enabled job's confirmed no-target alert. Enabled probe
+  timeouts and priority are unchanged. Disabled edits get at most 10 s per pass, excluding discovery;
+  each edit's timeout fits the remaining edit allowance, and no disabled probe or edit starts past the soft stop.
   An uncertain edit is reconciled from the next job-list read before another edit. Deferred disabled work forces
   no early probe. One with nowhere to go is not reported, a failed edit is.
   Disabled one-shot (`at`) and legacy account-mode jobs are left alone.
