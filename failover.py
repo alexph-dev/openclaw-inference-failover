@@ -51,6 +51,8 @@ whole account: a probe that answers ok for one model says nothing about another 
   failover.py --status   open problems, held model@account pairs, work parked on a fallback model (JSON)
   failover.py --adopt KEY[=MODEL]...   record that the current account of these chats was set by the operator, not a
                          person; =MODEL: the operator moved it off its own model MODEL, which it returns to
+  failover.py --adopt-job JOB=MODEL...   the operator moved this job off its own model MODEL: it returns there like a
+                         job this script parked, on an account chosen by the normal selection
 State and journal: ~/.local/state/openclaw-inference-failover (OCF_STATE overrides).
 Settings (optional): ~/.config/openclaw-inference-failover/settings.json (OCF_SETTINGS overrides):
   {"prefer": {"provider/model": ["provider:account", ...]}}
@@ -203,7 +205,7 @@ USAGE = SDIR / 'usage.json'   # claude_usage snapshot: limits, resets and free l
 OC_DIR = pathlib.Path(os.environ.get('OCF_OPENCLAW_DIR') or os.environ.get('OPENCLAW_STATE_DIR') or HOME / '.openclaw')
 CONFIG = os.environ.get('OCF_CONFIG') or os.environ.get('OPENCLAW_CONFIG_PATH') or str(OC_DIR / 'openclaw.json')
 FAKE = json.load(open(os.environ['OCF_FAKE'])) if os.environ.get('OCF_FAKE') else None  # tests only
-APPLY = '--apply' in sys.argv or '--adopt' in sys.argv
+APPLY = '--apply' in sys.argv or '--adopt' in sys.argv or '--adopt-job' in sys.argv
 SETTINGS = pathlib.Path(os.environ.get('OCF_SETTINGS') or pathlib.Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config')
                         / 'openclaw-inference-failover' / 'settings.json')
 NOW = lambda: int(time.time() * 1000)
@@ -1405,8 +1407,12 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
             home.pop(jid, None)
             continue
         ref = j['model'] or conf['primary'] + '@' + j['profile']
-        if jid in home and home[jid]['parked'] != ref:
-            home.pop(jid)                    # somebody rebound it since: that choice stands
+        full = ref if '@' in ref else '%s@%s' % (ref, j['profile'])   # payload.model may leave the account to the store
+        if jid in home and home[jid]['parked'] != full:
+            if MODEL(home[jid]['parked']) == MODEL(full):
+                home[jid]['parked'] = full   # only the fallback's account changed: still on its way home
+            else:
+                home.pop(jid)                # somebody chose another model since: that choice stands
         if health.dead(j['profile'], MODEL(ref)):
             todo.append((j['next'], jid, None, 'out'))
         elif jid in home and ripe(home[jid]) and health.target(home[jid]['model'], chain=False):
@@ -1933,6 +1939,39 @@ def adopt(state, keys):
     print(json.dumps(res, indent=1, ensure_ascii=False))
 
 
+def adopt_jobs(state, args):
+    """--adopt-job JOB=MODEL...: the operator moved these jobs off MODEL, their own model, to a fallback. Each then goes
+    home like a job this script parked (state 'home'): jobs_pass picks the account once one of MODEL is live, and a
+    later choice of another model cancels it. MODEL equal to the current model drops an older home. Only operator jobs
+    jobs_pass may rebind, only a provider/model the allowlist keeps and without an account, and not while the outcome
+    of the job's last edit is unknown, because reconciling that edit writes the home. Changes no job."""
+    conf, res = cfg(), {}
+    try:                                   # on a copy: the next pass, not an adoption, dates a binding change
+        jobs = load_jobs({'bindings': dict(state.get('bindings') or {}), 'started': state.get('started', 0)})[0]
+    except (Shape, Unreachable) as e:
+        sys.exit('[inference failover] --adopt-job: job list not readable, nothing recorded: %s' % str(e)[:200])
+    for arg in args:
+        jid, _, model = arg.partition('=')
+        j = jobs.get(jid)
+        if not j or j['mode'] != JOB_TRUSTED or not j['profile'] or (not j['enabled'] and j['kind'] == AT_KIND):
+            res[jid] = 'skipped: no recurring or enabled operator job with a stored account'
+        elif '/' not in model or '@' in model or (conf.get('allowed') and model not in conf['allowed']):
+            res[jid] = 'skipped: %r is no provider/model in %s (name no account)' % (model, '.'.join(CFG_MODELS))
+        elif jid in state.get('unsure', {}):
+            res[jid] = 'skipped: the outcome of its last rebind is not known yet; run this again after the next pass'
+        else:
+            ref = res[jid] = j['ref']
+            parked = MODEL(ref) != model
+            if parked:
+                state.setdefault('home', {})[jid] = {'model': model, 'parked': ref, 'at': NOW(), 'wait': 0}
+                res[jid] += ' (home %s)' % model
+            else:
+                state.get('home', {}).pop(jid, None)   # the operator says it is home now: no older return stands
+            journal('job_adopt', job=jid, ref=ref, **({'home': model} if parked else {}))
+    save(state)
+    print(json.dumps(res, indent=1, ensure_ascii=False))
+
+
 def order_pass(state, health, conf, jobs, out):
     """auth.order decides only where unpinned work starts (new chats, subagents), and OpenClaw does not skip an account
     this script holds. So per provider with a non-empty order and a preference for some of its models: each such model
@@ -2369,6 +2408,11 @@ def main():
         lock = open(SDIR / 'lock', 'w')
         fcntl.flock(lock, fcntl.LOCK_EX)   # waits for a running pass, so its save cannot overwrite this one
         return adopt(load_state(), sys.argv[sys.argv.index('--adopt') + 1:])
+    if '--adopt-job' in sys.argv:
+        SDIR.mkdir(parents=True, exist_ok=True)
+        lock = open(SDIR / 'lock', 'w')
+        fcntl.flock(lock, fcntl.LOCK_EX)   # waits for a running pass, so its save cannot overwrite this one
+        return adopt_jobs(load_state(), sys.argv[sys.argv.index('--adopt-job') + 1:])
     if '--check' in sys.argv:
         try:
             ver, missing = openclaw_version(), selfcheck()

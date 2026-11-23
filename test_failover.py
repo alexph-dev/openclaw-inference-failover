@@ -2781,6 +2781,171 @@ def test_failed_rebind_retried_ok_next_pass_does_not_fail_that_pass():
     assert rc == 0 and not err and 'rebind:x' not in st['problems'], (rc, err, st)
 
 
+SOL, SOL_A = 'openai/gpt-6.1-sol', 'openai:default'
+OPENAI_OUT = {SOL_A: 'rate_limit', OA: 'rate_limit', 'openai:b': 'rate_limit'}
+OPENAI_OK = {SOL_A: 'ok', OA: 'ok', 'openai:b': 'ok'}
+ANTHROPIC_OK = {PA: 'ok', PB: 'ok', PC: 'ok'}
+XAI_OUT = {'xai:x': 'rate_limit'}
+
+
+def rebind_outside(d, jid, ref):
+    """A change of the job's binding that this script did not make (the operator, or an edit that landed late)."""
+    c = sqlite3.connect(d / 'state.sqlite')
+    jj = json.loads(c.execute('select job_json from cron_jobs where job_id=?', (jid,)).fetchone()[0])
+    jj['payload']['model'], jj['inferenceBinding'] = ref, {'profileId': ref.split('@', 1)[1]}
+    c.execute('update cron_jobs set job_json=? where job_id=?', (json.dumps(jj), jid))
+    c.commit()
+    c.close()
+
+
+def patch_state(d, **kw):
+    s = state_of(d)
+    s.update(kw)
+    (d / 'st' / 'state.json').write_text(json.dumps(s))
+
+
+def parked_job(**kw):
+    """Job 'j' of SOL, moved across providers to Opus on PB by a real pass while every OpenAI account is out."""
+    d = setup({'j': (SOL, SOL_A, 'trusted')}, [], {'openai': OPENAI_OUT, 'anthropic': ANTHROPIC_OK, 'xai': XAI_OUT}, **kw)
+    go(d)
+    assert binding(d, 'j') == OPUS + '@' + PB and state_of(d)['home']['j']['model'] == SOL, state_of(d)
+    return d
+
+
+def test_job_keeps_its_home_through_repeated_moves_until_it_returns():
+    # Production 17-18 Nov: a job parked on Opus had its Opus account changed outside this script, and the next pass
+    # took that for a new home. Each go() is a new process, so every step also proves the home survives a restart.
+    d = parked_job()
+    rebind_outside(d, 'j', OPUS + '@' + PA)                            # same fallback model, another account
+    go(d, True)
+    h = state_of(d)['home'].get('j')
+    assert h and h['model'] == SOL and h['parked'] == OPUS + '@' + PA, state_of(d)['home']
+    assert binding(d, 'j') == OPUS + '@' + PA                          # nothing to do while OpenAI is out
+    prefer(d, {'prefer': {OPUS: [PC, PA, PB]}})                        # the account preference moves it on the fallback
+    fake(d, retest={OPUS + '@' + PC: RT_OK})
+    go(d, True)
+    assert binding(d, 'j') == OPUS + '@' + PC, binding(d, 'j')
+    assert state_of(d)['home']['j']['model'] == SOL and state_of(d)['home']['j']['parked'] == OPUS + '@' + PC
+    fake(d, probe={'openai': OPENAI_OUT, 'anthropic': DEAD, 'xai': {'xai:x': 'ok'}})   # a second provider move
+    go(d, True)
+    assert binding(d, 'j') == 'xai/grok-4.7@xai:x' and state_of(d)['home']['j']['model'] == SOL, state_of(d)['home']
+    go(d, True)
+    assert binding(d, 'j') == 'xai/grok-4.7@xai:x' and state_of(d)['home']['j']['model'] == SOL
+    fake(d, probe={'openai': OPENAI_OK, 'anthropic': DEAD, 'xai': {'xai:x': 'ok'}})
+    patch_state(d, home=dict(state_of(d)['home'], j=dict(state_of(d)['home']['j'], at=0, wait=0)))
+    rc, err, j = go(d, True)
+    assert binding(d, 'j') == SOL + '@' + SOL_A and not state_of(d)['home'], (err, j)
+    assert kinds(j, 'job_move')[-1]['why'] == 'home', j
+    prefer(d, {'prefer': {SOL: [OA, SOL_A]}})                          # once home, the preference only changes account
+    fake(d, retest={SOL + '@' + OA: RT_OK})
+    patch_state(d, pref_moved={})
+    go(d, True)
+    assert binding(d, 'j') == SOL + '@' + OA and not state_of(d)['home'], binding(d, 'j')
+
+
+def test_operator_choice_of_another_model_for_a_parked_job_still_stands():
+    d = parked_job()
+    rebind_outside(d, 'j', FABLE + '@' + PA)
+    go(d, True)
+    assert 'j' not in state_of(d)['home'], state_of(d)['home']
+    fake(d, probe={'openai': OPENAI_OK, 'anthropic': ANTHROPIC_OK, 'xai': XAI_OUT})
+    go(d, True)
+    assert binding(d, 'j') == FABLE + '@' + PA
+
+
+def test_job_home_survives_an_ambiguous_rebind_that_lands_or_lands_late():
+    # A cross-provider edit times out but landed: the next pass adopts it with the original home and clears the problem.
+    d = parked_job()
+    fake(d, probe={'openai': OPENAI_OUT, 'anthropic': DEAD, 'xai': {'xai:x': 'ok'}}, edit_result='rc=124 timeout')
+    rc, err, j = go(d, True)
+    assert rc == 1 and state_of(d)['unsure']['j']['own'] == SOL, (err, j)
+    fake(d, edit_result='ok')
+    rc, err, j = go(d)
+    s = state_of(d)
+    assert rc == 0 and not s['unsure'] and 'rebind:j' not in s['problems'], (err, s)
+    assert s['home']['j']['model'] == SOL and s['home']['j']['parked'] == 'xai/grok-4.7@xai:x', s['home']
+    # An account edit not visible on the next pass, which lands after that pass gave up on it: still on its way home.
+    d = parked_job()
+    patch_state(d, unsure={'j': {'own': SOL, 'tgt': OPUS + '@' + PA, 'frm': OPUS + '@' + PB, 'why': 'preference'}})
+    go(d)
+    assert not state_of(d)['unsure'] and binding(d, 'j') == OPUS + '@' + PB
+    rebind_outside(d, 'j', OPUS + '@' + PA)
+    go(d, True)
+    h = state_of(d)['home'].get('j')
+    assert h and h['model'] == SOL and h['parked'] == OPUS + '@' + PA, state_of(d)['home']
+
+
+def test_adopt_job_returns_an_operator_moved_job_through_the_normal_path():
+    # The job's record lost its model; the operator names only the MODEL. The account comes from normal selection.
+    d = setup({'j': (OPUS, PB, 'trusted')}, [], {'openai': OPENAI_OUT, 'anthropic': ANTHROPIC_OK, 'xai': XAI_OUT})
+    go(d)
+    assert not state_of(d)['home']
+    rc, err, j = go(d, False, '--adopt-job', 'j=' + SOL)
+    a, = kinds(j, 'job_adopt')
+    assert rc == 0 and (a['job'], a['ref'], a['home']) == ('j', OPUS + '@' + PB, SOL), (err, a)
+    assert state_of(d)['home']['j']['parked'] == OPUS + '@' + PB and binding(d, 'j') == OPUS + '@' + PB
+    go(d, True)                                                        # its model is still out: it waits, no edit
+    assert binding(d, 'j') == OPUS + '@' + PB and state_of(d)['home']['j']['model'] == SOL
+    fake(d, probe={'openai': {SOL_A: 'rate_limit', OA: 'ok', 'openai:b': 'ok'}, 'anthropic': ANTHROPIC_OK, 'xai': XAI_OUT})
+    rc, err, j = go(d, True)
+    m = kinds(j, 'job_move')[-1]
+    assert (m['to'], m['why']) == (SOL + '@' + OA, 'home') and not state_of(d)['home'], (err, m)
+
+
+def test_adopt_job_refuses_what_the_normal_path_could_not_return():
+    d = setup({'j': (OPUS, PB, 'trusted'), 'legacy': (OPUS, PB, 'account'), 'once': (OPUS, PB, 'trusted')}, [],
+              {'openai': OPENAI_OUT, 'anthropic': ANTHROPIC_OK, 'xai': XAI_OUT}, sched={'once': ('at', 60)})
+    c = sqlite3.connect(d / 'state.sqlite')
+    c.execute("update cron_jobs set enabled=0 where job_id='once'")
+    c.commit()
+    c.close()
+    rc, err, j = go(d, False, '--adopt-job', 'j=' + SOL + '@' + SOL_A)  # no allowlist to catch it: an account is refused
+    assert rc == 0 and not kinds(j, 'job_adopt') and not state_of(d).get('home'), (err, j)
+    cfg_ = json.loads((d / 'cfg.json').read_text())
+    cfg_['agents']['defaults']['models'] = {m: {} for m in (OPUS, FABLE, SOL, 'xai/grok-4.7')}
+    (d / 'cfg.json').write_text(json.dumps(cfg_))
+    go(d)
+    for arg in ('j', 'j=gpt-6.1-sol', 'j=' + SOL + '@' + SOL_A, 'j=openai/old-model', 'legacy=' + SOL, 'once=' + SOL,
+                'missing=' + SOL):
+        rc, err, j = go(d, False, '--adopt-job', arg)
+        assert rc == 0 and not kinds(j, 'job_adopt') and not state_of(d)['home'], (arg, err, j)
+    # While a rebind's outcome is unknown, its reconciliation owns the home: an adoption would be overwritten by it.
+    patch_state(d, unsure={'j': {'own': OPUS, 'tgt': 'xai/grok-4.7@xai:x', 'frm': OPUS + '@' + PB, 'why': 'out'}})
+    rc, err, j = go(d, False, '--adopt-job', 'j=' + SOL)
+    assert rc == 0 and not kinds(j, 'job_adopt') and not state_of(d)['home'] and state_of(d)['unsure'], (err, j)
+    patch_state(d, unsure={})
+    # MODEL equal to the current model: the operator says it is home now, so an older return is dropped.
+    go(d, False, '--adopt-job', 'j=' + SOL)
+    assert state_of(d)['home']['j']['model'] == SOL
+    rc, err, j = go(d, False, '--adopt-job', 'j=' + OPUS)
+    assert rc == 0 and 'j' not in state_of(d)['home'] and 'home' not in kinds(j, 'job_adopt')[-1], (err, j)
+
+
+def test_adopted_job_yields_to_a_later_operator_model_choice():
+    d = setup({'j': (OPUS, PB, 'trusted')}, [], {'openai': OPENAI_OUT, 'anthropic': ANTHROPIC_OK, 'xai': XAI_OUT})
+    go(d)
+    go(d, False, '--adopt-job', 'j=' + SOL)
+    rebind_outside(d, 'j', FABLE + '@' + PA)
+    fake(d, probe={'openai': OPENAI_OK, 'anthropic': ANTHROPIC_OK, 'xai': XAI_OUT})
+    go(d, True)
+    assert binding(d, 'j') == FABLE + '@' + PA and 'j' not in state_of(d)['home'], state_of(d)['home']
+
+
+def test_adopt_job_with_an_unreadable_job_list_records_nothing():
+    d = setup({'j': (OPUS, PB, 'trusted')}, [], {'openai': OPENAI_OUT, 'anthropic': ANTHROPIC_OK, 'xai': XAI_OUT})
+    go(d)
+    before = state_of(d)
+    env = dict(os.environ, OCF_STATE=str(d / 'st'), OCF_STATE_DB='file:%s?mode=ro' % (d / 'state.sqlite'),
+               OCF_FAKE_DB=str(d / 'state.sqlite'), OCF_CONFIG=str(d / 'cfg.json'), OCF_LOG_DIR=str(d / 'logs'),
+               OCF_FAKE=str(d / 'fake.json'), OCF_DIST=str(d / 'pkg' / 'dist'), OCF_OPENCLAW_DIR=str(d / 'oc'),
+               OCF_FAKE_CALLS=str(d / 'calls.log'), OCF_SETTINGS=str(d / 'settings.json'), OCF_FAKE_CLI_DOWN='1',
+               PATH=str(d / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+    p = subprocess.run([sys.executable, str(HERE / os.environ.get('OCF_SCRIPT', 'failover.py')), '--adopt-job',
+                        'j=' + SOL], env=env, capture_output=True, text=True)
+    assert p.returncode == 1 and 'nothing recorded' in p.stderr and 'Traceback' not in p.stderr, p.stderr
+    assert state_of(d) == before
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:
