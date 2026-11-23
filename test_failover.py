@@ -589,6 +589,39 @@ def test_pinned_chat_parked_on_a_fallback_model_returns_to_its_own_model():
     assert len(kinds(go(d)[2], 'chat_return')) == 1                   # no second move: that choice stands
 
 
+def test_chat_the_operator_moved_to_a_fallback_model_returns_after_adopt_with_its_model():
+    # The operator moved a chat off Fable to Grok by hand; --adopt KEY=MODEL makes it go home like a parked chat.
+    grok = {'providerOverride': 'xai', 'modelOverride': 'grok-4.7', 'modelOverrideSource': 'user', 'authProfileOverride': 'xai:x'}
+    d = setup(probe={'anthropic': {PB: 'rate_limit', PA: 'ok', PC: 'rate_limit'}, 'xai': {'xai:x': 'ok'}}, entries={K: grok})
+    (d / 'st').mkdir()
+    (d / 'st' / 'state.json').write_text('{}')
+    assert not kinds(go(d)[2], 'chat_return')                         # a person's pick: never moved without adopt
+    c = json.loads((d / 'cfg.json').read_text())
+    c['agents']['defaults']['models'] = {OPUS: {}, FABLE: {}, 'xai/grok-4.7': {}}
+    (d / 'cfg.json').write_text(json.dumps(c))
+    rc, err, j = go(d, False, '--adopt', K + '=openai/old-model')     # a home the allowlist dropped is refused
+    assert rc == 0 and not kinds(j, 'chat_adopt') and not state_of(d).get('chat_home'), (err, j)
+    rc, err, j = go(d, False, '--adopt', K + '=' + FABLE)
+    a, = kinds(j, 'chat_adopt')
+    assert rc == 0 and (a['session'], a['home']) == (K, FABLE), (err, j)
+    r, = kinds(go(d, True)[2], 'chat_return')                         # stale probe: anthropic is probed again
+    assert (r['session'], r['to'], r['result']) == (K, FABLE + '@' + PA, 'ok'), r
+    assert K not in state_of(d).get('chat_home', {})
+
+
+def test_adopt_with_a_bare_model_or_the_current_model_parks_nothing():
+    grok = {'providerOverride': 'xai', 'modelOverride': 'grok-4.7', 'modelOverrideSource': 'user', 'authProfileOverride': 'xai:x'}
+    d = setup(probe={'anthropic': {PB: 'rate_limit', PA: 'ok', PC: 'rate_limit'}, 'xai': {'xai:x': 'ok'}}, entries={K: grok})
+    (d / 'st').mkdir()
+    (d / 'st' / 'state.json').write_text(json.dumps({'chat_home': {K: {'model': FABLE, 'parked': 'xai/grok-4.7@xai:x'}}}))
+    rc, err, j = go(d, False, '--adopt', K + '=claude-fable-5-2')      # no provider: refused, the old home stays
+    assert rc == 0 and not kinds(j, 'chat_adopt') and state_of(d)['chat_home'][K]['model'] == FABLE, (err, j)
+    rc, err, j = go(d, False, '--adopt', K + '=xai/grok-4.7')         # the operator says grok is home now
+    a, = kinds(j, 'chat_adopt')
+    assert rc == 0 and 'home' not in a and K not in state_of(d).get('chat_home', {}), (err, j)
+    assert not kinds(go(d, True)[2], 'chat_return')
+
+
 def test_cron_run_that_failed_on_a_limit_is_never_continued_like_a_chat():
     d = setup({STALL_JOB: (OPUS, PB, 'trusted')}, log=[req(STALL_KEY, 'R9'), end('R9')], probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}},
               sessions={STALL_KEY: {'key': STALL_KEY, 'hasActiveRun': False, 'lastRunId': 'R9', 'status': 'failed',
