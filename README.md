@@ -232,6 +232,8 @@ Requirements and limits:
   queue is empty, the watchdog still owns the selection, and the original model is not held on that account. Selecting
   the configured primary clears its model override in OpenClaw, including when the original session inherited that
   default.
+- A job parked on a fallback keeps its original model when only the fallback's account changes, including a change
+  made outside this script. Moving it to another model cancels the return, and that choice stands.
 - If a chat's or job's original model leaves the non-empty `agents.defaults.models` allowlist, its saved return is
   dropped (`home_gone` in the journal), leaving it on its current model without a problem. A permanent
   `model not allowed` refusal during a return does the same.
@@ -252,6 +254,10 @@ verified. The default remains enabled for installations that allow local model c
   preference may move them; with `=MODEL` the operator moved the chat off its own model MODEL to a fallback, and it
   goes back to MODEL like a chat this script parked once an account of MODEL is live. Changes no chat itself (journal
   `chat_adopt`).
+- `failover.py --adopt-job JOB=MODEL...`: records that the operator moved this trusted job off its own model MODEL. The
+  job returns to MODEL like a job this script parked, on the account the normal selection picks once one is live, so
+  MODEL names no account. MODEL equal to the current model drops an older return. A job whose last edit has an unknown
+  outcome is skipped until the next pass settles it. Changes no job itself (journal `job_adopt`).
 - `failover.py --status`: open problems, held model@account pairs, the preference, and jobs and chats parked on a fallback model, as
   JSON.
 
