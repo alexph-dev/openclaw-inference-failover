@@ -49,7 +49,8 @@ whole account: a probe that answers ok for one model says nothing about another 
   failover.py --apply    act
   failover.py --check    self-check of the OpenClaw surfaces it reads plus the 24 h check; exit 1 with problems
   failover.py --status   open problems, held model@account pairs, work parked on a fallback model (JSON)
-  failover.py --adopt KEY...   record that the current account of these chats was set by the operator, not a person
+  failover.py --adopt KEY[=MODEL]...   record that the current account of these chats was set by the operator, not a
+                         person; =MODEL: the operator moved it off its own model MODEL, which it returns to
 State and journal: ~/.local/state/openclaw-inference-failover (OCF_STATE overrides).
 Settings (optional): ~/.config/openclaw-inference-failover/settings.json (OCF_SETTINGS overrides):
   {"prefer": {"provider/model": ["provider:account", ...]}}
@@ -1902,19 +1903,31 @@ def chats_prefer(state, health, conf, out):
 
 
 def adopt(state, keys):
-    """--adopt KEY...: the operator moved these chats by hand, so their current account is not a person's choice:
-    record it as this script's own (state 'owned'), and the preference may move them. Only human chats with a stored
-    account; anything else is listed as skipped. Changes no chat."""
+    """--adopt KEY[=MODEL]...: the operator moved these chats by hand, so their current account is not a person's choice:
+    record it as this script's own (state 'owned'), and the preference may move them. KEY=MODEL: the operator moved the
+    chat off MODEL, its own model, to a fallback; it then goes home like a chat this script parked (state 'chat_home'),
+    once an account of MODEL is live. Only human chats with a stored account, and only a MODEL the allowlist keeps;
+    anything else is listed as skipped. Changes no chat."""
     conf, res = cfg(), {}
-    for key in keys:
+    for arg in keys:
+        key, _, home = arg.partition('=')
         e, _ = entry(key)
         model, acct = chat_ref(conf, e)
         if not e or not acct or not human_chat(key, None, e):
             res[key] = 'skipped: no human chat with a stored account'
             continue
-        res[key] = '%s@%s' % (model, acct)
-        own(state, key, res[key], e)
-        journal('chat_adopt', session=key, ref=res[key])
+        if home and ('/' not in home or (conf.get('allowed') and home not in conf['allowed'])):
+            res[key] = 'skipped: %s is no provider/model in %s' % (home, '.'.join(CFG_MODELS))
+            continue
+        ref = res[key] = '%s@%s' % (model, acct)
+        own(state, key, ref, e)
+        parked = bool(home) and home != model
+        if parked:
+            state.setdefault('chat_home', {})[key] = {'model': home, 'parked': ref, 'at': NOW(), 'wait': 0}
+            res[key] += ' (home %s)' % home
+        elif home:
+            state.get('chat_home', {}).pop(key, None)   # the operator says it is home now: no older return stands
+        journal('chat_adopt', session=key, ref=ref, **({'home': home} if parked else {}))
     save(state)
     print(json.dumps(res, indent=1, ensure_ascii=False))
 

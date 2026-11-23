@@ -248,8 +248,10 @@ verified. The default remains enabled for installations that allow local model c
 - `failover.py --apply`: one real pass (what the job runs).
 - `failover.py --check`: self-check plus a check of the last 24 hours; prints `{"openclaw": version, "missing": [...],
   "saved_profiles": "ok" or the failure}` and exits 1 with problems.
-- `failover.py --adopt KEY...`: records that the operator set the current account of these chats by hand, so the
-  preference may move them; changes no chat (journal `chat_adopt`).
+- `failover.py --adopt KEY[=MODEL]...`: records that the operator set the current account of these chats by hand, so the
+  preference may move them; with `=MODEL` the operator moved the chat off its own model MODEL to a fallback, and it
+  goes back to MODEL like a chat this script parked once an account of MODEL is live. Changes no chat itself (journal
+  `chat_adopt`).
 - `failover.py --status`: open problems, held model@account pairs, the preference, and jobs and chats parked on a fallback model, as
   JSON.
 
