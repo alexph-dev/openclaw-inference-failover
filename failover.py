@@ -1468,6 +1468,7 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
             else:
                 home.pop(jid, None)
             j['profile'], j['model'], j['ref'], j['since'] = PROF(tgt), tgt, tgt, NOW()
+            state.get('problems', {}).pop('rebind:' + jid, None)   # an earlier failed edit of this job is now fixed
             if r == 'ok':
                 state.setdefault('bindings', {})[jid] = {'model': tgt, 't': j['since']}
             save(state)                      # a pass cut off later must still know where this job came from

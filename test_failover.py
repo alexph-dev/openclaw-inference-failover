@@ -2761,6 +2761,26 @@ def test_local_model_checks_can_be_disabled_without_accepting_unverified_returns
         assert state['limited'][FABLE + '@' + PA] > ms()
 
 
+def test_failed_rebind_retried_ok_next_pass_does_not_fail_that_pass():
+    # 23 Nov 08:08: a rebind timed out while the Gateway was busy and did not land; the next pass rebound the job
+    # fine but still exited 1 for the ledger's second pass, a failure streak for a problem that pass had fixed.
+    d = setup({'x': (OPUS, PA, 'trusted')}, probe={'anthropic': DEAD, 'xai': {'xai:x': 'ok'}})
+    fake(d, edit_result='rc=124 timeout')
+    rc, err, j = go(d, True)
+    assert rc == 1 and 'rebind:x' in state_of(d)['problems'], (err, j)
+    c = sqlite3.connect(d / 'state.sqlite')                           # the timed-out edit did not land after all
+    jj = json.loads(c.execute('select job_json from cron_jobs where job_id=?', ('x',)).fetchone()[0])
+    jj['payload']['model'], jj['inferenceBinding'] = OPUS + '@' + PA, {'profileId': PA}
+    c.execute('update cron_jobs set job_json=? where job_id=?', (json.dumps(jj), 'x'))
+    c.commit()
+    c.close()
+    fake(d, edit_result='ok')
+    rc, err, j = go(d, True)
+    st = state_of(d)
+    assert binding(d, 'x') == 'xai/grok-4.7@xai:x' and kinds(j, 'job_move')[-1]['result'] == 'ok', (err, j)
+    assert rc == 0 and not err and 'rebind:x' not in st['problems'], (rc, err, st)
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:
