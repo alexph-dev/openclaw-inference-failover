@@ -10,13 +10,14 @@ import failover as F                                                  # names of
 
 
 def offline(test):
-    """Unit tests that mock APPLY must never write to the operator's actual state/journal."""
+    """Unit tests that mock APPLY must never write to the operator's actual state/journal. Each starts its own pass
+    clock: F.T0 is set at import, so a late test in a long suite would otherwise look like a pass out of time."""
     @functools.wraps(test)
     def wrapped():
         with tempfile.TemporaryDirectory(prefix='ocf-unit-') as tmp:
             d = pathlib.Path(tmp)
             with patch.object(F, 'SDIR', d), patch.object(F, 'STATE', d / 'state.json'), \
-                    patch.object(F, 'JOURNAL', d / 'journal.jsonl'):
+                    patch.object(F, 'JOURNAL', d / 'journal.jsonl'), patch.object(F, 'T0', time.time()):
                 return test()
     return wrapped
 ERR = 'Automation candidate is incompatible with its recorded inference account and route.'
