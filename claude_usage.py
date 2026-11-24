@@ -12,8 +12,8 @@ Code login (CLAUDE_CONFIG_DIR) per OpenClaw account, only to read, per account:
 It never sends a model request and never writes anything but its own snapshot file and the logins it owns.
 
 Logins. Settings 'usage' (in the failover's settings file) maps an OpenClaw account to its login:
-  {"anthropic:chit": {"dir": "~/.config/claude-usage/chit", "email": "duckiechalic@gmail.com"},
-   "anthropic:sam":  {"dir": "~/.config/claude-usage/sam", "email": "sam.kpg5stars@gmail.com", "borrow": "~/.claude"}}
+  {"anthropic:chit": {"dir": "~/.config/claude-usage/chit", "email": "chit@example.com"},
+   "anthropic:sam":  {"dir": "~/.config/claude-usage/sam", "email": "sam@example.com", "borrow": "~/.claude"}}
   dir     a login this module owns: made once with
           CLAUDE_CONFIG_DIR=<dir> claude auth login --claudeai
           Its access token is refreshed here when it is about to expire (the same refresh-token grant Claude Code
