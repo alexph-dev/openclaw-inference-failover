@@ -297,6 +297,23 @@ runtime/account guidance introduced in 2026.11.10-beta.1. Legacy refusal receipt
 CLI-login, and replaced-authorization refusals are operational errors, not usage-limit signals; they do not cause
 a model/account limit hold. Provider rate-limit detection keeps its existing checks.
 
+## PII check before contributing a push
+
+This repository includes an executable `.githooks/pre-push` that runs `tools/pii_push_gate.py` with Python 3 and Git. It checks every outgoing commit, including content introduced and deleted between the remote tip and the pushed tip. New branches and tags scan reachable commits not already in remote-tracking history; if no such history is available, they scan all reachable commits. The hook checks ref names, commit and annotated tag messages, changed filenames, and changed file contents. It blocks likely email addresses, phone numbers, labeled private IDs and account numbers, common credential formats, private data file types and names, binary files, and files over 2 MiB. It reports a category, commit, and safe location without printing a matched value. Git author and committer names and emails are excluded because they are expected Git identity metadata; configure your Git identity with a public address before committing if that metadata must remain private. A fixed public Claude co-author address in an existing commit trailer is also treated as automation identity.
+
+Check the hook dispatch path in each clone:
+
+```sh
+git config --show-origin --get core.hooksPath
+test -x .githooks/pre-push
+```
+
+On hosts where the existing global hooks path invokes executable repository `.githooks/pre-push`, no local configuration is needed. If there is no configured hooks path, use `git config --local core.hooksPath .githooks`. If another hooks path is configured, add a call to this repository hook in that dispatcher while forwarding Git's pre-push standard input and arguments; changing the local hooks path would bypass the other checks. A clone must install or dispatch the hook locally. `git push --no-verify`, a different client, or GitHub's web UI can bypass a local hook. GitHub secret push protection is separate and covers its supported secret patterns; CI runs after upload and cannot prevent a PII upload.
+
+The check is deliberately conservative for this source-only repository. Reserved `example.com`, `example.net`, and `example.org` email examples pass. Private file names such as `.env`, credential files, databases, spreadsheets, and PDFs are blocked regardless of content. Plain names, street addresses, unlabeled identifiers, novel credential formats, and arbitrary personal details cannot be reliably recognized by these patterns. Review changes before pushing; a server-side policy is needed to enforce this for every contributor and upload route.
+
+Run its push-boundary tests with `python3 -m unittest discover -s tests -p 'test_pii_push_gate.py'`. The tests use temporary local bare remotes and never send their synthetic payloads to GitHub.
+
 ## Removal
 
 Remove the job (`openclaw cron list` shows its id, then `openclaw cron rm <id>`), then delete the clone and
