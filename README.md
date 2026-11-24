@@ -13,8 +13,9 @@ fixed, and delete the whole script when all of them are.
 ## What it does
 
 A limit is always one model on one account (model@account), never a whole account: a probe that answers ok for one
-model says nothing about another model on that account. The targets of a provider are the accounts a non-empty
-`auth.order` list names for it, in that order; a provider without one (no key, or an empty list) has all its
+model says nothing about another model on that account. The targets of a provider are the accounts its non-empty
+stored auth order names, or config `auth.order` when no saved override exists. Stored order takes precedence without
+a manual settings or config copy. A provider without either non-empty list has all its
 subscription accounts, declared in config or saved in the agent's auth store (see "Targets" under Requirements and
 limits). After those come the entries of
 `agents.defaults.model.fallbacks`.
@@ -56,8 +57,10 @@ limits). After those come the entries of
   language, saying the chat moved to another model, and to reconcile completed actions and uncertain side effects
   before doing more work, rather than replaying the request. Every limit event the script drops is journaled
   (`event_drop`) with the reason.
-- **Account preference (optional).** A settings file can name, per model, the accounts in the order they should be
-  spent (example below). For such a model a move off a held account goes to the most preferred live account, and work
+- **Account preference.** A saved order supplies the default preference for configured models and models used by
+  watched jobs, chats and parked homes of that provider.
+  An optional settings file can override the preference per model (example below), within the effective targets.
+  For such a model a move off a held account goes to the most preferred live account, and work
   returns to a more preferred account once it is live again: its hold ran out (the reset came on time) or a re-test
   cleared it (the reset came early). Before the first return to that model@account in an hour, one real request of the
   model there must answer (`return_check` in the journal; a limit holds it instead), so work does not bounce back onto
@@ -69,7 +72,7 @@ limits). After those come the entries of
   visible). The model never changes on a return. Moves off held accounts come first in a pass, returns and their
   checks after them. Each job or chat is moved this way at most once an hour, at most 10 jobs and 10 chats per pass,
   journaled as `job_move` / `chat_move` with `why: preference`. The first account of a provider's
-  `auth.order` (where unpinned new chats and subagents start) follows the same preference: each preferred model votes
+  `auth.order`, when no stored override exists, follows the same preference: each preferred model votes
   for its first live account with its weight (enabled jobs and pinned chats on it, the default model one more), and the
   winner goes first when it beats the current first account. It is written with `openclaw config set` as a
   compare-and-set against the order just read, at most once per 15 min per provider (`order_set`); the settings file
@@ -77,19 +80,24 @@ limits). After those come the entries of
   is one per provider, so a model whose preferred account differs from the winner's still starts there (and is moved
   once held). Without a preference for any model of a provider nothing returns between its accounts and its
   `auth.order` is left alone.
+  A stored override remains operator-owned: the saved-order setter has no compare-and-set, so this script never
+  rewrites it or writes a shadowed config order. Unpinned new work therefore starts according to OpenClaw's stored
+  order; computed preferences still govern failover and eligible returns. Clearing the override restores config
+  ordering and its existing compare-and-set writeback.
 - **Order from the accounts' limits (optional, Claude subscriptions).** The owner's rule: get the most out of what is
   paid for, so fill the account whose limit resets earliest first. With `usage` logins in the settings (below),
   `claude_usage.py` reads each account's limits at most every 5 minutes, before a pass decides anything: weekly use
   and reset, each model's own weekly limit (Fable) and reset, the 5-hour window, and the number of free limit
-  resets the account holds (it never claims one). While every account the settings name for a model has a reading
+  resets the account holds (it never claims one). While every account the settings or saved order name for a model has a reading
   of the right account that is under 20 minutes old, the preference for that model is computed from the readings:
   accounts with room for that model (weekly under 100 %, and for Fable its own weekly limit under 100 %) first,
-  earliest reset first, then the full ones, the one back soonest first. Otherwise the settings' order stands. All the
+  earliest reset first, then the full ones, the one back soonest first. Otherwise the named order stands. All the
   rules of the preference above (moves, returns after a real request, at most once an hour, `auth.order`) apply to
   the computed order unchanged; each change of it is journaled as `prefer_order`. The order a model follows now is
   kept in the state as `prefer_eff`, next to `last_pass`, for other readers; a pass whose config check fails (wrong shape or
   not readable) drops it (journal `prefer_order_dropped` with the error), so they fall back to the settings' order rather than an old one.
-  `--status` and `python3 claude_usage.py` show the readings.
+  `--status` and `python3 claude_usage.py` show the readings. For a model without a settings preference, `--status`
+  shows the last pass's saved-derived order alongside `last_pass`, without contacting OpenClaw.
 - **Native Codex failures after tools.** An OpenAI account-limit bookkeeping event and an errored terminal
   delivery receipt for the same run are joined, including across polling passes. Only accounts whose identifiers
   match the log's SHA-256 profile labels are held. The session is rebound for its next turn; the interrupted turn
@@ -121,6 +129,7 @@ limits). After those come the entries of
 | Whether a held model@account answers again | documented CLI: `openclaw infer model run --local --model provider/model@account --prompt ... --json` |
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
 | Model, fallbacks, account order and declared accounts (the targets) | config file (`~/.openclaw/openclaw.json`) |
+| Stored auth order, ahead of config | documented read-only CLI: `openclaw models auth order get --provider <provider> --agent <id> --json`; only `agentId`, `provider`, `order` are consumed |
 | Accounts saved only in the agent's auth store (targets of a provider without a non-empty `auth.order`) | documented CLI: `openclaw models status --json --agent <id>`, `auth.oauth.profiles[]` `profileId`, `provider`, `type` (only when needed) |
 | Chats' pinned model/account and queued input | internal: tables `session_nodes` and `session_pending_inputs` in each agent database (read-only) |
 | The recorded account of a job whose `payload.model` names no account | internal: table `cron_jobs` (`inferenceBinding.profileId`) in `state/openclaw.sqlite` (read-only); `cron list` does not show it |
@@ -197,7 +206,7 @@ Requirements and limits:
   reported as a failure.
 - `openclaw cron list` returns one page of 200 jobs and has no paging option. With more jobs the script reports it
   and watches only the first page.
-- Targets: with a non-empty `auth.order` list for a provider, an account is chosen only when that list names it,
+- Targets: with a non-empty stored order, or config `auth.order` when no stored override exists, an account is chosen only when that list names it,
   whatever the probe reports about it and however it is billed. Without one (no key, or an empty list) the targets are
   every subscription account of the provider: its `oauth` and `token` profiles in `auth.profiles` (config order) and
   in the agent's saved auth store (`openclaw models status --json`, field `auth.oauth.profiles`), each once, `oauth`
@@ -206,12 +215,22 @@ Requirements and limits:
   are the targets and the failure is reported as a problem. A provider whose saved types disagree with the store's
   per-type counts (a plugin credential can override the reported type) or a row whose id names another provider is
   left out the same way. OpenClaw breaks ties by last use; without a preference this script prefers no account, so that order stands. An
-  `api_key` profile is billed per token and is a target only when `auth.order` lists it. Under an empty list
+  `api_key` profile is billed per token and is a target only when the effective explicit order lists it. Under an empty config list
   OpenClaw itself uses no account for unpinned work and its probe answers `unknown` for every one; the script still
   moves pinned work onto those accounts (any order rather than stopping) when the saved store calls their credential
-  usable (ok, expiring or static), and a real limit comes back as a hold from the runs. Without an empty list, an order saved with `openclaw models auth order set` is not read: profiles it
-  leaves out probe `unknown` and are never chosen. Work that can go nowhere else is reported as having no live
+  usable (ok, expiring or static), and a real limit comes back as a hold from the runs. A saved override excludes
+  unlisted accounts even if a settings preference or probe names them. Work that can go nowhere else is reported as having no live
   account.
+- Saved-order semantics were checked against installed OpenClaw 2026.11.3: `src/agents/auth-profiles/explicit-order.ts`,
+  `state-normalization.ts`, and `src/commands/models/auth-order.ts` (bundled in `dist/`). Persisted order is a provider
+  map of profile-id lists in SQLite auth state, separate from credentials. Empty, absent and malformed saved lists
+  normalize to no override; the CLI reports `order: null`, falling back to config. A non-empty saved list wins.
+  The CLI owns agent/shared inheritance and normalization; no credential store is read by this script for order.
+  Order reads use the same selected default agent as existing probes and account checks, never a hard-coded agent:
+  the config's default agent, otherwise `main` if present, otherwise the first discovered agent. This preserves the
+  existing install-wide probe scope rather than introducing per-chat or per-job probe agents. Each configured or
+  watched provider is read at most once per pass, with a bounded timeout. An unreadable, unsupported or wrong-scope answer
+  prevents that pass from changing work and is reported through the existing self-check problem ledger.
 - Holds: a model@account is held until the time its provider named (the delay of a stalled run), or for an hour after
   a failure that named no time. A probe that answers ok (it tests another model) does not end a hold, and nothing
   moves back onto a model while it is held there. A provider can end a limit early (Anthropic resets a weekly limit
