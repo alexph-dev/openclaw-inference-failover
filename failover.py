@@ -10,7 +10,7 @@ whole account: a probe that answers ok for one model says nothing about another 
          (openclaw models status), oauth first, then config order, then saved order. An api_key profile is a target
          only when the effective order lists it. A move to another MODEL is temporary: the job goes back to its own model once an
          account of it is live again. A job is never rerun.
-  prefer stored order, or an explicit per-model preference (settings file, see SETTINGS): a move off a held account goes to the
+  prefer explicit saved order first; otherwise the per-model settings/usage preference (see SETTINGS): a move off a held account goes to the
          most preferred live account, and work of that model returns to a more preferred account once it is live again
          (its hold ran out or a re-test cleared it) and one real request of that model there answered within the hour.
          Moved back: operator cron jobs, and chats this script moved, parked or was told to adopt (--adopt); never a
@@ -58,7 +58,7 @@ State and journal: ~/.local/state/openclaw-inference-failover (OCF_STATE overrid
 Settings (optional): ~/.config/openclaw-inference-failover/settings.json (OCF_SETTINGS overrides):
   {"prefer": {"provider/model": ["provider:account", ...]}}
 """
-import calendar, fcntl, glob, hashlib, json, os, pathlib, re, signal, sqlite3, subprocess, sys, time
+import calendar, fcntl, glob, hashlib, json, os, pathlib, re, signal, sqlite3, subprocess, sys, time, urllib.parse
 
 import claude_usage as CU      # sibling module: Claude subscription limits per account (optional 'usage' settings)
 
@@ -76,7 +76,6 @@ CLI_RUNS = ['cron', 'runs', '--all', '--status', 'error', '--sort', 'desc', '--l
 CLI_EDIT = lambda jid, ref: ['cron', 'edit', jid, '--model', ref, '--timeout', '120000']   # rebind a job to model@account
 CLI_AGENT = lambda key, msg, deliver=True: ['agent', '--session-key', key, '--message', msg] + (['--deliver'] if deliver else []) + ['--timeout', '3600']  # continue on the stored route, or locally
 CLI_MODELS = lambda agent: ['models', 'status', '--json', '--agent', agent]   # the agent's accounts, saved ones too
-CLI_ORDER_GET = lambda provider, agent: ['models', 'auth', 'order', 'get', '--provider', provider, '--agent', agent, '--json']
 AGENT_STOPPED = 'aborted'   # last output line of 'openclaw agent' when its run was stopped (sessions.abort, a stop button)
 AGENT_OUTPUT = lambda unit: ['journalctl', '--user', '-u', unit, '-t', 'openclaw', '-o', 'cat', '--no-pager', '-n', '5']
                             # what 'openclaw agent' printed in a continuation unit (syslog identifier 'openclaw')
@@ -133,6 +132,9 @@ T_PENDING, C_PEND_KEY, C_PEND_STATE = 'session_pending_inputs', 'session_key', '
 PEND_QUEUED = 'queued'                                              # state of a user message not yet answered
 # Cron store (a job's recorded account when payload.model names no account: cron list does not show it)
 STATE_DB_PATH = 'state/openclaw.sqlite'                             # under the OpenClaw state dir
+AUTH_STATE_CELL = ('auth_profile_state', 'state_key', 'state_json', 'primary')
+AUTH_SHARED_CELL = ('config_machine_state', 'state_key', 'value_json', 'authProfiles.state')
+AUTH_OWNER_CELL = ('config_machine_state', 'state_key', 'value_json', 'auth.sharedStore')
 T_CRON, C_CRON_ID, C_CRON_JSON = 'cron_jobs', 'job_id', 'job_json'  # one row per job
 JOB_BINDING = 'inferenceBinding.profileId'                          # the account the job is bound to
 E_MODEL, E_PROVIDER, E_MODEL_SRC = 'modelOverride', 'providerOverride', 'modelOverrideSource'   # entry_json keys
@@ -559,42 +561,110 @@ def with_stored_orders(conf, work_models=()):
     providers.update(v[PROFILE_PROVIDER] for v in conf['profiles'].values()
                      if isinstance(v, dict) and isinstance(v.get(PROFILE_PROVIDER), str))
     stored = {p: o for p in sorted(providers) if (o := stored_order(p))}
-    # A saved list names targets first, just as a settings list does. Explicit
-    # per-model settings retain their priority; usage still computes the live order.
-    base = {model: stored[model.split('/')[0]] for model in sorted(models)
-            if not conf['settings_err'] and model.split('/')[0] in stored}
-    base.update(prefer)
-    eff, src = effective_prefer(base, load_usage()[0])
-    src.update({model: 'stored' for model in base if model not in prefer and model not in src})
+    # Keep the established settings/usage computation when there is no explicit
+    # saved override. A saved list is the person's named priority, so neither a
+    # stale settings list nor computed usage can silently replace it.
+    eff, src = effective_prefer(prefer, load_usage()[0])
+    eff = dict(eff)
+    for model in models:
+        if model.split('/')[0] in stored:
+            eff[model], src[model] = stored[model.split('/')[0]], 'stored'
     return dict(conf, order=dict(configured, **stored), stored_order=stored, prefer=eff, prefer_from=src)
 
 
 def stored_order(provider):
-    """The probe agent's effective saved override, through OpenClaw's read-only CLI.
-    The CLI resolves agent/shared inheritance, aliases and persisted normalization:
-    empty, absent and malformed saved lists become null, so config remains the
-    fallback. Never read credential bytes or accept an answer for another scope.
-    cli_json caches each agent/provider read for this pass only."""
-    agent = default_agent()
-    argv = CLI_ORDER_GET(provider, agent)
-    timeout = min(MS_TIMEOUT_S, PASS_HARD_S - (time.time() - T0))
-    if timeout <= 0:
-        raise Shape('saved auth order: %s: no time left in this pass' % provider)
+    """Declared saved priority, local agent first, then the canonical shared owner.
+    Only nonsecret order metadata is selected, through SQLite mode=ro. No auth CLI
+    admission, runtime refresh, credential read, offline lease or writer is used.
+    Native normalization drops empty/malformed lists; unreadable state is an error,
+    never permission to fall back to config or discover an unlisted API account."""
+    local, shared_uri, shared_cell = auth_order_sources()
+    orders = order_metadata(local, AUTH_STATE_CELL)
+    order = orders.get(provider)
+    if not order and (local, AUTH_STATE_CELL) != (shared_uri, shared_cell):
+        order = order_metadata(shared_uri, shared_cell).get(provider)
+    if any(p.split(':')[0] != provider for p in order or []):
+        raise Shape('saved auth order: %s: profile names another provider' % provider)
+    return list(order or [])
+
+
+def auth_metadata(uri, cell, field, required=False):
+    """Read one selected nonsecret JSON field, never a full auth-state/store cell.
+    Missing rows/tables are native absence. Corruption, permission errors, schema
+    impostors and unavailable required ownership metadata fail closed."""
+    key = ('auth-metadata', uri, cell, field, required)
+    if key in _CACHE:
+        return _CACHE[key]
+    db = None
     try:
-        d = cli_json(argv, timeout)
-    except (Shape, Unreachable) as e:
-        raise Shape('saved auth order: %s (%s)' % (provider, quiet_error(e))) from None
-    order = d.get('order')
-    if d.get('agentId') != agent or d.get('provider') != provider or 'order' not in d or \
-            (order is not None and (not isinstance(order, list) or any(
-                not isinstance(p, str) or not p.strip() or p.split(':')[0] != provider for p in order))):
-        raise Shape('saved auth order: %s: unexpected CLI answer shape or scope' % provider)
-    return list(dict.fromkeys(order or []))
+        parsed = urllib.parse.urlsplit(uri)
+        if parsed.scheme != 'file' or parsed.netloc not in ('', 'localhost') or \
+                urllib.parse.parse_qs(parsed.query).get('mode') != ['ro']:
+            raise Shape('saved auth order: metadata requires a read-only file URI')
+        try:
+            pathlib.Path(urllib.parse.unquote(parsed.path)).stat()
+        except FileNotFoundError:
+            if required:
+                raise Shape('saved auth order: ownership database missing') from None
+            _CACHE[key] = (False, None)
+            return _CACHE[key]
+        timeout = min(2, PASS_HARD_S - (time.time() - T0))
+        if timeout <= 0:
+            raise Shape('saved auth order: no time left in this pass')
+        db = sqlite3.connect(uri, uri=True, timeout=timeout)
+        db.execute('pragma query_only=on')
+        table, key_col, value_col, row_key = cell
+        schema = db.execute('select type from sqlite_master where name=?', (table,)).fetchone()
+        if required and not schema:
+            raise Shape('saved auth order: required ownership metadata table missing')
+        if schema and schema[0] != 'table':
+            raise Shape('saved auth order: unexpected metadata schema')
+        row = db.execute('select json_type(%s, ?), json_extract(%s, ?) from %s where %s=?' %
+                         (value_col, value_col, table, key_col), (field, field, row_key)).fetchone() if schema else None
+        value = json.loads(row[1]) if row and row[0] in ('object', 'array') else row[1] if row else None
+        _CACHE[key] = (row is not None, value)
+        return _CACHE[key]
+    except (OSError, sqlite3.Error, ValueError) as e:
+        raise Shape('saved auth order: metadata unreadable (%s)' % type(e).__name__) from None
+    finally:
+        if db is not None:
+            db.close()
+
+
+def order_metadata(uri, cell):
+    raw = auth_metadata(uri, cell, '$.order', required=cell == AUTH_SHARED_CELL)[1]
+    orders = {}
+    for provider, ids in raw.items() if isinstance(raw, dict) else ():
+        ids = list(dict.fromkeys(x.strip() for x in ids if isinstance(x, str) and x.strip())) if isinstance(ids, list) else []
+        if provider.strip() and ids:
+            orders[provider.strip().lower()] = ids
+    return orders
+
+
+@cached
+def auth_order_sources():
+    """Resolve native shared-state ownership and the same agent used by probes.
+    The relocation marker is mandatory to inspect; an absent marker means the
+    native legacy-main location, while an unreadable/invalid marker is a blocker."""
+    c = json.load(open(CONFIG))
+    agent = default_agent()
+    configured = next((e['agentDir'].strip() for e in dig(c, CFG_AGENTS) or [] if isinstance(e, dict)
+                       and e.get('id') == agent and isinstance(e.get('agentDir'), str)), None)
+    path = pathlib.Path(os.path.expanduser(configured)) / 'openclaw-agent.sqlite' if configured else OC_DIR / AGENT_DB_PATH.format(agent=agent)
+    local = os.environ.get('OCF_AGENT_DB') or path.absolute().as_uri() + '?mode=ro'
+    state = os.environ.get('OCF_STATE_DB') or (OC_DIR / STATE_DB_PATH).absolute().as_uri() + '?mode=ro'
+    present, owner = auth_metadata(state, AUTH_OWNER_CELL, '$', required=True)
+    if present and (not isinstance(owner, dict) or set(owner) != {'location'} or owner['location'] not in ('state-db', 'legacy-main')):
+        raise Shape('saved auth order: invalid shared state owner')
+    if present and owner['location'] == 'state-db':
+        return local, state, AUTH_SHARED_CELL
+    shared = pathlib.Path(os.path.expanduser((os.environ.get('OPENCLAW_AGENT_DIR') or '').strip() or str(OC_DIR / 'agents/main/agent')))
+    return local, (shared / 'openclaw-agent.sqlite').absolute().as_uri() + '?mode=ro', AUTH_STATE_CELL
 
 
 def load_settings():
     """The operator's optional settings file: ({model: [accounts in order of preference]}, error or None). A missing
-    file is no preference. An unreadable or wrong one is a problem (main raises it) and counts as no preference, so a
+    file is no settings preference. An unreadable or wrong one is a problem (main raises it) and counts as no settings preference, so a
     typo never stops the rest of the failover. Accounts of another provider than the model's are an error too."""
     if not SETTINGS.exists():
         return {}, None
@@ -2422,10 +2492,11 @@ def status(state):
     now = NOW()
     static = load_settings()[0]
     eff, src = effective_prefer(static, load_usage()[0])
+    eff = dict(eff)
     # Saved-derived models need no settings entry. Report their last applied
     # order beside last_pass without contacting OpenClaw during diagnostics.
     for model, (accounts, source) in (state.get('prefer_eff') or {}).items():
-        if model not in static:
+        if model not in static or source == 'stored':
             eff[model], src[model] = accounts, source
     hm = lambda ms: time.strftime('%d %b %H:%M', time.localtime(ms / 1000))
     print(json.dumps({
@@ -2526,7 +2597,7 @@ def main():
         signal.alarm(0)
         return finish(state, out, {'providers': set()}, {}, Health(conf or {}, {}))
     if conf.get('settings_err'):
-        prob(out, 'settings', conf['settings_err'] + '; no account is preferred until it is fixed')
+        prob(out, 'settings', conf['settings_err'] + '; settings preferences are ignored until it is fixed')
     if conf.get('usage_err'):
         prob(out, 'settings-usage', conf['usage_err'])
     limited = state.setdefault('limited', {})
