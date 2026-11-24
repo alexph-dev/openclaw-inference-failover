@@ -62,6 +62,9 @@ elif a[:2] == ['models', 'status']:
     f = json.load(open(os.environ['OCF_FAKE']))
     print(json.dumps(f.get('models_status', {'auth': {'oauth': {'warnAfterMs': 86400000, 'profiles': [], 'providers': []}}})))
     sys.exit(f.get('models_status_rc', 0))
+elif a[:4] == ['models', 'auth', 'order', 'get']:
+    sys.stderr.write('Cannot admit models.auth: This operation requires exclusive offline state ownership\n')
+    sys.exit(1)
 elif a[:2] == ['config', 'set']:
     f = os.environ['OCF_CONFIG']
     c = json.load(open(f))
@@ -102,6 +105,8 @@ def setup(jobs=None, receipts=(), probe=None, sessions=None, entries=None, log=(
     c = sqlite3.connect(d / 'state.sqlite')
     c.execute('create table cron_jobs(job_id, job_json, enabled, state_json, updated_at)')
     c.execute('create table cron_run_receipts(job_id, status, error_text, started_at_ms)')
+    c.execute('create table config_machine_state(state_key primary key, value_json)')
+    c.execute('insert into config_machine_state values(?,?)', ('auth.sharedStore', '{"location":"state-db"}'))
     for jid, (model, prof, mode) in (jobs or {}).items():
         c.execute('insert into cron_jobs values(?,?,1,?,?)', (jid, json.dumps({
             'name': jid, 'payload': {'model': model + '@' + prof}, 'inferenceBinding': {'profileId': prof},
@@ -115,6 +120,7 @@ def setup(jobs=None, receipts=(), probe=None, sessions=None, entries=None, log=(
     c = sqlite3.connect(a / 'openclaw-agent.sqlite')
     c.execute('create table session_nodes(session_key, entry_json)')
     c.execute('create table session_pending_inputs(session_key, state)')
+    c.execute('create table auth_profile_state(state_key primary key, state_json)')
     c.commit()
     c.close()
     (d / 'bin').mkdir()
@@ -138,6 +144,21 @@ def pkg_strings(pkg, strings):
 
 
 def fake(d, **kw):
+    if 'saved_orders' in kw:
+        # Persist native nonsecret auth state in actual SQLite fixtures. The auth
+        # CLI deliberately refuses online access, exactly as the installed build.
+        for db in (d / 'oc' / 'agents').glob('*/agent/openclaw-agent.sqlite'):
+            with sqlite3.connect(db) as c:
+                c.execute('delete from auth_profile_state')
+        for agent, orders in kw.pop('saved_orders').items():
+            db = d / 'oc' / 'agents' / agent / 'agent' / 'openclaw-agent.sqlite'
+            db.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(db) as c:
+                c.execute('create table if not exists session_nodes(session_key, entry_json)')
+                c.execute('create table if not exists session_pending_inputs(session_key, state)')
+                c.execute('create table if not exists auth_profile_state(state_key primary key, state_json)')
+                c.execute('insert or replace into auth_profile_state values(?,?)',
+                          ('primary', json.dumps({'version': 1, 'order': orders})))
     f = d / 'fake.json'
     cur = json.loads(f.read_text()) if f.exists() else {}
     cur.update(kw)
@@ -1152,7 +1173,7 @@ def test_models_status_is_not_read_when_every_provider_has_an_order():
     fake(d, models_status_rc=1)
     rc, err, j = go(d, True)
     assert {r['to'] for r in kinds(j, 'job_move')} == {'xai/grok-4.7@xai:x'}, (err, j)
-    assert not [x for x in calls(d) if x.startswith('models')] and 'models status' not in err, (calls(d), err)
+    assert not [x for x in calls(d) if x.startswith('models status')] and 'models status' not in err, (calls(d), err)
 
 
 def test_failed_models_status_falls_back_to_config_and_never_hides_no_target():
@@ -2228,6 +2249,211 @@ def order(d):
     return json.loads((d / 'cfg.json').read_text())['auth']['order']['anthropic']
 
 
+def test_stored_order_owns_targets_and_supplies_the_model_preference():
+    person = dict(PIN, modelOverride=OPUS.split('/')[1], authProfileOverride=PA)
+    d = setup({'j': (OPUS, PA, 'trusted')}, [], ALL_OK, entries={K: person})
+    fake(d, saved_orders={'main': {'anthropic': [PC, PA]}}, retest={OPUS + '@' + PC: RT_OK})
+    # Config names PB first. The saved override excludes PB and names PC first;
+    # no manual settings copy is needed for a preferred-account return.
+    rc, err, j = go(d, True)
+    assert binding(d, 'j') == OPUS + '@' + PC, (err, j)
+    assert kinds(j, 'prefer_order')[0]['order'] == [PC, PA], j
+    assert order(d) == [PB, PA, PC] and not kinds(j, 'order_set'), j
+    assert not kinds(j, 'chat_move') and json.loads((d / 'fake.json').read_text())['entries'][K] == person, j
+    assert rc == 0, err
+    st = subprocess.run([sys.executable, str(HERE / 'failover.py'), '--status'], capture_output=True, text=True,
+                        env=dict(os.environ, OCF_STATE=str(d / 'st'), OCF_SETTINGS=str(d / 'settings.json')))
+    status = json.loads(st.stdout)
+    assert status['prefer'][OPUS] == [PC, PA] and status['prefer_settings'] == {}, status
+
+
+def test_stored_order_limits_preferences_and_never_enables_an_unlisted_api_key():
+    for saved, want in (([PA, PC], PC), ([PA, 'anthropic:k', PC], 'anthropic:k')):
+        d = setup({'j': (OPUS, PA, 'trusted')}, [],
+                  {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok', 'anthropic:k': 'ok'}})
+        prefer(d, {'prefer': {OPUS: [PB, 'anthropic:k', PC, PA]}})
+        fake(d, saved_orders={'main': {'anthropic': saved}})
+        rc, err, j = go(d, True)
+        assert binding(d, 'j') == OPUS + '@' + want and rc == 0, (err, j)
+        assert order(d) == [PB, PA, PC] and not kinds(j, 'order_set'), j
+
+
+def test_empty_absent_and_malformed_persisted_orders_fall_back_to_config():
+    for raw in (None, [], 'bad', {}, [None, 7, '  ']):
+        d = setup({'j': (OPUS, PA, 'trusted')}, [], {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
+        fake(d, saved_orders={'main': {'anthropic': raw}})
+        rc, err, j = go(d, True)
+        assert binding(d, 'j') == OPUS + '@' + PB and rc == 0, (raw, err, j)
+        assert not kinds(j, 'prefer_order') and not kinds(j, 'order_set'), (raw, j)
+    # A normalized empty saved order does not erase the existing empty-config
+    # subscription fallback, nor does it admit an undeclared API-key profile.
+    d = setup({'j': (OPUS, PA, 'trusted')}, [], {'anthropic': {PA: 'rate_limit', PC: 'ok', 'anthropic:k': 'ok'}})
+    c = json.loads((d / 'cfg.json').read_text())
+    c['auth'] = {'order': {'anthropic': []}, 'profiles': SUBS}
+    (d / 'cfg.json').write_text(json.dumps(c))
+    fake(d, saved_orders={'main': {'anthropic': []}})
+    assert binding_after_pass(d, 'j') == OPUS + '@' + PC
+
+
+def binding_after_pass(d, jid):
+    rc, err, j = go(d, True)
+    assert rc == 0, (err, j)
+    return binding(d, jid)
+
+
+def test_order_read_is_scoped_to_the_selected_agent_and_reloaded_each_pass():
+    d = setup({'j': (OPUS, PA, 'trusted')}, [], {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
+    c = json.loads((d / 'cfg.json').read_text())
+    c['agents']['list'] = [{'id': 'main'}, {'id': 'worker', 'default': True}]
+    (d / 'cfg.json').write_text(json.dumps(c))
+    fake(d, saved_orders={'main': {'anthropic': [PB]}, 'worker': {'anthropic': [PC]}})
+    assert binding_after_pass(d, 'j') == OPUS + '@' + PC
+    assert not any(x.startswith('models auth') for x in calls(d)), calls(d)
+    fake(d, saved_orders={'worker': {'anthropic': [PB]}}, probe={'anthropic': {PC: 'rate_limit', PB: 'ok'}})
+    assert binding_after_pass(d, 'j') == OPUS + '@' + PB
+
+
+def test_stored_order_covers_models_named_only_by_jobs_chats_or_parked_homes():
+    for surface in ('job', 'chat', 'home'):
+        d = setup({'j': (OPUS if surface == 'job' else SOL, PA if surface == 'job' else OA, 'trusted')}
+                  if surface != 'chat' else {}, probe={'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'}},
+                  entries={K: dict(PIN, authProfileOverride=PA)} if surface == 'chat' else {})
+        c = json.loads((d / 'cfg.json').read_text())
+        c['agents']['defaults']['model'] = {'primary': SOL, 'fallbacks': []}
+        c['auth'] = {'order': {'openai': [OA]}}
+        (d / 'cfg.json').write_text(json.dumps(c))
+        if surface == 'home':
+            prefer(d, {}, state={'home': {'j': {'model': OPUS, 'parked': SOL + '@' + OA, 'at': 0, 'wait': 0}}})
+        fake(d, saved_orders={'main': {'anthropic': [PA, PC]}}, models_status=models_status([(PB, 'oauth'), (PC, 'token')]))
+        rc, err, j = go(d, True)
+        moved = kinds(j, 'chat_move' if surface == 'chat' else 'job_move')
+        assert rc == 0 and moved and moved[-1]['to'] == (FABLE if surface == 'chat' else OPUS) + '@' + PC, (surface, err, j)
+
+
+def test_unavailable_order_metadata_blocks_mutation_and_never_selects_an_unlisted_api_key():
+    for broken in ('bad-json', 'wrong-owner', 'wrong-provider', 'wrong-table', 'missing-owner-table'):
+        d = setup({'j': (OPUS, PA, 'trusted')}, [], {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
+        c = json.loads((d / 'cfg.json').read_text())
+        c['auth']['order']['anthropic'] = ['anthropic:k', PB]
+        (d / 'cfg.json').write_text(json.dumps(c))
+        fake(d, probe={'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok', 'anthropic:k': 'ok'}},
+             saved_orders={'main': {'anthropic': [PC, PA]}})
+        with sqlite3.connect(d / 'oc/agents/main/agent/openclaw-agent.sqlite') as db:
+            if broken == 'bad-json':
+                db.execute('update auth_profile_state set state_json=?', ('broken ' + SECRET,))
+            elif broken == 'wrong-provider':
+                db.execute('update auth_profile_state set state_json=?', (json.dumps({'order': {'anthropic': [OA]}}),))
+            elif broken == 'wrong-table':
+                db.execute('drop table auth_profile_state')
+                db.execute('create view auth_profile_state as select 1 as state_key, 2 as state_json')
+        if broken == 'wrong-owner':
+            fake(d, saved_orders={})
+            with sqlite3.connect(d / 'state.sqlite') as db:
+                db.execute('update config_machine_state set value_json=?', (json.dumps({'location': SECRET}),))
+        elif broken == 'missing-owner-table':
+            with sqlite3.connect(d / 'state.sqlite') as db:
+                db.execute('drop table config_machine_state')
+        rc, err, j = go(d, False, '--check')
+        assert rc == 1 and 'saved auth order' in err and SECRET not in err, (err, j)
+        rc, err, j = go(d, True)
+        assert rc == 1 and binding(d, 'j') == OPUS + '@' + PA and not kinds(j, 'order_set'), (err, j)
+        assert SECRET not in err + (d / 'st' / 'journal.jsonl').read_text(), err
+
+
+def test_online_order_reader_uses_committed_wal_metadata_while_auth_cli_is_offline_only():
+    d = setup({'j': (OPUS, PA, 'trusted')}, [], {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
+    fake(d, saved_orders={'main': {'anthropic': [PB, PA]}})
+    path = d / 'oc/agents/main/agent/openclaw-agent.sqlite'
+    with sqlite3.connect(path) as writer:
+        writer.execute('pragma journal_mode=wal')
+        writer.execute('update auth_profile_state set state_json=?', (json.dumps({'order': {'anthropic': [PC, PA]}}),))
+        writer.commit()                      # the committed order is in WAL, beyond the main database image
+        writer.execute('begin immediate')
+        writer.execute('update auth_profile_state set state_json=?', (json.dumps({'order': {'anthropic': [PB]}}),))
+        # A concurrent online reader must see committed PC, not an uncommitted
+        # operator edit, an offline admission error, or the config's unlisted PB.
+        rc, err, j = go(d, True)
+        assert rc == 0 and binding(d, 'j') == OPUS + '@' + PC, (err, j)
+        assert not any(x.startswith('models auth') for x in calls(d)), calls(d)
+        writer.rollback()
+
+
+@offline
+def test_explicit_saved_order_cannot_be_replaced_by_stale_settings():
+    conf = {'primary': OPUS, 'chain': [], 'allowed': {}, 'profiles': {}, 'order': {'anthropic': [PB, PA, PC]},
+            'prefer_static': {OPUS: [PB, PA, PC]}, 'settings_err': None}
+    # Isolate precedence from transport; usage behavior is exercised end to end.
+    with patch.object(F, 'stored_order', return_value=[PC, PA]), \
+            patch.object(F, 'load_usage', return_value=({}, None)):
+        result = F.with_stored_orders(conf)
+    assert result['prefer'][OPUS] == [PC, PA] and result['prefer_from'][OPUS] == 'stored', result
+    assert conf['prefer_static'][OPUS] == [PB, PA, PC], conf
+
+
+@offline
+def test_order_metadata_uses_native_shared_owner_local_precedence_and_configured_agent_directory():
+    d = setup()
+    fake(d, saved_orders={'main': {'anthropic': [PB]}, 'worker': {'anthropic': [PC]}})
+    custom = d / 'custom-agent'
+    custom.mkdir()
+    with sqlite3.connect(custom / 'openclaw-agent.sqlite') as db:
+        db.execute('create table auth_profile_state(state_key primary key, state_json)')
+        db.execute('insert into auth_profile_state values(?,?)', ('primary', json.dumps({'order': {'anthropic': [PA]}})))
+    c = json.loads((d / 'cfg.json').read_text())
+    c['agents']['list'] = [{'id': 'worker', 'default': True, 'agentDir': ' ' + str(custom) + ' '}]
+    (d / 'cfg.json').write_text(json.dumps(c))
+    with sqlite3.connect(d / 'state.sqlite') as db:
+        db.execute('insert into config_machine_state values(?,?)', ('authProfiles.state', json.dumps({'order': {'anthropic': [PC]}})))
+    with patch.object(F, 'CONFIG', str(d / 'cfg.json')), patch.object(F, 'OC_DIR', d / 'oc'), \
+            patch.object(F, '_CACHE', {}), patch.dict(os.environ, {'OCF_STATE_DB': 'file:%s?mode=ro' % (d / 'state.sqlite')}):
+        assert F.stored_order('anthropic') == [PA]                    # configured directory, not worker's default path
+        with sqlite3.connect(custom / 'openclaw-agent.sqlite') as db:
+            db.execute('update auth_profile_state set state_json=?', ('{"order":{"anthropic":[]}}',))
+        F._CACHE.clear()
+        assert F.stored_order('anthropic') == [PC]                    # empty local list inherits current shared state
+        with sqlite3.connect(d / 'state.sqlite') as db:
+            db.execute('update config_machine_state set value_json=? where state_key=?',
+                       ('{"location":"legacy-main"}', 'auth.sharedStore'))
+        F._CACHE.clear()
+        assert F.stored_order('anthropic') == [PB]                    # native legacy owner, ignoring relocated state
+
+
+@offline
+def test_order_reader_never_reads_credential_cells_or_changes_database_bytes():
+    d = setup()
+    fake(d, saved_orders={'main': {'anthropic': [PC, PA]}})
+    path = d / 'oc/agents/main/agent/openclaw-agent.sqlite'
+    with sqlite3.connect(path) as db:
+        db.execute('create table auth_profile_store(store_key primary key, store_json)')
+        db.execute('insert into auth_profile_store values(?,?)', ('primary', SECRET))
+    before = path.read_bytes()
+    native_connect = sqlite3.connect
+    def guarded_connect(db_uri, **kw):
+        assert kw.get('uri') and 'mode=ro' in db_uri, db_uri
+        db = native_connect(db_uri, **kw)
+        db.set_authorizer(lambda action, table, *_: sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ
+                          and table == 'auth_profile_store' else sqlite3.SQLITE_OK)
+        return db
+    with patch.object(F, 'CONFIG', str(d / 'cfg.json')), patch.object(F, 'OC_DIR', d / 'oc'), \
+            patch.object(F, '_CACHE', {}), patch.object(F.sqlite3, 'connect', side_effect=guarded_connect), \
+            patch.dict(os.environ, {'OCF_STATE_DB': 'file:%s?mode=ro' % (d / 'state.sqlite')}):
+        assert F.stored_order('anthropic') == [PC, PA]
+    assert path.read_bytes() == before
+
+
+def test_clearing_saved_order_restores_the_existing_config_compare_and_set_writer():
+    d = setup({'j': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d)
+    fake(d, saved_orders={'main': {'anthropic': [PA, PB, PC]}}, retest={OPUS + '@' + PA: RT_OK})
+    j = go(d, True)[2]
+    assert binding(d, 'j') == OPUS + '@' + PA and not kinds(j, 'order_set') and order(d) == [PB, PA, PC], j
+    fake(d, saved_orders={})
+    j = go(d, True)[2]
+    assert order(d) == [PA, PB, PC] and kinds(j, 'order_set')[-1]['result'] == 'ok', j
+    writes = [x for x in calls(d) if x.startswith('config set auth.order.anthropic')]
+    assert len(writes) == 1 and '--expect-current-json' in writes[0], writes
+
+
 def test_a_move_off_a_held_account_goes_to_the_most_preferred_live_one():
     # Fable is out on PA. auth.order would pick PB next; the preference puts Fable on PC before PB.
     d = setup(probe=ALL_OK, entries={K: dict(PIN, authProfileOverride=PA)})
@@ -2541,6 +2767,36 @@ def usage_setup(answers, emails=None, expiring=()):
     prefer(d, {'prefer': {OPUS: [PB, PA, PC]}, 'usage': usage})
     fake(d, usage_api=api, retest={OPUS + '@' + PA: RT_OK})
     return d
+
+
+def test_saved_override_precedes_computed_usage_and_clear_restores_dynamic_order():
+    now = ms()
+    for complete in (True, False):
+        answers = {PA: usage_answer(85, now + 2 * DAY), PB: usage_answer(40, now + 5 * DAY)}
+        if complete:
+            answers[PC] = usage_answer(100, now + DAY, 98)
+        d = usage_setup(answers)
+        settings = json.loads((d / 'settings.json').read_text())
+        settings['prefer'] = {OPUS: [PC, PB, PA]}
+        prefer(d, settings)
+        fake(d, saved_orders={'main': {'anthropic': [PB, PA, PC]}})
+        rc, err, j = go(d, True)
+        o, = [r for r in kinds(j, 'prefer_order') if r['model'] == OPUS]
+        want = [PB, PA, PC]
+        assert rc == 0 and o['order'] == want and o['source'] == 'stored', (err, j)
+        assert binding(d, 'a') == OPUS + '@' + want[0] and order(d) == [PB, PA, PC], j
+        assert not kinds(j, 'order_set') and not any(x.startswith('models auth order set') for x in calls(d)), j
+        st = subprocess.run([sys.executable, str(HERE / 'failover.py'), '--status'], capture_output=True, text=True,
+                            env=dict(os.environ, OCF_STATE=str(d / 'st'), OCF_SETTINGS=str(d / 'settings.json')))
+        assert st.returncode == 0 and json.loads(st.stdout)['prefer'][OPUS] == want, st.stderr
+        fake(d, saved_orders={})
+        before = len(j)
+        rc, err, j = go(d, True)
+        o, = [r for r in kinds(j[before:], 'prefer_order') if r['model'] == OPUS]
+        assert rc == 0 and o['order'] == ([PA, PB, PC] if complete else [PC, PB, PA]), (err, j)
+        assert o['source'] == ('usage' if complete else 'settings'), o
+        if complete:
+            assert binding(d, 'a') == OPUS + '@' + PA and order(d)[0] == PA, j
 
 
 def test_failover_follows_the_usage_order_and_returns_work_to_the_earliest_reset():
