@@ -121,5 +121,30 @@ class PushGateTest(unittest.TestCase):
         self.push(name, allowed=False, category="in ref name")
 
 
+    def test_remote_ref_name_rejects(self):
+        name = "person" + "@" + "private.invalid"
+        self.push("HEAD:refs/heads/" + name, allowed=False, category="in ref name")
+
+    def test_blank_ref_input_passes(self):
+        # The global hook dispatcher forwards one blank line when nothing is outgoing.
+        gate = HOOKS.parent / "tools" / "pii_push_gate.py"
+        proc = subprocess.run(
+            ["python3", str(gate), "origin", str(self.remote)], cwd=self.local, env=self.env,
+            input="\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_branch_update_does_not_rescan_history_on_other_remote_branches(self):
+        self.git("checkout", "-b", "feature")
+        self.push("feature", allowed=True)
+        self.git("checkout", "main")
+        self.commit("old.txt", "person" + "@" + "private.invalid", "published data")
+        self.git("push", "--no-verify", "origin", "main")  # Already public on the remote.
+        self.git("checkout", "feature")
+        self.git("merge", "--no-edit", "main")
+        self.commit("safe.txt", "tester@example.net\n", "safe update")
+        self.push("feature", allowed=True)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -130,14 +130,17 @@ def main():
     remote_name = sys.argv[1] if len(sys.argv) > 1 else ""
     for raw in sys.stdin.buffer:
         fields = raw.decode("utf-8", "replace").strip().split()
+        if not fields:
+            continue  # Git sends no ref lines when nothing is outgoing.
         if len(fields) != 4:
             raise RuntimeError("Invalid pre-push ref input")
-        local_ref, local_oid, _remote_ref, remote_oid = fields
+        local_ref, local_oid, remote_ref, remote_oid = fields
         if local_oid in (ZERO, "0" * 64):
             continue  # A deletion sends no objects.
-        for category in sorted(findings(local_ref)):
-            report(category + " in ref name", local_oid, "<redacted ref>")
-            count += 1
+        for ref in {local_ref, remote_ref}:
+            for category in sorted(findings(ref)):
+                report(category + " in ref name", local_oid, "<redacted ref>")
+                count += 1
         if not all(re.fullmatch(r"[0-9a-f]{40,64}", oid) for oid in (local_oid, remote_oid)):
             raise RuntimeError("Invalid pre-push object ID")
         obj_type = git("cat-file", "-t", local_oid).strip()
@@ -150,9 +153,9 @@ def main():
         args = ["rev-list", "--reverse", commit]
         if remote_oid not in (ZERO, "0" * 64):
             args.append("^" + remote_oid)
-        elif remote_name and re.fullmatch(r"[A-Za-z0-9._-]+", remote_name):
-            # Existing remote-tracking history is not newly sent by a branch/tag.
-            args.append(f"--not")
+        if remote_name and re.fullmatch(r"[A-Za-z0-9._-]+", remote_name):
+            # History the remote already has (any of its branches) is not newly sent.
+            args.append("--not")
             args.append(f"--remotes={remote_name}")
         for outgoing in git(*args).decode("ascii").splitlines():
             if outgoing not in seen:
