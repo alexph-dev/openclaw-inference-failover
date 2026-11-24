@@ -1,0 +1,5 @@
+#!/bin/sh
+# Git's pre-push input is passed through unchanged by the host hook dispatcher.
+set -eu
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$hook_dir/../tools/pii_push_gate.py" "$@"
