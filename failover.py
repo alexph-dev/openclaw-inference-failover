@@ -5,25 +5,26 @@ Run once a minute by an OpenClaw command job. A limit is always one model on one
 whole account: a probe that answers ok for one model says nothing about another model on that account.
   jobs   a cron job whose model@account is held or probed out moves to the same model on the next live account
          of auth.order, else to the first live entry of agents.defaults.model.fallbacks. The targets of a provider are
-         the accounts its non-empty auth.order lists; a provider without one (no key or an empty list) has all its
+         the accounts its non-empty stored order lists, ahead of config auth.order; a provider without either has all its
          subscription accounts: its oauth and token profiles in auth.profiles and in the agent's saved auth store
          (openclaw models status), oauth first, then config order, then saved order. An api_key profile is a target
-         only when auth.order lists it. A move to another MODEL is temporary: the job goes back to its own model once an
+         only when the effective order lists it. A move to another MODEL is temporary: the job goes back to its own model once an
          account of it is live again. A job is never rerun.
-  prefer optional per-model account preference (settings file, see SETTINGS): a move off a held account goes to the
+  prefer stored order, or an explicit per-model preference (settings file, see SETTINGS): a move off a held account goes to the
          most preferred live account, and work of that model returns to a more preferred account once it is live again
          (its hold ran out or a re-test cleared it) and one real request of that model there answered within the hour.
          Moved back: operator cron jobs, and chats this script moved, parked or was told to adopt (--adopt); never a
          chat whose account or model a person chose, nor one whose account OpenClaw chose itself. At most one such move
-         per item an hour. The first account of auth.order follows the preferred live account of the most used models, so
-         new unpinned chats and subagents start there. Without a preference for a model: no return between accounts.
+         per item an hour. Without a saved override, the first account of auth.order follows the preferred live account
+         of the most used models. Saved orders stay operator-owned (their setter has no compare-and-set). Without a
+         preference for a model: no return between accounts.
          A disabled job moves too, after the chats, and stays disabled, so a run started by hand ('cron run') finds a
          live account. On probing passes it discovers its own accounts and fallbacks; other passes use existing
          answers only. No target is not a problem; disabled one-shot and legacy account-mode jobs are left alone.
   usage  optional ('usage' logins in the settings, claude_usage.py): each Claude account's limits are read at most every
          5 min; while every account named for a model has a fresh, verified reading, that model's preference is
          computed from them: accounts with room for it first, earliest reset first (owner's rule: fill what resets
-         soonest), then the full ones, back soonest first. Else the settings' order. Never claims a free reset.
+         soonest), then the full ones, back soonest first. Else the named order. Never claims a free reset.
   chats  a pinned human chat (a model or account the user chose, or this script set) is moved the same way on the same
          passes, whatever its runs did.
   strict chats  session keys listed in OCF_STRICT_CHATS (comma-separated) never change model: they move only to
@@ -75,6 +76,7 @@ CLI_RUNS = ['cron', 'runs', '--all', '--status', 'error', '--sort', 'desc', '--l
 CLI_EDIT = lambda jid, ref: ['cron', 'edit', jid, '--model', ref, '--timeout', '120000']   # rebind a job to model@account
 CLI_AGENT = lambda key, msg, deliver=True: ['agent', '--session-key', key, '--message', msg] + (['--deliver'] if deliver else []) + ['--timeout', '3600']  # continue on the stored route, or locally
 CLI_MODELS = lambda agent: ['models', 'status', '--json', '--agent', agent]   # the agent's accounts, saved ones too
+CLI_ORDER_GET = lambda provider, agent: ['models', 'auth', 'order', 'get', '--provider', provider, '--agent', agent, '--json']
 AGENT_STOPPED = 'aborted'   # last output line of 'openclaw agent' when its run was stopped (sessions.abort, a stop button)
 AGENT_OUTPUT = lambda unit: ['journalctl', '--user', '-u', unit, '-t', 'openclaw', '-o', 'cat', '--no-pager', '-n', '5']
                             # what 'openclaw agent' printed in a continuation unit (syslog identifier 'openclaw')
@@ -547,6 +549,49 @@ def cfg():
             'prefer': eff, 'prefer_static': prefer, 'prefer_from': src, 'settings_err': err, 'usage_err': uerr}
 
 
+def with_stored_orders(conf, work_models=()):
+    """Resolve the selection snapshot for a pass. Adoption only records ownership
+    and uses cfg() directly, so it needs no auth-order CLI availability."""
+    prefer = conf['prefer_static']
+    models = {MODEL(x) for x in [conf['primary'], *conf['chain'], *conf['allowed'], *prefer, *work_models]}
+    configured = conf['order']
+    providers = {x.split('/')[0] for x in models} | set(configured)
+    providers.update(v[PROFILE_PROVIDER] for v in conf['profiles'].values()
+                     if isinstance(v, dict) and isinstance(v.get(PROFILE_PROVIDER), str))
+    stored = {p: o for p in sorted(providers) if (o := stored_order(p))}
+    # A saved list names targets first, just as a settings list does. Explicit
+    # per-model settings retain their priority; usage still computes the live order.
+    base = {model: stored[model.split('/')[0]] for model in sorted(models)
+            if not conf['settings_err'] and model.split('/')[0] in stored}
+    base.update(prefer)
+    eff, src = effective_prefer(base, load_usage()[0])
+    src.update({model: 'stored' for model in base if model not in prefer and model not in src})
+    return dict(conf, order=dict(configured, **stored), stored_order=stored, prefer=eff, prefer_from=src)
+
+
+def stored_order(provider):
+    """The probe agent's effective saved override, through OpenClaw's read-only CLI.
+    The CLI resolves agent/shared inheritance, aliases and persisted normalization:
+    empty, absent and malformed saved lists become null, so config remains the
+    fallback. Never read credential bytes or accept an answer for another scope.
+    cli_json caches each agent/provider read for this pass only."""
+    agent = default_agent()
+    argv = CLI_ORDER_GET(provider, agent)
+    timeout = min(MS_TIMEOUT_S, PASS_HARD_S - (time.time() - T0))
+    if timeout <= 0:
+        raise Shape('saved auth order: %s: no time left in this pass' % provider)
+    try:
+        d = cli_json(argv, timeout)
+    except (Shape, Unreachable) as e:
+        raise Shape('saved auth order: %s (%s)' % (provider, quiet_error(e))) from None
+    order = d.get('order')
+    if d.get('agentId') != agent or d.get('provider') != provider or 'order' not in d or \
+            (order is not None and (not isinstance(order, list) or any(
+                not isinstance(p, str) or not p.strip() or p.split(':')[0] != provider for p in order))):
+        raise Shape('saved auth order: %s: unexpected CLI answer shape or scope' % provider)
+    return list(dict.fromkeys(order or []))
+
+
 def load_settings():
     """The operator's optional settings file: ({model: [accounts in order of preference]}, error or None). A missing
     file is no preference. An unreadable or wrong one is a problem (main raises it) and counts as no preference, so a
@@ -585,8 +630,7 @@ def load_usage():
 
 def effective_prefer(prefer, usage):
     """The account order per model that the rest of the script follows, and where it came from ({model: 'usage'}).
-    Owner's rule (Alex, IT topic 6601 msg 6885, 18 Nov 2026): get the most out of what we pay, fill the account
-    that resets earliest first. So when every account the settings name for a model has a usable reading
+    Fill the account that resets earliest first. When every named account for a model has a usable reading
     (claude_usage.usable: fresh, verified), the order is computed from the readings: accounts with room left for
     that model (weekly under 100 %, and for Fable its own weekly limit under 100 %) first, earliest reset first, then
     the full ones, the one back soonest first. Otherwise the settings' order stands for that model."""
@@ -756,7 +800,7 @@ class Health:
         return self.held(profile, model) or self.status(profile) in LIMITED
 
     def ordered(self, provider):
-        """True when a non-empty auth.order lists the provider's targets."""
+        """True when a non-empty effective order lists the provider's targets."""
         return bool((self.conf.get('order') or {}).get(provider))
 
     def empty_order(self, provider):
@@ -788,13 +832,13 @@ class Health:
         return self.saved
 
     def accounts(self, provider):
-        """The accounts that are targets for provider, in order; the one answer for every caller. auth.order[provider]
+        """The accounts that are targets for provider, in order; the one answer for every caller. The saved override,
+        already merged over auth.order by with_stored_orders(), owns selection when non-empty. Otherwise auth.order[provider]
         when it is a non-empty list, api_key profiles included. Otherwise (no key, or an empty list) every subscription
         account of the provider: its oauth and token profiles in auth.profiles (config order) and in the agent's saved
         auth store (models status order), each once, oauth first. A profile declared in config keeps its config mode.
         OpenClaw breaks ties by last use; this script prefers no account, so that order stands. models status is asked
-        only here, so a pass whose providers all have a non-empty auth.order never runs it. An order saved with
-        'openclaw models auth order set' is not read; profiles it leaves out probe 'unknown', so they are never chosen."""
+        only here, so a pass whose providers all have a non-empty effective order never runs it."""
         order = (self.conf.get('order') or {}).get(provider)
         if self.ordered(provider):
             return list(order)
@@ -831,9 +875,8 @@ class Health:
         """True when a probe failed or timed out for a target account (accounts()): 'nothing alive' is then unproven.
         auth, no_model and format are definite answers (that account cannot be used), so an expired token does not hide
         'nothing alive'. An account that is not a target is never chosen, so its answer does not matter. For a provider
-        without a non-empty auth.order, 'unknown' counts as a definite answer: OpenClaw reports it for a profile that an
-        order saved with 'openclaw models auth order set' leaves out (excluded_by_auth_order), which this script cannot
-        read. A failed models status read does not count: the config profiles are then the targets. A read skipped
+        without a non-empty effective order, 'unknown' counts as a definite answer. A failed models status read does
+        not count: the config profiles are then the targets. A read skipped
         because the pass ran out of time does: saved-only accounts were not looked at."""
         if self.saved_skipped:
             return True
@@ -1991,6 +2034,8 @@ def order_pass(state, health, conf, jobs, out):
     weight[conf['primary']] = weight.get(conf['primary'], 0) + 1
     last = state.setdefault('order_set', {})
     for prov, order in sorted((conf.get('order') or {}).items()):
+        if prov in (conf.get('stored_order') or {}):
+            continue   # config cannot override it; the stored-order CLI has no compare-and-set
         models = [m for m in prefs if m.split('/')[0] == prov and weight.get(m)]
         if not isinstance(order, list) or not order or not models or NOW() - last.get(prov, 0) < ORDER_EVERY_MS:
             continue
@@ -2377,6 +2422,11 @@ def status(state):
     now = NOW()
     static = load_settings()[0]
     eff, src = effective_prefer(static, load_usage()[0])
+    # Saved-derived models need no settings entry. Report their last applied
+    # order beside last_pass without contacting OpenClaw during diagnostics.
+    for model, (accounts, source) in (state.get('prefer_eff') or {}).items():
+        if model not in static:
+            eff[model], src[model] = accounts, source
     hm = lambda ms: time.strftime('%d %b %H:%M', time.localtime(ms / 1000))
     print(json.dumps({
         'last_pass': hm(state.get('last_pass', 0)),
@@ -2416,6 +2466,10 @@ def main():
     if '--check' in sys.argv:
         try:
             ver, missing = openclaw_version(), selfcheck()
+            try:
+                with_stored_orders(cfg())
+            except Shape as e:
+                missing.append(str(e))
             try:                   # optional: without it the targets are the config profiles, so it is not 'missing'
                 bad = saved_profiles()[1]
                 saved = 'ok' if not bad else 'saved types disagree with the store for %s' % ', '.join(bad)
@@ -2456,7 +2510,7 @@ def main():
             note_prefer(state, None, 'config %s not readable: %s' % (CONFIG, str(e)[:120]))
             save(state)
         raise
-    if APPLY:
+    if APPLY and conf is None:
         note_prefer(state, conf, cfg_err)
     if APPLY:                  # armed before the self-check: after an update it alone can take minutes on a slow Gateway
         signal.signal(signal.SIGALRM, _alarm)
@@ -2467,6 +2521,8 @@ def main():
         ok = False             # a slow Gateway right after an update: a problem only once it lasts DOWN_MS
         down(state, out, 'self-check cut off after %d s' % PASS_HARD_S)
     if not ok or conf is None:
+        if APPLY:
+            note_prefer(state, None, cfg_err or 'OpenClaw self-check failed')
         signal.alarm(0)
         return finish(state, out, {'providers': set()}, {}, Health(conf or {}, {}))
     if conf.get('settings_err'):
@@ -2474,19 +2530,27 @@ def main():
     if conf.get('usage_err'):
         prob(out, 'settings-usage', conf['usage_err'])
     limited = state.setdefault('limited', {})
-    for k in [k for k, u in limited.items() if u <= NOW() or '/' not in k.split('@', 1)[0]]:
-        state.get('verified', {}).pop(k, None)   # a proof from before this limit says nothing about after it
-        if limited.pop(k) <= NOW() and conf.get('prefer'):
-            state['retry'] = True          # a limit ran out: this pass asks the accounts, so work can return now
     cleanup_prefer(state)
     for k in ('rerun', 'rerun_wanted', 'run_req'):
         state.pop(k, None)     # an older version's rerun bookkeeping
     ev, streak, health = {'providers': set()}, {}, Health(conf, limited)
     no_target_unknown = None
+    orders_ready = False
     part = None                # the part running now that does not run every pass: a cut-off there keeps its own clock
     try:
         del CRON_STORE_ERR[:]
         jobs, streak = load_jobs(state)
+        models = [j['model'] or conf['primary'] for j in jobs.values()]
+        models.extend(chat_ref(conf, e)[0] for e in stored_entries(CHAT_RE.match).values())
+        models.extend(h['model'] for field in ('home', 'chat_home') for h in (state.get(field) or {}).values())
+        conf = with_stored_orders(conf, models)
+        health.conf, orders_ready = conf, True
+        if APPLY:
+            note_prefer(state, conf)
+        for k in [k for k, u in limited.items() if u <= NOW() or '/' not in k.split('@', 1)[0]]:
+            state.get('verified', {}).pop(k, None)   # a proof before a limit says nothing about after it
+            if limited.pop(k) <= NOW() and conf.get('prefer'):
+                state['retry'] = True       # a limit ran out: ask the accounts so work can return now
         for e in CRON_STORE_ERR[:1]:
             prob(out, 'cron-store', e + '; jobs whose model names no account are not watched')
         if jobs_partial():
@@ -2549,6 +2613,8 @@ def main():
             _CACHE.clear()
             surface_ok(state, out, str(e))
     finally:
+        if APPLY and not orders_ready:
+            note_prefer(state, None, 'auth order snapshot not resolved')
         signal.alarm(0)
     return finish(state, out, ev, streak, health, no_target_unknown)
 

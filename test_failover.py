@@ -62,6 +62,16 @@ elif a[:2] == ['models', 'status']:
     f = json.load(open(os.environ['OCF_FAKE']))
     print(json.dumps(f.get('models_status', {'auth': {'oauth': {'warnAfterMs': 86400000, 'profiles': [], 'providers': []}}})))
     sys.exit(f.get('models_status_rc', 0))
+elif a[:4] == ['models', 'auth', 'order', 'get']:
+    f = json.load(open(os.environ['OCF_FAKE']))
+    agent, provider = a[a.index('--agent') + 1], a[a.index('--provider') + 1]
+    # The installed CLI coerces persisted empty/non-list orders to no override,
+    # trims strings, and returns only the selected agent/provider's order.
+    raw = f.get('saved_orders', {}).get(agent, {}).get(provider)
+    order = list(dict.fromkeys(p.strip() for p in raw if isinstance(p, str) and p.strip())) if isinstance(raw, list) else []
+    answer = {'agentId': agent, 'provider': provider, 'order': order or None}
+    print(json.dumps(f.get('order_answer', answer)))
+    sys.exit(f.get('order_rc', 0))
 elif a[:2] == ['config', 'set']:
     f = os.environ['OCF_CONFIG']
     c = json.load(open(f))
@@ -1152,7 +1162,7 @@ def test_models_status_is_not_read_when_every_provider_has_an_order():
     fake(d, models_status_rc=1)
     rc, err, j = go(d, True)
     assert {r['to'] for r in kinds(j, 'job_move')} == {'xai/grok-4.7@xai:x'}, (err, j)
-    assert not [x for x in calls(d) if x.startswith('models')] and 'models status' not in err, (calls(d), err)
+    assert not [x for x in calls(d) if x.startswith('models status')] and 'models status' not in err, (calls(d), err)
 
 
 def test_failed_models_status_falls_back_to_config_and_never_hides_no_target():
@@ -2228,6 +2238,111 @@ def order(d):
     return json.loads((d / 'cfg.json').read_text())['auth']['order']['anthropic']
 
 
+def test_stored_order_owns_targets_and_supplies_the_model_preference():
+    person = dict(PIN, modelOverride=OPUS.split('/')[1], authProfileOverride=PA)
+    d = setup({'j': (OPUS, PA, 'trusted')}, [], ALL_OK, entries={K: person})
+    fake(d, saved_orders={'main': {'anthropic': [PC, PA]}}, retest={OPUS + '@' + PC: RT_OK})
+    # Config names PB first. The saved override excludes PB and names PC first;
+    # no manual settings copy is needed for a preferred-account return.
+    rc, err, j = go(d, True)
+    assert binding(d, 'j') == OPUS + '@' + PC, (err, j)
+    assert kinds(j, 'prefer_order')[0]['order'] == [PC, PA], j
+    assert order(d) == [PB, PA, PC] and not kinds(j, 'order_set'), j
+    assert not kinds(j, 'chat_move') and json.loads((d / 'fake.json').read_text())['entries'][K] == person, j
+    assert rc == 0, err
+
+
+def test_stored_order_limits_preferences_and_never_enables_an_unlisted_api_key():
+    for saved, want in (([PA, PC], PC), ([PA, 'anthropic:k', PC], 'anthropic:k')):
+        d = setup({'j': (OPUS, PA, 'trusted')}, [],
+                  {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok', 'anthropic:k': 'ok'}})
+        prefer(d, {'prefer': {OPUS: [PB, 'anthropic:k', PC, PA]}})
+        fake(d, saved_orders={'main': {'anthropic': saved}})
+        rc, err, j = go(d, True)
+        assert binding(d, 'j') == OPUS + '@' + want and rc == 0, (err, j)
+        assert order(d) == [PB, PA, PC] and not kinds(j, 'order_set'), j
+
+
+def test_empty_absent_and_malformed_persisted_orders_fall_back_to_config():
+    for raw in (None, [], 'bad', {}, [None, 7, '  ']):
+        d = setup({'j': (OPUS, PA, 'trusted')}, [], {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
+        fake(d, saved_orders={'main': {'anthropic': raw}})
+        rc, err, j = go(d, True)
+        assert binding(d, 'j') == OPUS + '@' + PB and rc == 0, (raw, err, j)
+        assert not kinds(j, 'prefer_order') and not kinds(j, 'order_set'), (raw, j)
+    # A normalized empty saved order does not erase the existing empty-config
+    # subscription fallback, nor does it admit an undeclared API-key profile.
+    d = setup({'j': (OPUS, PA, 'trusted')}, [], {'anthropic': {PA: 'rate_limit', PC: 'ok', 'anthropic:k': 'ok'}})
+    c = json.loads((d / 'cfg.json').read_text())
+    c['auth'] = {'order': {'anthropic': []}, 'profiles': SUBS}
+    (d / 'cfg.json').write_text(json.dumps(c))
+    fake(d, saved_orders={'main': {'anthropic': []}})
+    assert binding_after_pass(d, 'j') == OPUS + '@' + PC
+
+
+def binding_after_pass(d, jid):
+    rc, err, j = go(d, True)
+    assert rc == 0, (err, j)
+    return binding(d, jid)
+
+
+def test_order_read_is_scoped_to_the_selected_agent_and_reloaded_each_pass():
+    d = setup({'j': (OPUS, PA, 'trusted')}, [], {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
+    c = json.loads((d / 'cfg.json').read_text())
+    c['agents']['list'] = [{'id': 'main'}, {'id': 'worker', 'default': True}]
+    (d / 'cfg.json').write_text(json.dumps(c))
+    fake(d, saved_orders={'main': {'anthropic': [PB]}, 'worker': {'anthropic': [PC]}})
+    assert binding_after_pass(d, 'j') == OPUS + '@' + PC
+    reads = [x for x in calls(d) if x.startswith('models auth order get')]
+    assert reads and all('--agent worker' in x for x in reads) and len(reads) == len(set(reads)), reads
+    fake(d, saved_orders={'worker': {'anthropic': [PB]}}, probe={'anthropic': {PC: 'rate_limit', PB: 'ok'}})
+    assert binding_after_pass(d, 'j') == OPUS + '@' + PB
+
+
+def test_stored_order_covers_models_named_only_by_jobs_chats_or_parked_homes():
+    for surface in ('job', 'chat', 'home'):
+        d = setup({'j': (OPUS if surface == 'job' else SOL, PA if surface == 'job' else OA, 'trusted')}
+                  if surface != 'chat' else {}, probe={'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'}},
+                  entries={K: dict(PIN, authProfileOverride=PA)} if surface == 'chat' else {})
+        c = json.loads((d / 'cfg.json').read_text())
+        c['agents']['defaults']['model'] = {'primary': SOL, 'fallbacks': []}
+        c['auth'] = {'order': {'openai': [OA]}}
+        (d / 'cfg.json').write_text(json.dumps(c))
+        if surface == 'home':
+            prefer(d, {}, state={'home': {'j': {'model': OPUS, 'parked': SOL + '@' + OA, 'at': 0, 'wait': 0}}})
+        fake(d, saved_orders={'main': {'anthropic': [PA, PC]}}, models_status=models_status([(PB, 'oauth'), (PC, 'token')]))
+        rc, err, j = go(d, True)
+        moved = kinds(j, 'chat_move' if surface == 'chat' else 'job_move')
+        assert rc == 0 and moved and moved[-1]['to'] == (FABLE if surface == 'chat' else OPUS) + '@' + PC, (surface, err, j)
+
+
+def test_an_unreadable_or_wrong_order_answer_blocks_mutation_without_leaking_output():
+    for broken in ({'order_rc': 1, 'order_answer': {'label': SECRET}},
+                   {'order_answer': {'agentId': 'main', 'provider': 'anthropic', 'order': 'bad', 'label': SECRET}},
+                   {'order_answer': {'agentId': 'main', 'provider': 'anthropic', 'order': [7]}},
+                   {'order_answer': {'agentId': 'other', 'provider': 'anthropic', 'order': [PC]}}):
+        d = setup({'j': (OPUS, PA, 'trusted')}, [], {'anthropic': {PA: 'rate_limit', PB: 'ok', PC: 'ok'}})
+        fake(d, **broken)
+        rc, err, j = go(d, False, '--check')
+        assert rc == 1 and 'saved auth order' in err and SECRET not in err, (err, j)
+        rc, err, j = go(d, True)
+        assert rc == 1 and binding(d, 'j') == OPUS + '@' + PA and not kinds(j, 'order_set'), (err, j)
+        assert SECRET not in err + (d / 'st' / 'journal.jsonl').read_text(), err
+
+
+def test_clearing_saved_order_restores_the_existing_config_compare_and_set_writer():
+    d = setup({'j': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d)
+    fake(d, saved_orders={'main': {'anthropic': [PB, PA, PC]}}, retest={OPUS + '@' + PA: RT_OK})
+    j = go(d, True)[2]
+    assert binding(d, 'j') == OPUS + '@' + PA and not kinds(j, 'order_set') and order(d) == [PB, PA, PC], j
+    fake(d, saved_orders={})
+    j = go(d, True)[2]
+    assert order(d) == [PA, PB, PC] and kinds(j, 'order_set')[-1]['result'] == 'ok', j
+    writes = [x for x in calls(d) if x.startswith('config set auth.order.anthropic')]
+    assert len(writes) == 1 and '--expect-current-json' in writes[0], writes
+
+
 def test_a_move_off_a_held_account_goes_to_the_most_preferred_live_one():
     # Fable is out on PA. auth.order would pick PB next; the preference puts Fable on PC before PB.
     d = setup(probe=ALL_OK, entries={K: dict(PIN, authProfileOverride=PA)})
@@ -2541,6 +2656,28 @@ def usage_setup(answers, emails=None, expiring=()):
     prefer(d, {'prefer': {OPUS: [PB, PA, PC]}, 'usage': usage})
     fake(d, usage_api=api, retest={OPUS + '@' + PA: RT_OK})
     return d
+
+
+def test_stored_order_supplies_named_accounts_for_dynamic_usage_without_a_preference_copy():
+    now = ms()
+    for complete in (True, False):
+        answers = {PA: usage_answer(85, now + 2 * DAY), PB: usage_answer(40, now + 5 * DAY)}
+        if complete:
+            answers[PC] = usage_answer(100, now + DAY, 98)
+        d = usage_setup(answers)
+        settings = json.loads((d / 'settings.json').read_text())
+        settings.pop('prefer')
+        prefer(d, settings)
+        fake(d, saved_orders={'main': {'anthropic': [PB, PA, PC]}})
+        rc, err, j = go(d, True)
+        o, = [r for r in kinds(j, 'prefer_order') if r['model'] == OPUS]
+        want = [PA, PB, PC] if complete else [PB, PA, PC]
+        assert rc == 0 and o['order'] == want and o['source'] == ('usage' if complete else 'stored'), (err, j)
+        assert binding(d, 'a') == OPUS + '@' + want[0] and order(d) == [PB, PA, PC], j
+        assert not kinds(j, 'order_set') and not any(x.startswith('models auth order set') for x in calls(d)), j
+        st = subprocess.run([sys.executable, str(HERE / 'failover.py'), '--status'], capture_output=True, text=True,
+                            env=dict(os.environ, OCF_STATE=str(d / 'st'), OCF_SETTINGS=str(d / 'settings.json')))
+        assert st.returncode == 0 and json.loads(st.stdout)['prefer'][OPUS] == want, st.stderr
 
 
 def test_failover_follows_the_usage_order_and_returns_work_to_the_earliest_reset():
