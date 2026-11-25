@@ -237,6 +237,7 @@ HOLD_MS = 3600_000             # a model@account that failed on a limit without 
 RETEST_LEFT_MS = 3600_000      # a hold with more than this left is re-tested with a real request (a provider may reset early)
 RETEST_EVERY_MS = 60 * 60_000  # at most one re-test per hold this often
 LOCAL_MODEL_CHECKS = os.environ.get('OCF_LOCAL_MODEL_CHECKS', '1') != '0'  # opt out of isolated --local requests
+UNSUPPORTED_RETRY_MS = 24 * 3600_000
 RETEST_PER_PASS = 2            # re-tests per pass at most (one takes ~15 s)
 RETEST_TIMEOUT_S = 60
 RETEST_ERRORS = 3              # re-tests in a row that failed other than on a limit before it is a problem
@@ -392,14 +393,14 @@ def raise_due(state, out):
             journal('problem', key=key, text=text)
         else:
             e['text'], e['seen'] = text, now
-    for k in [k for k, e in led.items() if now - e.get('seen', e['raised']) > 2 * RERAISE_MS]:
+    for k in [k for k, e in led.items() if not e.get('once') and now - e.get('seen', e['raised']) > 2 * RERAISE_MS]:
         led.pop(k)
     streak, due = state.get('fail_streak', 0), [e for e in led.values() if e['left'] > 0]
     if streak >= 2 or not due:
         state['fail_streak'] = 0           # a quiet pass resets the scheduler's error count; the rest is raised next
         return []
     for e in due:
-        e['left'] = (2 if streak == 0 else e['left']) - 1      # whatever is raised gets its full pair of passes
+        e['left'] = 0 if e.get('once') else (2 if streak == 0 else e['left']) - 1
     state['fail_streak'] = streak + 1
     return sorted(e['text'] for e in due)
 
@@ -996,6 +997,42 @@ def retest_one(ref):
     return 'error', None, msg[:300]
 
 
+def exact_check_due(state, ref, last, now):
+    refusal = state.get('unsupported', {}).get(ref)
+    if refusal and last <= refusal['at']:
+        return (refusal['version'] != state['selfcheck']['version']
+                or now - refusal['at'] >= UNSUPPORTED_RETRY_MS)
+    return now - last >= RETEST_EVERY_MS
+
+
+def exact_check(state, ref, out):
+    """Both hold and return checks use the same capability receipt and problem episode."""
+    result, until, why = retest_one(ref)
+    key = 'runtime_check:' + ref
+    problems = state.setdefault('problems', {})
+    if result == 'unsupported':
+        now = NOW()
+        state.setdefault('unsupported', {})[ref] = {'version': state['selfcheck']['version'], 'at': now}
+        state.get('verified', {}).pop(ref, None)
+        for ledger in ('retest_errors', 'verify_errors'):
+            state.get(ledger, {}).pop(ref, None)
+        for prefix in ('retest:', 'return_check:'):
+            problems.pop(prefix + ref, None)
+        if key not in problems:
+            text = 'OpenClaw cannot check the runtime-bound model on this account: ' + ref
+            problems[key] = {'raised': now, 'left': 1, 'once': True, 'text': text}
+            journal('problem', key=key, text=text)
+        out['runtime_checked'] = True
+        save(state)  # retain the refusal if a later operation crashes
+    else:
+        if key in problems:
+            out['runtime_checked'] = True
+        state.get('unsupported', {}).pop(ref, None)
+        if result == 'ok':
+            problems.pop(key, None)
+    return result, until, why
+
+
 def retest_holds(state, health, out):
     """A provider may end a limit before the time it named (Anthropic resets a weekly limit early), and the probe tests
     another model, so it cannot see that. A hold with more than RETEST_LEFT_MS left is re-tested with one real request
@@ -1011,7 +1048,7 @@ def retest_holds(state, health, out):
         for k in [k for k in led if k not in limited]:
             led.pop(k)
     due = sorted((tested.get(k, 0), k) for k, u in limited.items()
-                 if u - now > RETEST_LEFT_MS and now - tested.get(k, 0) >= RETEST_EVERY_MS)
+                 if u - now > RETEST_LEFT_MS and exact_check_due(state, k, tested.get(k, 0), now))
     for _, k in due[:RETEST_PER_PASS]:
         if late() or not fits(RETEST_TIMEOUT_S):
             break
@@ -1019,7 +1056,7 @@ def retest_holds(state, health, out):
             out['retest_due'].append(k)
             continue
         tested[k] = NOW()                  # first: a re-test cut off by the deadline still counts
-        res, until, why = retest_one(k)
+        res, until, why = exact_check(state, k, out)
         if res == 'ok':
             was = limited.pop(k, 0)
             errs.pop(k, None)
@@ -1033,10 +1070,12 @@ def retest_holds(state, health, out):
             if until:
                 limited[k] = until
             journal('hold_retest', key=k, result='limit', until=hm(limited.get(k, 0)), error=why)
+        elif res == 'unsupported':
+            journal('hold_retest', key=k, result=res, error=why)
         else:
             n = errs[k] = errs.get(k, 0) + 1
             journal('hold_retest', key=k, result=res, in_a_row=n, error=why)
-            if n >= RETEST_ERRORS:
+            if n >= RETEST_ERRORS and 'runtime_check:' + k not in state['problems']:
                 prob(out, 'retest:' + k, 'hold %s: its re-test failed %d times in a row (%s); the hold stays'
                      % (k, n, why[:120]))
 
@@ -1054,7 +1093,8 @@ def verify(state, health, ref, out, request=True):
     v, tried = state.setdefault('verified', {}), state.setdefault('verify_tried', {})
     if NOW() - v.get(ref, 0) < VERIFY_MS:
         return True
-    if not LOCAL_MODEL_CHECKS or not request or _VERIFY.get('busy') or ref in _VERIFY['failed'] or NOW() - tried.get(ref, 0) < RETEST_EVERY_MS:
+    if (not LOCAL_MODEL_CHECKS or not request or _VERIFY.get('busy') or ref in _VERIFY['failed']
+            or not exact_check_due(state, ref, tried.get(ref, 0), NOW())):
         return False                       # busy: a pass with fresh limits keeps its time for them; returns wait
     if not APPLY:
         if ref not in out['verify_due']:
@@ -1064,7 +1104,7 @@ def verify(state, health, ref, out, request=True):
         return False
     _VERIFY['n'] += 1
     tried[ref] = NOW()                     # first: a request cut off by the deadline still counts
-    res, until, why = retest_one(ref)
+    res, until, why = exact_check(state, ref, out)
     journal('return_check', key=ref, result=res, **({'error': why} if why else {}))
     errs = state.setdefault('verify_errors', {})
     if res == 'ok':
@@ -1073,9 +1113,9 @@ def verify(state, health, ref, out, request=True):
         errs.pop(ref, None)
         return True
     _VERIFY['failed'].add(ref)
-    if res in ('error', 'unsupported'):    # not a limit: returns there stop, so a streak of these must reach someone
+    if res == 'error':    # not a limit: returns there stop, so a streak of these must reach someone
         n = errs[ref] = [(errs.get(ref) or [0])[0] + 1, NOW()]
-        if n[0] >= RETEST_ERRORS:
+        if n[0] >= RETEST_ERRORS and 'runtime_check:' + ref not in state['problems']:
             prob(out, 'return_check:' + ref, 'return to %s: its check failed %d times in a row (%s); work stays where it is'
                  % (ref, n[0], why[:120]))
     else:
@@ -1106,6 +1146,9 @@ def cleanup_prefer(state):
         d = state.get(led) or {}
         for k in [k for k, t in d.items() if now - t >= ttl]:
             d.pop(k)
+    refused = state.get('unsupported', {})
+    for ref in [ref for ref, receipt in refused.items() if now - receipt['at'] >= UNSUPPORTED_RETRY_MS]:
+        refused.pop(ref)
     errs = state.get('verify_errors') or {}
     for k in [k for k, (n, t) in errs.items() if now - t > 2 * RETEST_EVERY_MS]:
         errs.pop(k)                        # no check of it for two hours (nothing to return there): the streak is over
@@ -2120,7 +2163,10 @@ def order_pass(state, health, conf, jobs, out):
         score = {}
         tried = state.get('verify_tried') or {}      # a pair whose return check failed this hour is no start either
         for m in models:
-            best = next((p for p in health.pref(m) if health.alive(p, m) and '%s@%s' % (m, p) not in tried), None)
+            best = next((p for p in health.pref(m) if health.alive(p, m)
+                         and '%s@%s' % (m, p) not in tried
+                         and '%s@%s' % (m, p) not in state.get('unsupported', {})
+                         and 'runtime_check:%s@%s' % (m, p) not in state.get('problems', {})), None)
             if best:
                 score[best] = score.get(best, 0) + weight[m]
         first = max(order, key=lambda p: (score.get(p, 0), -order.index(p)))   # a tie keeps the current first
@@ -2510,7 +2556,7 @@ def status(state):
     print(json.dumps({
         'last_pass': hm(state.get('last_pass', 0)),
         'open_problems': [{'since': hm(e['raised']), 'text': e['text']} for e in state.get('problems', {}).values()
-                          if now - max(e['raised'], e.get('seen', 0)) < CHECK_EVERY_MS + 5 * 60_000],
+                          if e.get('once') or now - max(e['raised'], e.get('seen', 0)) < CHECK_EVERY_MS + 5 * 60_000],
         'held': {k: hm(u) for k, u in state.get('limited', {}).items() if u > now},   # model@account: until
         'hold_retested': {k: hm(t) for k, t in state.get('retested', {}).items()
                           if state.get('limited', {}).get(k, 0) > now},       # last real re-test of a held pair
@@ -2627,6 +2673,7 @@ def main():
         if APPLY:
             note_prefer(state, conf)
         for k in [k for k, u in limited.items() if u <= NOW() or '/' not in k.split('@', 1)[0]]:
+            state.get('problems', {}).pop('runtime_check:' + k, None)
             state.get('verified', {}).pop(k, None)   # a proof before a limit says nothing about after it
             if limited.pop(k) <= NOW() and conf.get('prefer'):
                 state['retry'] = True       # a limit ran out: ask the accounts so work can return now
@@ -2680,7 +2727,7 @@ def main():
         down(state, out, 'pass cut off after %d s; what was done is saved, the rest continues next pass' % PASS_HARD_S,
              slow=True, part=part)
     except (Shape, Unreachable) as e:
-        if not (out['moved'] or out['chats'] or out['continued'] or out['aborted'] or out['cleared']):
+        if not (out['moved'] or out['chats'] or out['continued'] or out['aborted'] or out['cleared'] or out.get('runtime_checked')):
             eff = state.get('prefer_eff')
             state = json.loads(before)    # nothing was done: keep log offsets and pending events for the next pass
             if eff is not None:

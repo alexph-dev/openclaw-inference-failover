@@ -3035,31 +3035,83 @@ def test_a_runtime_bound_model_check_is_a_named_blocker_never_a_proof():
     # OpenClaw serves such a model only through its agent runtime, and no isolated request can lock it to one account,
     # so --local refuses it before any provider request. That is no answer and no limit: the pair stays unverified,
     # its hold stays, and the problem names the missing check instead of a generic failure.
-    out = lambda: {'problems': [], 'verify_due': [], 'retest_due': [], 'cleared': []}
     page = lambda m: {'rc': 1, 'out': 'log line\n' + json.dumps({'ok': False, 'error': {'type': 'cli_error', 'message': m}})}
     env = {'OCF_FAKE_CALLS': str(F.SDIR / 'calls')}
     for refusal in (RUNTIME_REFUSAL, CODEX_REFUSAL):
         with patch.object(F, 'FAKE', {'retest': {RUNTIME_REF: page(refusal)}}), patch.dict(os.environ, env):
             res, until, why = F.retest_one(RUNTIME_REF)
         assert (res, until) == ('unsupported', None) and 'runtime-bound' in why, (res, why)
-    state, health = {}, F.Health({'primary': OPUS, 'chain': [], 'order': {}})
-    with patch.object(F, 'FAKE', {'retest': {RUNTIME_REF: page(RUNTIME_REFUSAL)}}), patch.object(F, 'APPLY', True), \
-            patch.dict(os.environ, env), patch.dict(F._VERIFY, {'n': 0, 'failed': set()}):
-        for _ in range(F.RETEST_ERRORS):
-            F._VERIFY.update(n=0, failed=set())
-            o = out()
-            assert not F.verify(state, health, RUNTIME_REF, o)
-            state['verify_tried'][RUNTIME_REF] -= F.RETEST_EVERY_MS        # an hour later the next check is due
-        assert RUNTIME_REF not in state.get('verified', {}) and RUNTIME_REF not in health.limited, state
-        (key, text), = o['problems']
-        assert key == 'return_check:' + RUNTIME_REF and 'runtime-bound' in text, o['problems']
-        held = {'limited': {RUNTIME_REF: ms() + 86400_000}}
-        hold_health = F.Health({'primary': OPUS, 'chain': [], 'order': {}}, held['limited'])
-        F.retest_holds(held, hold_health, out())
-        assert held['limited'][RUNTIME_REF] > ms() and RUNTIME_REF not in held.get('verified', {}), held
-    j = [json.loads(x) for x in F.JOURNAL.read_text().splitlines()]
-    assert [(r['kind'], r['result']) for r in j] == [('return_check', 'unsupported')] * F.RETEST_ERRORS + \
-        [('hold_retest', 'unsupported')], j
+
+
+def runtime_problems(d):
+    env = dict(os.environ, OCF_STATE=str(d / 'st'), OCF_SETTINGS=str(d / 'settings.json'))
+    status = subprocess.check_output([sys.executable, str(HERE / 'failover.py'), '--status'], env=env)
+    return json.loads(status)['open_problems']
+
+
+def test_runtime_refusal_blocks_returns_until_version_change_and_closes_on_proof():
+    ref = OPUS + '@' + PA
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d)
+    fake(d, retest={ref: {'rc': 1, 'err': CODEX_REFUSAL}})
+    rc, err, j = go(d, True)
+    assert rc == 1 and 'runtime-bound' in err and requests(d) == [ref], (rc, err)
+    assert binding(d, 'a') == OPUS + '@' + PB and not state_of(d).get('verified')
+    assert go(d, True)[0] == 0 and requests(d) == [ref]
+    # A different version may still refuse. It gets an immediate check, in the same open episode.
+    rc, err, j = go(d, True, env={'OCF_FAKE_VERSION': '2026.11.4'})
+    assert rc == 0 and requests(d) == [ref, ref] and len(kinds(j, 'problem')) == 1, (err, j)
+    assert 'runtime-bound' in runtime_problems(d)[0]['text']
+    fake(d, retest={ref: RT_OK})
+    rc, err, j = go(d, True, env={'OCF_FAKE_VERSION': '2026.11.5'})
+    assert rc == 0 and requests(d) == [ref] * 3 and binding(d, 'a') == ref
+    assert not runtime_problems(d)
+
+
+@offline
+def test_runtime_refusal_shares_daily_retry_across_hold_and_return_without_starving_other_pairs():
+    ref = RUNTIME_REF
+    other = ref + '-other'
+    hour = 3600_000
+    start = ms()
+    state = {'selfcheck': {'version': '2026.11.3'}}
+    health = F.Health({}, {})
+    out = {'problems': [], 'cleared': []}
+    with patch.object(F, 'FAKE', {'retest': {ref: {'rc': 1, 'err': CODEX_REFUSAL}, other: RT_OK}}), \
+            patch.dict(os.environ, OCF_FAKE_CALLS=str(F.SDIR / 'calls')), patch.object(F, 'APPLY', True), \
+            patch.dict(F._VERIFY, n=0, failed=set()), patch.object(F, 'NOW', return_value=start) as clock:
+        assert not F.verify(state, health, ref, out)
+        assert len(F.raise_due(state, out)) == 1
+        health.limited.update({ref: start + 48 * hour, other: start + 48 * hour})
+        clock.return_value = start + 24 * hour - 1
+        out['problems'].clear()
+        F.cleanup_prefer(state)
+        with patch.object(F, 'RETEST_PER_PASS', 1):
+            F.retest_holds(state, health, out)
+        assert out['cleared'] == [other] and ref in health.limited
+        assert not F.raise_due(state, out)
+        clock.return_value += 1
+        F.retest_holds(state, health, out)
+        assert not F.raise_due(state, out) and ref in health.limited
+    checks = [json.loads(line) for line in F.JOURNAL.read_text().splitlines()]
+    assert [r['key'] for r in kinds(checks, 'hold_retest')] == [ref]
+    assert len(kinds(checks, 'problem')) == 1
+
+
+def test_ending_a_runtime_bound_hold_closes_its_problem_and_preserves_the_retry_delay():
+    ref = OPUS + '@' + PA
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d, state={'limited': {ref: ms() + 86400_000}})
+    fake(d, retest={ref: {'rc': 1, 'err': CODEX_REFUSAL}})
+    rc, err, j = go(d, True)
+    assert rc == 1 and requests(d) == [ref] and ref in state_of(d)['limited'], (err, j)
+    s = state_of(d)
+    s['limited'][ref] = ms() - 1
+    (d / 'st/state.json').write_text(json.dumps(s))
+    rc, err, j = go(d, True)
+    assert rc == 0 and requests(d) == [ref] and binding(d, 'a') == OPUS + '@' + PB
+    assert not runtime_problems(d)
+    assert not state_of(d).get('verified')
 
 
 def test_failed_rebind_retried_ok_next_pass_does_not_fail_that_pass():
