@@ -3047,7 +3047,8 @@ def test_a_runtime_bound_model_check_is_a_named_blocker_never_a_proof():
 
 
 def runtime_problems(d):
-    env = dict(os.environ, OCF_STATE=str(d / 'st'), OCF_SETTINGS=str(d / 'settings.json'))
+    env = dict(os.environ, OCF_STATE=str(d / 'st'), OCF_SETTINGS=str(d / 'settings.json'),
+               OCF_CONFIG=str(d / 'cfg.json'), OCF_FAKE=str(d / 'fake.json'))
     status = subprocess.check_output([sys.executable, str(HERE / 'failover.py'), '--status'], env=env)
     return json.loads(status)['open_problems']
 
@@ -3328,6 +3329,67 @@ def test_adopt_job_with_an_unreadable_job_list_records_nothing():
                         'j=' + SOL], env=env, capture_output=True, text=True)
     assert p.returncode == 1 and 'nothing recorded' in p.stderr and 'Traceback' not in p.stderr, p.stderr
     assert state_of(d) == before
+
+
+def test_chat_policy_retires_the_home_recorded_by_an_earlier_failover():
+    sol = dict(PIN, providerOverride='openai', modelOverride='gpt-6.1-sol', authProfileOverride=SOL_A)
+    d = setup(entries={K: sol}, probe={'openai': OPENAI_OUT, 'xai': {'xai:x': 'ok'}, **ALL_OK})
+    go(d, env={'OCF_CHAT_BANNED_MODELS': ''})  # reproduce a saved Sol home under the old policy
+    assert state_of(d)['chat_home'][K]['model'] == SOL
+    fake(d, probe={'openai': OPENAI_OK, **ALL_OK})
+    rc, err, j = go(d, True)
+    assert rc == 0 and [r['to'] for r in kinds(j, 'chat_policy')] == [OPUS + '@' + PB], (err, j)
+    assert K not in state_of(d)['chat_home'] and not kinds(go(d, True)[2], 'chat_return')
+
+
+def test_chat_policy_repairs_inherited_models_between_probes_and_skips_jobs():
+    sol = {'providerOverride': 'openai', 'modelOverride': 'gpt-7-sol'}
+    d = setup({'audit': (SOL, SOL_A, 'trusted')}, entries={K: sol}, probe=ALL_OK)
+    prefer(d, {}, state={'probed_at': ms(), 'limited': {OPUS + '@' + PB: ms() + 300_000}})
+    rc, err, j = go(d)
+    assert rc == 0 and [r['to'] for r in kinds(j, 'chat_policy')] == [OPUS + '@' + PA], (err, j)
+    assert binding(d, 'audit') == SOL + '@' + SOL_A
+    assert len(kinds(go(d)[2], 'chat_policy')) == 1
+
+
+def test_chat_policy_dry_run_only_previews_the_primary():
+    sol = {'providerOverride': 'openai', 'modelOverride': 'gpt-6-luna'}
+    d = setup(entries={K: sol}, probe=ALL_OK)
+    preview = go_dry(d)
+    assert preview['chats'] == [[K[-40:], OPUS + '@' + PB]]
+    assert json.loads((d / 'fake.json').read_text())['entries'][K] == sol
+    assert not (d / 'st/state.json').exists() and not (d / 'st/journal.jsonl').exists()
+
+
+def test_strict_chat_policy_waits_for_primary_then_stays_on_it():
+    strict = {'OCF_STRICT_CHATS': K}
+    sol = dict(PIN, providerOverride='openai', modelOverride='gpt-6.1-sol', authProfileOverride=SOL_A)
+    d = setup(entries={K: sol}, probe={'anthropic': DEAD, 'openai': OPENAI_OK, 'xai': {'xai:x': 'ok'}})
+    assert go(d, env=strict)[0] == 1
+    fake(d, probe=ALL_OK)
+    rc, err, j = go(d, env=strict)
+    assert rc == 0 and [r['to'] for r in kinds(j, 'chat_policy')] == [OPUS + '@' + PB], (err, j)
+    fake(d, probe={'anthropic': DEAD, 'openai': OPENAI_OK, 'xai': {'xai:x': 'ok'}})
+    assert not kinds(go(d, True, env=strict)[2], 'chat_move')
+
+
+def test_chat_skips_banned_fallback_that_a_job_can_use():
+    d = setup({'audit': (FABLE, PA, 'trusted')}, entries={K: PIN},
+              probe={'anthropic': DEAD, 'xai': XAI_OUT, 'openai': OPENAI_OK})
+    _, _, j = go(d)
+    assert not kinds(j, 'chat_move') and binding(d, 'audit') == SOL + '@' + SOL_A
+
+
+def test_chat_policy_reports_busy_chat_once_and_closes_after_repair():
+    d = setup(entries={K: {'providerOverride': 'openai', 'modelOverride': 'gpt-6.1-terra'}}, probe=ALL_OK)
+    fake(d, queued={K: True})
+    assert any(K in p['text'] for p in runtime_problems(d))
+    assert go(d)[0] == 1 and go(d)[0] == 0
+    assert any(K in p['text'] for p in runtime_problems(d))
+    fake(d, queued={})
+    rc, err, j = go(d)
+    assert rc == 0 and not runtime_problems(d), (err, j)
+    assert len([r for r in kinds(j, 'problem') if r['key'] == 'chat_policy:' + K]) == 1
 
 
 if __name__ == '__main__':

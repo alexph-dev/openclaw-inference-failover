@@ -27,7 +27,8 @@ whole account: a probe that answers ok for one model says nothing about another 
          soonest), then the full ones, back soonest first. Else the named order. Never claims a free reset.
   chats  a pinned human chat (a model or account the user chose, or this script set) is moved the same way on the same
          passes, whatever its runs did.
-  strict chats  session keys listed in OCF_STRICT_CHATS (comma-separated) never change model: they move only to
+  chat policy  each pass repairs banned current or home models to the configured primary. Applies to strict chats too.
+  strict chats  session keys listed in OCF_STRICT_CHATS (comma-separated) fail over only to
          another account of their own model. While no account of it is live the chat is left alone, and a turn that
          died on a limit waits like any other (then is a problem); it is continued only on its own model.
   stalls a run sleeping out a long same-model rate-limit wait is aborted, and its model@account is held until the time
@@ -58,7 +59,7 @@ State and journal: ~/.local/state/openclaw-inference-failover (OCF_STATE overrid
 Settings (optional): ~/.config/openclaw-inference-failover/settings.json (OCF_SETTINGS overrides):
   {"prefer": {"provider/model": ["provider:account", ...]}}
 """
-import calendar, fcntl, glob, hashlib, json, os, pathlib, re, signal, sqlite3, subprocess, sys, time, urllib.parse
+import calendar, fcntl, fnmatch, glob, hashlib, json, os, pathlib, re, signal, sqlite3, subprocess, sys, time, urllib.parse
 
 import claude_usage as CU      # sibling module: Claude subscription limits per account (optional 'usage' settings)
 
@@ -226,6 +227,8 @@ CHECK_EVERY_MS = 30 * 60_000   # cadence of the 24 h check inside --apply passes
 FRESH_MS = 20 * 60_000         # a failed chat turn older than this when first seen is not continued
 WAIT_MS = 2 * 3600_000         # a failed chat turn waits this long for any live account, then is a problem
 STRICT = frozenset(k.strip() for k in os.environ.get('OCF_STRICT_CHATS', '').split(',') if k.strip())
+CHAT_BANNED_MODELS = tuple(p.strip() for p in os.environ.get(
+    'OCF_CHAT_BANNED_MODELS', 'openai/*-sol,openai/gpt-6-luna,openai/gpt-6.1-terra').split(',') if p.strip())
 STALL_MS = 300_000             # same-model retry waits above 5 min are the #143274 stall
 PASS_SOFT_S = 200              # no new Gateway call is started after this
 PASS_HARD_S = int(os.environ.get('OCF_PASS_HARD_S', 270))   # a running call is cut off here: the job's own timeout is 300 s
@@ -944,11 +947,13 @@ class Health:
         want = [p for p in (self.conf.get('prefer') or {}).get(model) or [] if p in accts]
         return want + [p for p in accts if p not in want]
 
-    def target(self, model, avoid=(), chain=True):
+    def target(self, model, avoid=(), chain=True, human=False):
         """First live model@account: the same model on the first live of its pref() accounts, then the config fallback
         chain. avoid is the account this model just failed on, and it is skipped for this model only: a later model may
         use that account, because a limit on one model is not a limit on the next."""
         for m in dict.fromkeys([model] + (list(self.conf['chain']) if chain else [])):
+            if human and chat_banned(m):
+                continue
             blocked = avoid if m == model else ()
             for p in self.pref(m):
                 if p not in blocked and self.alive(p, m):
@@ -1543,6 +1548,8 @@ def prune_homes(state, kind, conf):
     """The model allowlist, not a provider's health, decides whether a saved home still exists."""
     allowed = conf.get('allowed')
     for ident, h in list(state.get(kind, {}).items()):
+        if kind == 'chat_home' and chat_banned(h['model']):
+            continue                       # policy repair still needs this return record
         if allowed and h['model'] not in allowed:
             forget_home(state, kind, ident, 'model removed from ' + '.'.join(CFG_MODELS))
 
@@ -1926,12 +1933,24 @@ def patch_chat(key, tgt, e=None):
     return '' if d else (err or 'failed')
 
 
+def chat_banned(model):
+    return any(fnmatch.fnmatchcase(model, pattern) for pattern in CHAT_BANNED_MODELS)
+
+
+def policy_repair(model, home):
+    return chat_banned(model) or chat_banned(home.get('model', ''))
+
+
 def chat_plan(state, health, key, e, unknown_dead=False):
     """Whether a chat must move and where, by the same rule as a job: it moves when its own model@account is held or
     probed out (with unknown_dead also when it stores no account: a limit event whose account is unknown). own is the
     model it goes home to; tgt the first live target (None when nothing is live)."""
     model, acct = chat_ref(health.conf, e)
     ref = '%s@%s' % (model, acct)
+    if policy_repair(model, state.get('chat_home', {}).get(key, {})):
+        primary = health.conf['primary']
+        return {'ref': ref, 'own': primary, 'needed': True, 'strict': key in STRICT, 'policy': True,
+                'tgt': health.target(primary, chain=False, human=True)}
     prune_homes(state, 'chat_home', health.conf)   # recovery also plans from saved homes, before chats_home runs
     home = state.setdefault('chat_home', {})
     if key in home and home[key]['parked'] != ref:
@@ -1939,14 +1958,16 @@ def chat_plan(state, health, key, e, unknown_dead=False):
     own = home.get(key, {}).get('model', model)
     needed = health.dead(acct, model) if acct else unknown_dead
     return {'ref': ref, 'own': own, 'needed': needed, 'strict': key in STRICT,   # strict: its own model only
-            'tgt': health.target(own, avoid=(acct,) if acct else (), chain=key not in STRICT) if needed else None}
+            'tgt': health.target(own, avoid=(acct,) if acct else (), chain=key not in STRICT, human=True) if needed else None}
 
 
 def move_chat(state, key, plan, e, out, why):
     """Patch the chat to plan['tgt'] and remember the move; returns 'ok' ('dry-run') or the error."""
     err = patch_chat(key, plan['tgt'], e)
     res = err or ('ok' if APPLY else 'dry-run')
-    journal('chat_move', session=key, frm=plan['ref'], to=plan['tgt'], why=why, result=res)
+    if not err or not plan.get('policy'):
+        journal('chat_policy' if plan.get('policy') else 'chat_move', session=key,
+                frm=plan['ref'], to=plan['tgt'], why=why, result=res)
     if err:
         if home_rejected(state, 'chat_home', key, plan['tgt'], err):
             save(state)
@@ -1966,7 +1987,7 @@ def move_chat(state, key, plan, e, out, why):
     return res
 
 
-def chats_pass(state, health, out):
+def chats_pass(state, health, out, probe_due=True, entries=None):
     """A pinned human chat is moved like a job: on every probing pass, a chat whose own model@account is held or probed
     out is patched to the next live target. Pinned: a model or account chosen by hand (OpenClaw applies no fallbacks
     to it), or a chat this script parked on a fallback. What its runs did is not asked. A chat with a run in progress
@@ -1974,11 +1995,14 @@ def chats_pass(state, health, out):
     home, moved = state.setdefault('chat_home', {}), state.setdefault('chat_moved', {})
     for k in [k for k, v in moved.items() if NOW() - v.get('t', 0) > 86400_000]:
         moved.pop(k)
-    for key, e in sorted(stored_entries(CHAT_RE.match).items()):
-        if not (pinned(e) or key in home) or not human_chat(key, None, e):
+    if entries is None:
+        entries = stored_entries(CHAT_RE.match)
+    for key, e in sorted(entries.items()):
+        if not human_chat(key, None, e):
             continue
         model, acct = chat_ref(health.conf, e)
-        if not acct or not health.dead(acct, model):
+        policy = policy_repair(model, home.get(key, {}))
+        if not policy and not (probe_due and (pinned(e) or key in home) and acct and health.dead(acct, model)):
             continue
         if not fits(60):
             out['deferred'] += 1
@@ -1989,16 +2013,45 @@ def chats_pass(state, health, out):
                 continue
             plan = chat_plan(state, health, key, e)
             if not plan['tgt']:
-                if not plan['strict']:         # a strict chat waiting for its own model is expected, not a problem
+                if not policy and not plan['strict']:  # a strict chat waiting for its own model is expected, not a problem
                     out['no_target'].append((key[-40:], plan['own']))
                 continue
-            fresh, (fresh_e, _) = session(key) or {}, entry(key)   # probes take time: a new run or choice wins
+            fresh, (fresh_e, queued) = session(key) or {}, entry(key)   # probes take time: a new run or choice wins
         except RuntimeError:
             out['deferred'] += 1               # the Gateway is busy: look again next pass
             continue
-        if not fresh or fresh.get(S_ACTIVE) or selection(fresh_e) != selection(e):
+        if not fresh or fresh.get(S_ACTIVE) or not human_chat(key, fresh, fresh_e):
             continue
-        move_chat(state, key, plan, fresh_e, out, 'held' if health.held(acct, model) else 'probe: %s' % health.status(acct))
+        if selection(fresh_e) != selection(e) or (policy and (queued or fresh_e != e)):
+            continue
+        why = 'model banned for chats' if policy else ('held' if health.held(acct, model) else 'probe: %s' % health.status(acct))
+        move_chat(state, key, plan, fresh_e, out, why)
+
+
+def chat_policy_findings(state, conf):
+    findings = {}
+    for key, e in stored_entries(CHAT_RE.match).items():
+        model, _ = chat_ref(conf, e)
+        home = state.get('chat_home', {}).get(key, {})
+        if human_chat(key, None, e) and policy_repair(model, home):
+            source, banned = ('current', model) if chat_banned(model) else ('home', home['model'])
+            findings['chat_policy:' + key] = 'chat %s has banned %s model %s' % (key, source, banned)
+    return findings
+
+
+def chat_policy_problems(state, findings, report):
+    """Keep one open episode until the chat is repaired or disappears."""
+    problems = state.setdefault('problems', {})
+    for key in list(problems):
+        if key.startswith('chat_policy:') and key not in findings:
+            problems.pop(key)
+    for key, text in findings.items():
+        if key not in problems:
+            problems[key] = {'raised': NOW(), 'left': 1, 'once': True, 'text': text}
+            if report:
+                journal('problem', key=key, text=text)
+        else:
+            problems[key]['text'] = text
 
 
 def chats_home(state, health, conf, out):
@@ -2011,6 +2064,8 @@ def chats_home(state, health, conf, out):
         e, queued = entry(key)
         s = session(key) or {}
         if not s or not human_chat(key, s, e) or s.get(S_ACTIVE) or queued:
+            continue
+        if policy_repair(chat_ref(conf, e)[0], h):
             continue
         if '%s@%s' % chat_ref(conf, e) != h['parked']:
             home.pop(key)                  # the user chose something else since: that choice stands
@@ -2064,7 +2119,7 @@ def chats_prefer(state, health, conf, out):
         model, acct = chat_ref(conf, e)
         ref = '%s@%s' % (model, acct)
         mine = key in owned or home.get(key, {}).get('parked') == ref
-        if not acct or not mine or not health.prefers(model) or not human_chat(key, None, e) \
+        if policy_repair(model, home.get(key, {})) or not acct or not mine or not health.prefers(model) or not human_chat(key, None, e) \
                 or NOW() - moved.get(key, 0) < RETURN_EVERY_MS:
             continue
         if n >= RETURN_CHATS_PER_PASS or late() or not fits(60):
@@ -2110,6 +2165,9 @@ def adopt(state, keys):
         model, acct = chat_ref(conf, e)
         if not e or not acct or not human_chat(key, None, e):
             res[key] = 'skipped: no human chat with a stored account'
+            continue
+        if home and chat_banned(home):
+            res[key] = 'skipped: model banned for chats: ' + home
             continue
         if home and ('/' not in home or (conf.get('allowed') and home not in conf['allowed'])):
             res[key] = 'skipped: %s is no provider/model in %s' % (home, '.'.join(CFG_MODELS))
@@ -2276,7 +2334,7 @@ def recover_chat(state, health, key, s, run_id, p, out):
         health.hold(p['profile'], p['until'] if p['kind'] == 'stall' else NOW() + HOLD_MS, p['model'])
     plan = chat_plan(state, health, key, e, unknown_dead=True)
     if plan['needed'] and not plan['tgt']:
-        if not plan['strict']:
+        if not plan['strict'] and not plan.get('policy'):
             out['no_target'].append((key[-40:], plan['own']))
         return False                       # stays pending and a sleeping run is not aborted; the next minute asks again
     # Probes can take minutes: read the chat again before any change. A user turn, a newer run or a choice wins.
@@ -2327,6 +2385,8 @@ def recover_chat(state, health, key, s, run_id, p, out):
         (not latest.get(S_ACTIVE) and last_run(latest, latest_e) not in (run_id, None))
     if not latest or newer or newer_input(latest, latest_e, queued, p['t']) or not human_chat(key, latest, latest_e):
         res['continue'] = 'user already wrote'
+    elif APPLY and chat_banned(chat_ref(health.conf, latest_e)[0]):
+        return False                       # the selection changed during recovery; re-plan before continuing
     elif p.get('no_continue'):
         res['continue'] = 'not replayed: native run may have completed tool actions'
     elif not has_chat(key, s):
@@ -2571,6 +2631,10 @@ def save(state):
 
 def status(state):
     now = NOW()
+    try:
+        chat_policy_problems(state, chat_policy_findings(state, cfg()), report=False)
+    except (OSError, ValueError, Shape, sqlite3.Error):
+        pass                               # offline status retains the last pass's policy findings
     static = load_settings()[0]
     eff, src = effective_prefer(static, load_usage()[0])
     eff = dict(eff)
@@ -2693,7 +2757,8 @@ def main():
         del CRON_STORE_ERR[:]
         jobs, streak = load_jobs(state)
         models = [j['model'] or conf['primary'] for j in jobs.values()]
-        models.extend(chat_ref(conf, e)[0] for e in stored_entries(CHAT_RE.match).values())
+        entries = stored_entries(CHAT_RE.match)
+        models.extend(chat_ref(conf, e)[0] for e in entries.values())
         models.extend(h['model'] for field in ('home', 'chat_home') for h in (state.get(field) or {}).values())
         conf = with_stored_orders(conf, models)
         health.conf, orders_ready = conf, True
@@ -2721,13 +2786,18 @@ def main():
                          or NOW() - state.get('probed_at', 0) >= PROBE_EVERY_MS)
         if probe_due:
             jobs_pass(conf, jobs, health, state, t0, out)
-            chats_pass(state, health, out)
+        chats_pass(state, health, out, probe_due, entries)
+        if probe_due:
             chats_home(state, health, conf, out)
             chats_prefer(state, health, conf, out)
             order_pass(state, health, conf, jobs, out)
             state['probed_at'] = NOW()
             state['retry'] = bool(out['deferred'] or out['no_target'] or health.failed)
         stalls_and_chats(state, health, jobs, out)
+        findings = chat_policy_findings(state, conf)
+        chat_policy_problems(state, findings, report=APPLY)
+        if not APPLY:
+            out['problems'].extend(findings.items())
         _VERIFY['busy'] = False
         continued_check(state, out)
         retest_holds(state, health, out)
