@@ -400,7 +400,8 @@ def raise_due(state, out):
         else:
             e['text'], e['seen'] = text, now
     for k in [k for k, e in led.items() if not e.get('once') and now - e.get('seen', e['raised']) > 2 * RERAISE_MS]:
-        led.pop(k)
+        if not k.startswith('rebind:') or out.get('jobs_verified'):
+            led.pop(k)
     streak, due = state.get('fail_streak', 0), [e for e in led.values() if e['left'] > 0]
     if streak >= 2 or not due:
         state['fail_streak'] = 0           # a quiet pass resets the scheduler's error count; the rest is raised next
@@ -1168,13 +1169,14 @@ def better(state, health, model, acct, out, request=True):
     return None
 
 
-def cleanup_prefer(state):
+def cleanup_prefer(state, jobs=()):
     """Forget proofs and per-item marks once they no longer matter."""
     now = NOW()
     for led, ttl in (('verified', VERIFY_MS), ('verify_tried', RETEST_EVERY_MS), ('pref_moved', RETURN_EVERY_MS)):
         d = state.get(led) or {}
         for k in [k for k, t in d.items() if now - t >= ttl]:
-            d.pop(k)
+            if led != 'pref_moved' or k in jobs or CHAT_RE.match(k):
+                d.pop(k)
     refused = state.get('unsupported', {})
     for ref in [ref for ref, receipt in refused.items() if now - receipt['at'] >= UNSUPPORTED_RETRY_MS]:
         refused.pop(ref)
@@ -1183,11 +1185,11 @@ def cleanup_prefer(state):
         errs.pop(k)                        # no check of it for two hours (nothing to return there): the streak is over
 
 
-def cli_json(argv, timeout=75):
-    """One documented CLI command with JSON output, at most once per pass (cached). Raises Shape when the answer is not
+def cli_json(argv, timeout=75, fresh=False):
+    """One documented CLI command with JSON output, cached unless a fresh snapshot is requested. Raises Shape when the answer is not
     the expected JSON object, so a pass never acts on a misread job list."""
     k = ' '.join(argv)
-    if k not in _CACHE:
+    if fresh or k not in _CACHE:
         rc, out, err = run(['openclaw'] + argv, timeout)
         why = (err or out).strip()[-200:]
         if rc != 0 and re.search(r'unknown (option|command)|too many arguments|invalid argument', why, re.I):
@@ -1200,6 +1202,8 @@ def cli_json(argv, timeout=75):
             raise Unreachable('openclaw %s: no complete JSON answer' % k)
         if not isinstance(d, dict):
             raise Shape('cli: openclaw %s: answer is not a JSON object' % k)
+        if fresh:
+            return d  # preserve the snapshot used by the rest of this pass
         _CACHE[k] = d
     return _CACHE[k]
 
@@ -1392,13 +1396,16 @@ def part_done(state, part):
         state.pop('cut_since', None)
 
 
-jobs_partial = lambda: bool(cli_json(CLI_JOBS).get(LIST_MORE))   # the job list did not fit one page
+jobs_partial = lambda: cli_json(CLI_JOBS).get(LIST_MORE) is not False   # the job list did not fit one page
 
 
-def cron_jobs():
-    d = cli_json(CLI_JOBS)
+def cron_jobs(d=None):
+    d = cli_json(CLI_JOBS) if d is None else d
     if not isinstance(d.get(JOBS_LIST), list):
         raise Shape('openclaw %s: no "%s" list' % (' '.join(CLI_JOBS), JOBS_LIST))
+    if any(not isinstance(j, dict) or not isinstance(j.get(JOB_F['id']), str) or not j[JOB_F['id']]
+           for j in d[JOBS_LIST]):
+        raise Shape('openclaw cron list: a job without a valid id')
     return d[JOBS_LIST]
 
 
@@ -1430,6 +1437,7 @@ def cron_bindings():
         try:
             p = dig(json.loads(j or '{}'), JOB_BINDING.split('.'))
         except ValueError:
+            CRON_STORE_ERR.append('cron store contains unreadable job JSON')
             continue
         if isinstance(p, str) and p:
             out[jid] = p
@@ -1446,8 +1454,6 @@ def load_jobs(state):
     for d in cron_jobs():
         f = lambda k: dig(d, JOB_F[k].split('.'))
         jid, ref = f('id'), f('model')
-        if not jid:
-            raise Shape('openclaw %s: a job without "%s"' % (' '.join(CLI_JOBS), JOB_F['id']))
         profile = None
         if ref and '@' in ref:
             profile = PROF(ref)
@@ -1465,7 +1471,7 @@ def load_jobs(state):
                      'ref': full if profile else None, 'since': max(rec['t'], start),
                      'mode': f('mode'), 'next': f('next') or 0, 'kind': f('kind'),
                      'last': f('last'), 'last_at': f('last_at') or 0, 'streak_n': f('streak') or 0, 'errors': []}
-    for k in [k for k in seen if k not in jobs and not jobs_partial()]:
+    for k in [k for k in seen if k not in jobs and not CRON_STORE_ERR and not jobs_partial()]:
         seen.pop(k)
     # The run history is read only when some job is in a fresh error streak: a quiet pass makes one CLI call.
     if any(j['last'] == 'error' and j['last_at'] > now - WINDOW_MS for j in jobs.values()):
@@ -1514,7 +1520,14 @@ def cron_edit(jid, model, timeout=180):
         c.commit()
         return FAKE.get('edit_result', 'ok')
     rc, out, err = run(['openclaw'] + CLI_EDIT(jid, model), timeout)
-    return 'ok' if rc == 0 else ('write_limited' if 'retry after' in (err + out).lower() else 'rc=%s %s' % (rc, (err or out).strip()[-200:]))
+    if rc == 0:
+        return 'ok'
+    message = (err + out).lower()
+    if 'retry after' in message:
+        return 'write_limited'
+    if 'automation not found' in message:
+        return 'rc=%s Automation not found' % rc
+    return 'rc=%s %s' % (rc, (err or out).strip()[-200:])
 
 
 def park(state, kind, ident, own, tgt):
@@ -1544,10 +1557,12 @@ def forget_home(state, kind, ident, reason):
                 state.get('problems', {}).pop(key, None)   # a failure to move elsewhere is still a problem
 
 
-def prune_homes(state, kind, conf):
+def prune_homes(state, kind, conf, jobs=None):
     """The model allowlist, not a provider's health, decides whether a saved home still exists."""
     allowed = conf.get('allowed')
     for ident, h in list(state.get(kind, {}).items()):
+        if jobs is not None and ident not in jobs:
+            continue  # only inventory reconciliation can retire an unseen job
         if kind == 'chat_home' and chat_banned(h['model']):
             continue                       # policy repair still needs this return record
         if allowed and h['model'] not in allowed:
@@ -1561,6 +1576,47 @@ def home_rejected(state, kind, ident, tgt, err):
         forget_home(state, kind, ident, err)
         return True
     return False
+
+
+def forget_job(state, jid):
+    for field in ('home', 'unsure', 'pref_moved', 'bindings'):
+        state.get(field, {}).pop(jid, None)
+    state.get('problems', {}).pop('rebind:' + jid, None)
+
+
+def retire_job(state, jid, out):
+    forget_job(state, jid)
+    out.setdefault('gone', []).append(jid)  # preserve confirmed removals if later work rolls back
+    journal('job_gone', job=jid)
+
+
+def reconcile_job_inventory(state, jobs, out):
+    if not APPLY or CRON_STORE_ERR or jobs_partial():
+        return
+    out['jobs_verified'] = True
+    tracked = set(state.get('home', {})) | set(state.get('unsure', {}))
+    tracked.update(k.removeprefix('rebind:') for k in state.get('problems', {}) if k.startswith('rebind:'))
+    tracked.update(k for k in state.get('pref_moved', {}) if not CHAT_RE.match(k))
+    missing = tracked - jobs.keys()
+    for jid in sorted(missing):
+        retire_job(state, jid, out)
+    if missing:
+        save(state)  # a crash in later work must not replay the cleanup on the next pass
+
+
+def missing_after_edit(jobs):
+    if CRON_STORE_ERR or jobs_partial():
+        return set()
+    try:
+        timeout = min(75, int(remaining_s()))
+        if timeout < 1:
+            return set()
+        snapshot = cli_json(CLI_JOBS, timeout=timeout, fresh=True)
+        if snapshot.get(LIST_MORE) is False:
+            return jobs.keys() - {j[JOB_F['id']] for j in cron_jobs(snapshot)}
+    except (Shape, Unreachable):
+        pass
+    return set()  # retain the edit failure until the scheduler confirms absence
 
 
 def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
@@ -1577,8 +1633,10 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
         health.budget_disabled(jobs, state)
     home = state.setdefault('home', {})      # {job: {'model': its own model, 'parked': 'fallback@account'}}
     for jid, u in list(state.setdefault('unsure', {}).items()) if not disabled else ():   # once, before any edit
+        if jid not in jobs:
+            continue
         state['unsure'].pop(jid)             # an edit that reported failure (a timeout) may still have landed
-        if jid in jobs and jobs[jid]['model'] == u['tgt']:
+        if jobs[jid]['model'] == u['tgt']:
             journal('job_move', job=jid, name=jobs[jid]['name'][:60], frm=u['frm'], to=u['tgt'], result='ok',
                     note='the edit reported a failure but was applied')
             if u.get('why') == 'preference':
@@ -1591,7 +1649,7 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
                 home.pop(jid, None)
             out['moved'].append((jid[:8], u['tgt']))            # counts as done: the pass state is not rolled back
             state.get('problems', {}).pop('rebind:' + jid, None)   # the failure reported last pass did not happen
-    prune_homes(state, 'home', conf)       # also covers disabled jobs and homes restored by an uncertain edit
+    prune_homes(state, 'home', conf, jobs)       # also covers disabled jobs and homes restored by an uncertain edit
     todo, pref_moved = [], state.setdefault('pref_moved', {})
     for jid, j in jobs.items():
         if j['enabled'] == disabled:
@@ -1614,10 +1672,10 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
             todo.append((j['next'], jid, health.target(home[jid]['model'], chain=False), 'home'))
         elif j['mode'] == JOB_TRUSTED and health.prefers(MODEL(ref)) and NOW() - pref_moved.get(jid, 0) >= RETURN_EVERY_MS:
             todo.append((j['next'], jid, None, 'preference'))   # decided below, after every move that must happen
-    for jid in [k for k in home if k not in jobs and not jobs_partial()]:
-        home.pop(jid)
     n_pref, rank = 0, {'out': 0, 'home': 1}
     for _, jid, back, why in sorted(todo, key=lambda x: (rank.get(x[3], 2), x[0], x[1])):
+        if jid not in jobs:
+            continue  # a fresh read after another edit confirmed this job is gone
         j = jobs[jid]
         if j['mode'] != JOB_TRUSTED:
             if disabled:
@@ -1654,6 +1712,17 @@ def jobs_pass(conf, jobs, health, state, t0, out, disabled=False):
         if r == 'write_limited':
             out['later' if disabled else 'deferred'] += 1
             break
+        if 'automation not found' in r.lower():
+            missing = missing_after_edit(jobs)
+            for gone in sorted(missing):
+                retire_job(state, gone, out)
+                jobs.pop(gone)
+            if missing:
+                out['problems'] = [(k, t) for k, t in out['problems']
+                                   if not (k.startswith('rebind:') and k.removeprefix('rebind:') in missing)]
+                save(state)
+            if jid in missing:
+                continue
         if home_rejected(state, 'home', jid, tgt, r):
             state.get('unsure', {}).pop(jid, None)
             save(state)
@@ -2746,7 +2815,6 @@ def main():
     if conf.get('usage_err'):
         prob(out, 'settings-usage', conf['usage_err'])
     limited = state.setdefault('limited', {})
-    cleanup_prefer(state)
     for k in ('rerun', 'rerun_wanted', 'run_req'):
         state.pop(k, None)     # an older version's rerun bookkeeping
     ev, streak, health = {'providers': set()}, {}, Health(conf, limited)
@@ -2756,6 +2824,8 @@ def main():
     try:
         del CRON_STORE_ERR[:]
         jobs, streak = load_jobs(state)
+        reconcile_job_inventory(state, jobs, out)
+        cleanup_prefer(state, jobs)
         models = [j['model'] or conf['primary'] for j in jobs.values()]
         entries = stored_entries(CHAT_RE.match)
         models.extend(chat_ref(conf, e)[0] for e in entries.values())
@@ -2829,6 +2899,8 @@ def main():
             restored = json.loads(before)  # replay unfinished work, keeping completed checks of runtime-bound pairs
             for ref in out.get('runtime_checks', ()):
                 copy_check_receipt(restored, state, ref)
+            for jid in out.get('gone', ()):
+                forget_job(restored, jid)
             state = restored
             if eff is not None:
                 state['prefer_eff'] = eff  # but the order this pass follows (and journaled), not the last pass's
