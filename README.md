@@ -39,8 +39,14 @@ limits). After those come the entries of
 - **Pinned chats.** A chat whose model or account was chosen by hand (OpenClaw applies no fallbacks to it), or that the
   script parked on a fallback model, is moved the same way, on the same passes, whenever its model@account is held or
   probed out. What its runs did is not consulted. A chat with a run in progress is moved once that run is over.
-- **Strict chats.** Session keys listed in `OCF_STRICT_CHATS` (comma-separated, set in the job's environment) never
-  change model: they move only to another account of their own model. While every account of that model is out, the
+- **Human chat model policy.** Every pass checks the current model and saved return model of each human chat,
+  including inherited topic selections. A match moves the chat to the configured primary on its first live,
+  unheld account and clears the saved return. Active runs and queued input wait. Set `OCF_CHAT_BANNED_MODELS`
+  to a comma-separated list of model globs to replace the defaults of `openai/*-sol,openai/gpt-6-luna,openai/gpt-6.1-terra`.
+  An empty value allows all models. Pending repairs appear in `--status` and raise one problem per episode.
+  Successful repairs journal `chat_policy`. Cron jobs keep their existing model selection.
+- **Strict chats.** Policy repair also applies to strict chats. During ordinary failover, session keys listed
+  in `OCF_STRICT_CHATS` (comma-separated, set in the job's environment) keep their model: they move only to another account of their own model. While every account of that model is out, the
   chat is left alone (a sleeping run is not aborted, no problem is raised for the pin), and a turn that died on a
   limit waits as any other does: it is continued only on an account of its own model, and becomes a problem if none
   is live in time. Use it for conversations that must only ever run on one model.
