@@ -45,6 +45,8 @@ runs = [dict(zip(('jobId', 'status', 'error', 'runAtMs'), r)) for r in
 if a[:2] == ['cron', 'list']:
     jobs = []
     for jid, j, en, st in c.execute('select job_id, job_json, enabled, state_json from cron_jobs'):
+        if not en and '--all' not in a:
+            continue
         d, s = json.loads(j), json.loads(st or '{}')
         mine = [r for r in runs if r['jobId'] == jid]
         n = 0
@@ -3144,6 +3146,83 @@ def test_ending_a_runtime_bound_hold_closes_its_problem_and_preserves_the_retry_
     assert rc == 0 and requests(d) == [ref] and binding(d, 'a') == OPUS + '@' + PB
     assert not runtime_problems(d)
     assert not state_of(d).get('verified')
+
+
+def test_not_found_edit_error_survives_cli_diagnostic_truncation():
+    reply = (1, 'Automation not found', 'gateway diagnostic ' * 20)
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), patch.object(F, 'run', return_value=reply):
+        assert F.cron_edit('once', OPUS + '@' + PA) == 'rc=1 Automation not found'
+
+
+def test_one_shot_disappears_during_preference_edit():
+    d = setup({'once': (OPUS, PB, 'trusted')}, probe=ALL_OK, sched={'once': ('at', 60)})
+    prefer(d, state={'verified': {OPUS + '@' + PA: ms()}})
+    with sqlite3.connect(d / 'state.sqlite') as c:
+        c.execute("""create trigger expire_once before update on cron_jobs begin
+                     delete from cron_jobs where job_id=old.job_id; select raise(ignore); end""")
+    fake(d, edit_result='rc=1 Automation not found')
+    rc, err, journal = go(d)
+    assert rc == 0 and not err, err
+    assert [r['result'] for r in kinds(journal, 'job_move')] == ['rc=1 Automation not found']
+    assert [r['job'] for r in kinds(journal, 'job_gone')] == ['once']
+    assert not runtime_problems(d) and not state_of(d)['unsure']
+    with sqlite3.connect(d / 'state.sqlite') as c:
+        assert c.execute('select count(*) from cron_jobs').fetchone()[0] == 0
+
+
+def test_only_complete_inventory_retires_job_records():
+    d = setup({'disabled': (OPUS, PA, 'trusted')}, sched={'disabled': ('at', 0)})
+    with sqlite3.connect(d / 'state.sqlite') as c:
+        c.execute('update cron_jobs set enabled=0')
+    problems = {'rebind:' + jid: {'text': jid, 'raised': ms(), 'left': 0}
+                for jid in ('missing', 'disabled')}
+    problems['rebind:unseen'] = {'text': 'unseen', 'raised': ms() - 3 * F.RERAISE_MS, 'left': 0}
+    prefer(d, state={'problems': problems, 'home': {'missing': {'model': OPUS}},
+                     'unsure': {'missing': {}}, 'pref_moved': {'missing': ms(), K: ms()}})
+    path = d / 'st' / 'state.json'
+    before = path.read_bytes()
+    go_dry(d)
+    assert path.read_bytes() == before and not (path.parent / 'journal.jsonl').exists()
+    _, _, journal = go(d, env={'OCF_FAKE_MORE': '1'})
+    state = state_of(d)
+    assert not kinds(journal, 'job_gone') and problems.keys() <= state['problems'].keys()
+    assert all('missing' in state[k] for k in ('home', 'unsure', 'pref_moved'))
+    go(d)
+    _, _, journal = go(d)
+    state = state_of(d)
+    assert [r['job'] for r in kinds(journal, 'job_gone')] == ['missing', 'unseen']
+    assert all('missing' not in state[k] for k in ('home', 'unsure', 'pref_moved'))
+    assert K in state['pref_moved'] and 'rebind:missing' not in state['problems']
+    visible = {p['text'] for p in runtime_problems(d)}
+    assert 'disabled' in visible and 'missing' not in visible
+
+
+def test_store_read_error_keeps_job_state_until_next_complete_pass():
+    d = setup({'live': (OPUS, PA, 'trusted'), 'other': (OPUS, PB, 'trusted')}, probe=ALL_OK)
+    go(d)
+    with sqlite3.connect(d / 'state.sqlite') as c:
+        c.execute("update cron_jobs set job_json=json_set(job_json, '$.payload.model', ?) where job_id='live'", (OPUS,))
+    # The CLI still lists both jobs when the local binding store cannot decode a row.
+    broken = d / 'broken.sqlite'
+    broken.write_bytes((d / 'state.sqlite').read_bytes())
+    with sqlite3.connect(broken) as c:
+        c.execute("update cron_jobs set job_json='{' where job_id='live'")
+    patch_state(d, problems={'rebind:missing': {'raised': ms(), 'text': 'missing', 'left': 0}})
+    _, err, journal = go(d, env={'OCF_STATE_DB': 'file:%s?mode=ro' % broken})
+    assert 'cron store' in err and 'rebind:missing' in state_of(d)['problems']
+    assert not kinds(journal, 'job_gone')
+    go(d)
+    assert 'rebind:missing' not in state_of(d)['problems']
+
+
+def test_not_found_edit_with_unconfirmed_absence_keeps_its_problem():
+    for partial in (False, True):
+        d = setup({'j': (OPUS, PB, 'trusted')}, probe=ALL_OK)
+        prefer(d, state={'verified': {OPUS + '@' + PA: ms()}})
+        fake(d, edit_result='rc=1 Automation not found')
+        rc, err, journal = go(d, env={'OCF_FAKE_MORE': '1'} if partial else {})
+        assert rc == 1 and 'Automation not found' in err
+        assert 'rebind:j' in state_of(d)['problems'] and not kinds(journal, 'job_gone')
 
 
 def test_failed_rebind_retried_ok_next_pass_does_not_fail_that_pass():
