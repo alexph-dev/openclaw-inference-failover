@@ -3035,7 +3035,10 @@ def test_a_runtime_bound_model_check_is_a_named_blocker_never_a_proof():
     # OpenClaw serves such a model only through its agent runtime, and no isolated request can lock it to one account,
     # so --local refuses it before any provider request. That is no answer and no limit: the pair stays unverified,
     # its hold stays, and the problem names the missing check instead of a generic failure.
-    page = lambda m: {'rc': 1, 'out': 'log line\n' + json.dumps({'ok': False, 'error': {'type': 'cli_error', 'message': m}})}
+    def page(message):
+        error = {'type': 'cli_error', 'message': message}
+        return {'rc': 1, 'out': 'log line\n' + json.dumps({'ok': False, 'error': error})}
+
     env = {'OCF_FAKE_CALLS': str(F.SDIR / 'calls')}
     for refusal in (RUNTIME_REFUSAL, CODEX_REFUSAL):
         with patch.object(F, 'FAKE', {'retest': {RUNTIME_REF: page(refusal)}}), patch.dict(os.environ, env):

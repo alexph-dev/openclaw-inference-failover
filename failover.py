@@ -237,6 +237,9 @@ HOLD_MS = 3600_000             # a model@account that failed on a limit without 
 RETEST_LEFT_MS = 3600_000      # a hold with more than this left is re-tested with a real request (a provider may reset early)
 RETEST_EVERY_MS = 60 * 60_000  # at most one re-test per hold this often
 LOCAL_MODEL_CHECKS = os.environ.get('OCF_LOCAL_MODEL_CHECKS', '1') != '0'  # opt out of isolated --local requests
+RUNTIME_CHECK_PREFIX = 'runtime_check:'
+RETEST_PREFIX = 'retest:'
+RETURN_CHECK_PREFIX = 'return_check:'
 UNSUPPORTED_RETRY_MS = 24 * 3600_000
 RETEST_PER_PASS = 2            # re-tests per pass at most (one takes ~15 s)
 RETEST_TIMEOUT_S = 60
@@ -400,7 +403,12 @@ def raise_due(state, out):
         state['fail_streak'] = 0           # a quiet pass resets the scheduler's error count; the rest is raised next
         return []
     for e in due:
-        e['left'] = 0 if e.get('once') else (2 if streak == 0 else e['left']) - 1
+        if e.get('once'):
+            e['left'] = 0
+        elif streak == 0:
+            e['left'] = 1
+        else:
+            e['left'] -= 1
     state['fail_streak'] = streak + 1
     return sorted(e['text'] for e in due)
 
@@ -1011,7 +1019,7 @@ def copy_check_receipt(target, state, ref):
     """Checkpoint this pair independently of log offsets, pending events and unrelated work."""
     for name in ('unsupported', 'limited', 'retested', 'retest_errors', 'verified', 'verify_tried',
                  'verify_errors', 'problems'):
-        keys = ('runtime_check:' + ref, 'retest:' + ref, 'return_check:' + ref) if name == 'problems' else (ref,)
+        keys = (RUNTIME_CHECK_PREFIX + ref, RETEST_PREFIX + ref, RETURN_CHECK_PREFIX + ref) if name == 'problems' else (ref,)
         source = state.get(name, {})
         for key in keys:
             if key in source:
@@ -1023,7 +1031,7 @@ def copy_check_receipt(target, state, ref):
 def exact_check(state, ref, out):
     """Both hold and return checks use the same capability receipt and problem episode."""
     result, until, why = retest_one(ref)
-    key = 'runtime_check:' + ref
+    key = RUNTIME_CHECK_PREFIX + ref
     problems = state.setdefault('problems', {})
     if result == 'unsupported' or key in problems:
         out.setdefault('runtime_checks', set()).add(ref)
@@ -1033,7 +1041,7 @@ def exact_check(state, ref, out):
         state.get('verified', {}).pop(ref, None)
         for ledger in ('retest_errors', 'verify_errors'):
             state.get(ledger, {}).pop(ref, None)
-        for prefix in ('retest:', 'return_check:'):
+        for prefix in (RETEST_PREFIX, RETURN_CHECK_PREFIX):
             problems.pop(prefix + ref, None)
         if key not in problems:
             text = 'OpenClaw cannot check the runtime-bound model on this account: ' + ref
@@ -1091,8 +1099,8 @@ def retest_holds(state, health, out):
         else:
             n = errs[k] = errs.get(k, 0) + 1
             journal('hold_retest', key=k, result=res, in_a_row=n, error=why)
-            if n >= RETEST_ERRORS and 'runtime_check:' + k not in state['problems']:
-                prob(out, 'retest:' + k, 'hold %s: its re-test failed %d times in a row (%s); the hold stays'
+            if n >= RETEST_ERRORS and RUNTIME_CHECK_PREFIX + k not in state['problems']:
+                prob(out, RETEST_PREFIX + k, 'hold %s: its re-test failed %d times in a row (%s); the hold stays'
                      % (k, n, why[:120]))
 
 
@@ -1131,8 +1139,8 @@ def verify(state, health, ref, out, request=True):
     _VERIFY['failed'].add(ref)
     if res == 'error':    # not a limit: returns there stop, so a streak of these must reach someone
         n = errs[ref] = [(errs.get(ref) or [0])[0] + 1, NOW()]
-        if n[0] >= RETEST_ERRORS and 'runtime_check:' + ref not in state['problems']:
-            prob(out, 'return_check:' + ref, 'return to %s: its check failed %d times in a row (%s); work stays where it is'
+        if n[0] >= RETEST_ERRORS and RUNTIME_CHECK_PREFIX + ref not in state['problems']:
+            prob(out, RETURN_CHECK_PREFIX + ref, 'return to %s: its check failed %d times in a row (%s); work stays where it is'
                  % (ref, n[0], why[:120]))
     else:
         errs.pop(ref, None)
@@ -2182,7 +2190,7 @@ def order_pass(state, health, conf, jobs, out):
             best = next((p for p in health.pref(m) if health.alive(p, m)
                          and '%s@%s' % (m, p) not in tried
                          and '%s@%s' % (m, p) not in state.get('unsupported', {})
-                         and 'runtime_check:%s@%s' % (m, p) not in state.get('problems', {})), None)
+                         and RUNTIME_CHECK_PREFIX + '%s@%s' % (m, p) not in state.get('problems', {})), None)
             if best:
                 score[best] = score.get(best, 0) + weight[m]
         first = max(order, key=lambda p: (score.get(p, 0), -order.index(p)))   # a tie keeps the current first
@@ -2548,7 +2556,7 @@ def load_state():
         s = {}             # a corrupt file only loses log offsets and dedup memory; the next pass rebuilds them
     for ref, until in s.get('limited', {}).items():
         if until <= NOW():
-            s.get('problems', {}).pop('runtime_check:' + ref, None)
+            s.get('problems', {}).pop(RUNTIME_CHECK_PREFIX + ref, None)
     return s               # no 'started' yet (new or imported state): load_jobs sets it, earlier history is not counted
 
 
@@ -2692,7 +2700,7 @@ def main():
         if APPLY:
             note_prefer(state, conf)
         for k in [k for k, u in limited.items() if u <= NOW() or '/' not in k.split('@', 1)[0]]:
-            state.get('problems', {}).pop('runtime_check:' + k, None)
+            state.get('problems', {}).pop(RUNTIME_CHECK_PREFIX + k, None)
             state.get('verified', {}).pop(k, None)   # a proof before a limit says nothing about after it
             if limited.pop(k) <= NOW() and conf.get('prefer'):
                 state['retry'] = True       # a limit ran out: ask the accounts so work can return now
