@@ -999,10 +999,25 @@ def retest_one(ref):
 
 def exact_check_due(state, ref, last, now):
     refusal = state.get('unsupported', {}).get(ref)
-    if refusal and last <= refusal['at']:
-        return (refusal['version'] != state['selfcheck']['version']
-                or now - refusal['at'] >= UNSUPPORTED_RETRY_MS)
+    if refusal:
+        if refusal['version'] == state['selfcheck']['version'] and now - refusal['at'] < UNSUPPORTED_RETRY_MS:
+            return False
+        if last <= refusal['at']:
+            return True
     return now - last >= RETEST_EVERY_MS
+
+
+def copy_check_receipt(target, state, ref):
+    """Checkpoint this pair independently of log offsets, pending events and unrelated work."""
+    for name in ('unsupported', 'limited', 'retested', 'retest_errors', 'verified', 'verify_tried',
+                 'verify_errors', 'problems'):
+        keys = ('runtime_check:' + ref, 'retest:' + ref, 'return_check:' + ref) if name == 'problems' else (ref,)
+        source = state.get(name, {})
+        for key in keys:
+            if key in source:
+                target.setdefault(name, {})[key] = source[key]
+            else:
+                target.get(name, {}).pop(key, None)
 
 
 def exact_check(state, ref, out):
@@ -1010,6 +1025,8 @@ def exact_check(state, ref, out):
     result, until, why = retest_one(ref)
     key = 'runtime_check:' + ref
     problems = state.setdefault('problems', {})
+    if result == 'unsupported' or key in problems:
+        out.setdefault('runtime_checks', set()).add(ref)
     if result == 'unsupported':
         now = NOW()
         state.setdefault('unsupported', {})[ref] = {'version': state['selfcheck']['version'], 'at': now}
@@ -1022,11 +1039,10 @@ def exact_check(state, ref, out):
             text = 'OpenClaw cannot check the runtime-bound model on this account: ' + ref
             problems[key] = {'raised': now, 'left': 1, 'once': True, 'text': text}
             journal('problem', key=key, text=text)
-        out['runtime_checked'] = True
-        save(state)  # retain the refusal if a later operation crashes
+        checkpoint = load_state()
+        copy_check_receipt(checkpoint, state, ref)
+        save(checkpoint)
     else:
-        if key in problems:
-            out['runtime_checked'] = True
         state.get('unsupported', {}).pop(ref, None)
         if result == 'ok':
             problems.pop(key, None)
@@ -2530,6 +2546,9 @@ def load_state():
         s = json.loads(STATE.read_text()) if STATE.exists() else {}
     except Exception:
         s = {}             # a corrupt file only loses log offsets and dedup memory; the next pass rebuilds them
+    for ref, until in s.get('limited', {}).items():
+        if until <= NOW():
+            s.get('problems', {}).pop('runtime_check:' + ref, None)
     return s               # no 'started' yet (new or imported state): load_jobs sets it, earlier history is not counted
 
 
@@ -2727,9 +2746,12 @@ def main():
         down(state, out, 'pass cut off after %d s; what was done is saved, the rest continues next pass' % PASS_HARD_S,
              slow=True, part=part)
     except (Shape, Unreachable) as e:
-        if not (out['moved'] or out['chats'] or out['continued'] or out['aborted'] or out['cleared'] or out.get('runtime_checked')):
+        if not (out['moved'] or out['chats'] or out['continued'] or out['aborted'] or out['cleared']):
             eff = state.get('prefer_eff')
-            state = json.loads(before)    # nothing was done: keep log offsets and pending events for the next pass
+            restored = json.loads(before)  # replay unfinished work, keeping completed checks of runtime-bound pairs
+            for ref in out.get('runtime_checks', ()):
+                copy_check_receipt(restored, state, ref)
+            state = restored
             if eff is not None:
                 state['prefer_eff'] = eff  # but the order this pass follows (and journaled), not the last pass's
         if isinstance(e, Unreachable):

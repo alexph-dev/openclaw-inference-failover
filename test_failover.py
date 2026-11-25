@@ -3098,6 +3098,33 @@ def test_runtime_refusal_shares_daily_retry_across_hold_and_return_without_starv
     assert len(kinds(checks, 'problem')) == 1
 
 
+def test_runtime_refusal_survives_a_later_gateway_failure_without_advancing_log_offsets():
+    ref = OPUS + '@' + PA
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK, log=[{'message': 'new log entry'}])
+    prefer(d)
+    fake(d, retest={ref: {'rc': 1, 'err': CODEX_REFUSAL}})
+    runner = d / 'interrupted.py'
+    runner.write_text(f"""import sys
+from unittest.mock import patch
+sys.path.insert(0, {str(HERE.resolve())!r})
+import failover as F
+
+def unavailable(*args):
+    assert not F.load_state().get('offsets'), 'an incomplete pass was already checkpointed'
+    raise F.Unreachable('gateway unavailable')
+
+with patch.object(F, 'check', unavailable):
+    F.main()
+""")
+    with patch.dict(os.environ, OCF_SCRIPT=str(runner)):
+        rc, err, _ = go(d, True)
+    assert rc == 1 and 'runtime-bound' in err and 'Traceback' not in err, err
+    assert not state_of(d).get('offsets') and requests(d) == [ref]
+    rc, err, j = go(d, True)
+    assert rc == 0 and any(state_of(d)['offsets'].values()) and requests(d) == [ref], err
+    assert len(kinds(j, 'problem')) == 1 and len(runtime_problems(d)) == 1
+
+
 def test_ending_a_runtime_bound_hold_closes_its_problem_and_preserves_the_retry_delay():
     ref = OPUS + '@' + PA
     d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
@@ -3108,6 +3135,7 @@ def test_ending_a_runtime_bound_hold_closes_its_problem_and_preserves_the_retry_
     s = state_of(d)
     s['limited'][ref] = ms() - 1
     (d / 'st/state.json').write_text(json.dumps(s))
+    assert not runtime_problems(d)  # status also sees expiry between scheduled passes
     rc, err, j = go(d, True)
     assert rc == 0 and requests(d) == [ref] and binding(d, 'a') == OPUS + '@' + PB
     assert not runtime_problems(d)
