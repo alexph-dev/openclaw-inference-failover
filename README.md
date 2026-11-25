@@ -250,6 +250,13 @@ Requirements and limits:
   dry run makes none. An answer clears the hold (journal `hold_cleared`) and the next pass moves work back by the
   usual rules; a limit keeps it, at the newly named time if the provider names one; any other failure keeps it and
   becomes a problem after three in a row (journal `hold_retest`). `--status` lists the holds and their last re-test.
+  A model served only through an agent runtime (`agentRuntime.id`, such as `codex`) is refused by the `--local`
+  request before any provider call, and OpenClaw 2026.11.3 has no isolated request that locks such a model to one
+  account. The first `unsupported` result opens one problem for that model and account and leaves the pair unverified.
+  Hold re-tests and return checks share the refusal. The next eligible check can run when the installed OpenClaw
+  version changes or 24 hours have elapsed, whichever comes first. The problem raises one alert and remains visible
+  in `--status` until a real request succeeds or the hold ends. Hold expiry preserves the retry delay. A return
+  still requires proof. Account usage readings do not currently supply that proof.
 - Cron, agent-to-agent (`a2a`), subagent and worker sessions are not continued as human chats. Dashboard keys also
   require a worker-metadata check; a remotely placed or spawned worker is not a browser conversation.
 - Before mutation, recovery refreshes the exact run, queued/newer input and model selection after account probes.

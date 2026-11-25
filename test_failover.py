@@ -3018,6 +3018,133 @@ def test_local_model_checks_can_be_disabled_without_accepting_unverified_returns
         assert state['limited'][FABLE + '@' + PA] > ms()
 
 
+# OpenClaw 2026.11.3's refusal of an isolated --local request for a model only an agent runtime serves (synthetic names).
+RUNTIME_REF = 'openai/example-runtime-model@openai:example'
+RUNTIME_REFUSAL = ('Unknown model: openai/example-runtime-model. Found agents.defaults.models["openai/example-runtime-'
+                   'model"] bound to the "codex" agent runtime. Models served by an agent runtime come from that runtime '
+                   'and its linked account, not from models.providers["openai"].models[] — registering it there will not '
+                   'make it usable. Confirm "example-runtime-model" is still offered by the "codex" runtime.')
+CODEX_REFUSAL = ('The codex provider is served by the Codex app-server agent runtime, not the local simple-completion '
+                 'transport. Use an openai/<model> ref with provider/model agentRuntime.id: "codex", run through the '
+                 'gateway, or use /codex commands.')
+
+
+@offline
+def test_a_runtime_bound_model_check_is_a_named_blocker_never_a_proof():
+    # Incident 25 Nov 2026: return checks of codex-runtime models failed every hour as plain errors ('Unknown model').
+    # OpenClaw serves such a model only through its agent runtime, and no isolated request can lock it to one account,
+    # so --local refuses it before any provider request. That is no answer and no limit: the pair stays unverified,
+    # its hold stays, and the problem names the missing check instead of a generic failure.
+    def page(message):
+        error = {'type': 'cli_error', 'message': message}
+        return {'rc': 1, 'out': 'log line\n' + json.dumps({'ok': False, 'error': error})}
+
+    env = {'OCF_FAKE_CALLS': str(F.SDIR / 'calls')}
+    for refusal in (RUNTIME_REFUSAL, CODEX_REFUSAL):
+        with patch.object(F, 'FAKE', {'retest': {RUNTIME_REF: page(refusal)}}), patch.dict(os.environ, env):
+            res, until, why = F.retest_one(RUNTIME_REF)
+        assert (res, until) == ('unsupported', None) and 'runtime-bound' in why, (res, why)
+
+
+def runtime_problems(d):
+    env = dict(os.environ, OCF_STATE=str(d / 'st'), OCF_SETTINGS=str(d / 'settings.json'))
+    status = subprocess.check_output([sys.executable, str(HERE / 'failover.py'), '--status'], env=env)
+    return json.loads(status)['open_problems']
+
+
+def test_runtime_refusal_blocks_returns_until_version_change_and_closes_on_proof():
+    ref = OPUS + '@' + PA
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d)
+    fake(d, retest={ref: {'rc': 1, 'err': CODEX_REFUSAL}})
+    rc, err, j = go(d, True)
+    assert rc == 1 and 'runtime-bound' in err and requests(d) == [ref], (rc, err)
+    assert binding(d, 'a') == OPUS + '@' + PB and not state_of(d).get('verified')
+    assert go(d, True)[0] == 0 and requests(d) == [ref]
+    # A different version may still refuse. It gets an immediate check, in the same open episode.
+    rc, err, j = go(d, True, env={'OCF_FAKE_VERSION': '2026.11.4'})
+    assert rc == 0 and requests(d) == [ref, ref] and len(kinds(j, 'problem')) == 1, (err, j)
+    assert 'runtime-bound' in runtime_problems(d)[0]['text']
+    fake(d, retest={ref: RT_OK})
+    rc, err, j = go(d, True, env={'OCF_FAKE_VERSION': '2026.11.5'})
+    assert rc == 0 and requests(d) == [ref] * 3 and binding(d, 'a') == ref
+    assert not runtime_problems(d)
+
+
+@offline
+def test_runtime_refusal_shares_daily_retry_across_hold_and_return_without_starving_other_pairs():
+    ref = RUNTIME_REF
+    other = ref + '-other'
+    hour = 3600_000
+    start = ms()
+    state = {'selfcheck': {'version': '2026.11.3'}}
+    health = F.Health({}, {})
+    out = {'problems': [], 'cleared': []}
+    with patch.object(F, 'FAKE', {'retest': {ref: {'rc': 1, 'err': CODEX_REFUSAL}, other: RT_OK}}), \
+            patch.dict(os.environ, OCF_FAKE_CALLS=str(F.SDIR / 'calls')), patch.object(F, 'APPLY', True), \
+            patch.dict(F._VERIFY, n=0, failed=set()), patch.object(F, 'NOW', return_value=start) as clock:
+        assert not F.verify(state, health, ref, out)
+        assert len(F.raise_due(state, out)) == 1
+        health.limited.update({ref: start + 48 * hour, other: start + 48 * hour})
+        clock.return_value = start + 24 * hour - 1
+        out['problems'].clear()
+        F.cleanup_prefer(state)
+        with patch.object(F, 'RETEST_PER_PASS', 1):
+            F.retest_holds(state, health, out)
+        assert out['cleared'] == [other] and ref in health.limited
+        assert not F.raise_due(state, out)
+        clock.return_value += 1
+        F.retest_holds(state, health, out)
+        assert not F.raise_due(state, out) and ref in health.limited
+    checks = [json.loads(line) for line in F.JOURNAL.read_text().splitlines()]
+    assert [r['key'] for r in kinds(checks, 'hold_retest')] == [ref]
+    assert len(kinds(checks, 'problem')) == 1
+
+
+def test_runtime_refusal_survives_a_later_gateway_failure_without_advancing_log_offsets():
+    ref = OPUS + '@' + PA
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK, log=[{'message': 'new log entry'}])
+    prefer(d)
+    fake(d, retest={ref: {'rc': 1, 'err': CODEX_REFUSAL}})
+    runner = d / 'interrupted.py'
+    runner.write_text(f"""import sys
+from unittest.mock import patch
+sys.path.insert(0, {str(HERE.resolve())!r})
+import failover as F
+
+def unavailable(*args):
+    assert not F.load_state().get('offsets'), 'an incomplete pass was already checkpointed'
+    raise F.Unreachable('gateway unavailable')
+
+with patch.object(F, 'check', unavailable):
+    F.main()
+""")
+    with patch.dict(os.environ, OCF_SCRIPT=str(runner)):
+        rc, err, _ = go(d, True)
+    assert rc == 1 and 'runtime-bound' in err and 'Traceback' not in err, err
+    assert not state_of(d).get('offsets') and requests(d) == [ref]
+    rc, err, j = go(d, True)
+    assert rc == 0 and any(state_of(d)['offsets'].values()) and requests(d) == [ref], err
+    assert len(kinds(j, 'problem')) == 1 and len(runtime_problems(d)) == 1
+
+
+def test_ending_a_runtime_bound_hold_closes_its_problem_and_preserves_the_retry_delay():
+    ref = OPUS + '@' + PA
+    d = setup({'a': (OPUS, PB, 'trusted')}, [], ALL_OK)
+    prefer(d, state={'limited': {ref: ms() + 86400_000}})
+    fake(d, retest={ref: {'rc': 1, 'err': CODEX_REFUSAL}})
+    rc, err, j = go(d, True)
+    assert rc == 1 and requests(d) == [ref] and ref in state_of(d)['limited'], (err, j)
+    s = state_of(d)
+    s['limited'][ref] = ms() - 1
+    (d / 'st/state.json').write_text(json.dumps(s))
+    assert not runtime_problems(d)  # status also sees expiry between scheduled passes
+    rc, err, j = go(d, True)
+    assert rc == 0 and requests(d) == [ref] and binding(d, 'a') == OPUS + '@' + PB
+    assert not runtime_problems(d)
+    assert not state_of(d).get('verified')
+
+
 def test_failed_rebind_retried_ok_next_pass_does_not_fail_that_pass():
     # 23 Nov 08:08: a rebind timed out while the Gateway was busy and did not land; the next pass rebound the job
     # fine but still exited 1 for the ledger's second pass, a failure streak for a problem that pass had fixed.
