@@ -92,6 +92,11 @@ CLI_RETEST = lambda ref, agent: ['infer', 'model', 'run', '--local', '--model', 
 RETEST_HELP = (['infer', 'model', 'run', '--help'], ('--local', '--model', '--agent', '--json'))   # self-check
 RETEST_OK, RETEST_OUTPUTS, RETEST_ERROR = 'ok', 'outputs', 'error'  # answer {ok: true, outputs: [{text}]} | {ok: false, error: {message}}
 RETRY_AFTER_RE = re.compile(r'Retry-After:\s*(\d+)\s*seconds', re.I)   # the provider's wait in the CLI's error message
+# Its refusal, before any provider request, of a model only an agent runtime serves (agentRuntime.id, e.g. codex).
+# 2026.11.3 offers no isolated request that locks such a model to one account (--gateway takes no account), so the
+# pair cannot be proven here: not an answer, not a limit. Compatibility anchors, not self-check items.
+RETEST_RUNTIME_ONLY = ('Models served by an agent runtime come from that runtime and its linked account',
+                       'served by the Codex app-server agent runtime, not the local simple-completion transport')
 # JSON fields of the CLI answers ('a.b' = nested)
 JOBS_LIST, RUNS_LIST = 'jobs', 'entries'                            # top-level lists of cron list / cron runs
 LIST_MORE = 'hasMore'                                               # true when the job list did not fit one page
@@ -957,8 +962,9 @@ class Health:
 
 
 def retest_one(ref):
-    """One real minimal request of this model on this account (CLI_RETEST). Returns ('ok' | 'limit' | 'error', the time
-    the provider named for a limit in ms or None, a short reason)."""
+    """One real minimal request of this model on this account (CLI_RETEST). Returns ('ok' | 'limit' | 'error' |
+    'unsupported', the time the provider named for a limit in ms or None, a short reason). 'unsupported': OpenClaw
+    refused the isolated request because an agent runtime serves the model (RETEST_RUNTIME_ONLY); it stays unproven."""
     if FAKE is not None:                   # tests: {ref: {rc, out, err}}
         time.sleep(FAKE.get('slow_retest', 0))
         a = FAKE.get('retest', {}).get(ref) or {'rc': 1, 'err': 'fake: no answer for ' + ref}
@@ -982,6 +988,8 @@ def retest_one(ref):
     msg = (e.get('message') if isinstance(e, dict) else e if isinstance(e, str) else None) or \
         (err or out or '').strip()[-300:] or ('timeout' if rc == 124 else 'rc=%s' % rc)
     both = '%s\n%s' % (msg, err or '')
+    if any(t in '%s\n%s' % (both, out or '') for t in RETEST_RUNTIME_ONLY):
+        return 'unsupported', None, ('no isolated check of a runtime-bound model on one account: ' + msg)[:300]
     if LIMIT_RE.search(both) or re.search(r'status=429\b|^429\b', both, re.M):
         w = RETRY_AFTER_RE.search(both)
         return 'limit', (NOW() + int(w.group(1)) * 1000) if w else None, msg[:300]
@@ -1027,7 +1035,7 @@ def retest_holds(state, health, out):
             journal('hold_retest', key=k, result='limit', until=hm(limited.get(k, 0)), error=why)
         else:
             n = errs[k] = errs.get(k, 0) + 1
-            journal('hold_retest', key=k, result='error', in_a_row=n, error=why)
+            journal('hold_retest', key=k, result=res, in_a_row=n, error=why)
             if n >= RETEST_ERRORS:
                 prob(out, 'retest:' + k, 'hold %s: its re-test failed %d times in a row (%s); the hold stays'
                      % (k, n, why[:120]))
@@ -1065,7 +1073,7 @@ def verify(state, health, ref, out, request=True):
         errs.pop(ref, None)
         return True
     _VERIFY['failed'].add(ref)
-    if res == 'error':                     # not a limit: returns there stop, so a streak of these must reach someone
+    if res in ('error', 'unsupported'):    # not a limit: returns there stop, so a streak of these must reach someone
         n = errs[ref] = [(errs.get(ref) or [0])[0] + 1, NOW()]
         if n[0] >= RETEST_ERRORS:
             prob(out, 'return_check:' + ref, 'return to %s: its check failed %d times in a row (%s); work stays where it is'

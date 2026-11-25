@@ -3018,6 +3018,50 @@ def test_local_model_checks_can_be_disabled_without_accepting_unverified_returns
         assert state['limited'][FABLE + '@' + PA] > ms()
 
 
+# OpenClaw 2026.11.3's refusal of an isolated --local request for a model only an agent runtime serves (synthetic names).
+RUNTIME_REF = 'openai/example-runtime-model@openai:example'
+RUNTIME_REFUSAL = ('Unknown model: openai/example-runtime-model. Found agents.defaults.models["openai/example-runtime-'
+                   'model"] bound to the "codex" agent runtime. Models served by an agent runtime come from that runtime '
+                   'and its linked account, not from models.providers["openai"].models[] — registering it there will not '
+                   'make it usable. Confirm "example-runtime-model" is still offered by the "codex" runtime.')
+CODEX_REFUSAL = ('The codex provider is served by the Codex app-server agent runtime, not the local simple-completion '
+                 'transport. Use an openai/<model> ref with provider/model agentRuntime.id: "codex", run through the '
+                 'gateway, or use /codex commands.')
+
+
+@offline
+def test_a_runtime_bound_model_check_is_a_named_blocker_never_a_proof():
+    # Incident 25 Nov 2026: return checks of codex-runtime models failed every hour as plain errors ('Unknown model').
+    # OpenClaw serves such a model only through its agent runtime, and no isolated request can lock it to one account,
+    # so --local refuses it before any provider request. That is no answer and no limit: the pair stays unverified,
+    # its hold stays, and the problem names the missing check instead of a generic failure.
+    out = lambda: {'problems': [], 'verify_due': [], 'retest_due': [], 'cleared': []}
+    page = lambda m: {'rc': 1, 'out': 'log line\n' + json.dumps({'ok': False, 'error': {'type': 'cli_error', 'message': m}})}
+    env = {'OCF_FAKE_CALLS': str(F.SDIR / 'calls')}
+    for refusal in (RUNTIME_REFUSAL, CODEX_REFUSAL):
+        with patch.object(F, 'FAKE', {'retest': {RUNTIME_REF: page(refusal)}}), patch.dict(os.environ, env):
+            res, until, why = F.retest_one(RUNTIME_REF)
+        assert (res, until) == ('unsupported', None) and 'runtime-bound' in why, (res, why)
+    state, health = {}, F.Health({'primary': OPUS, 'chain': [], 'order': {}})
+    with patch.object(F, 'FAKE', {'retest': {RUNTIME_REF: page(RUNTIME_REFUSAL)}}), patch.object(F, 'APPLY', True), \
+            patch.dict(os.environ, env), patch.dict(F._VERIFY, {'n': 0, 'failed': set()}):
+        for _ in range(F.RETEST_ERRORS):
+            F._VERIFY.update(n=0, failed=set())
+            o = out()
+            assert not F.verify(state, health, RUNTIME_REF, o)
+            state['verify_tried'][RUNTIME_REF] -= F.RETEST_EVERY_MS        # an hour later the next check is due
+        assert RUNTIME_REF not in state.get('verified', {}) and RUNTIME_REF not in health.limited, state
+        (key, text), = o['problems']
+        assert key == 'return_check:' + RUNTIME_REF and 'runtime-bound' in text, o['problems']
+        held = {'limited': {RUNTIME_REF: ms() + 86400_000}}
+        hold_health = F.Health({'primary': OPUS, 'chain': [], 'order': {}}, held['limited'])
+        F.retest_holds(held, hold_health, out())
+        assert held['limited'][RUNTIME_REF] > ms() and RUNTIME_REF not in held.get('verified', {}), held
+    j = [json.loads(x) for x in F.JOURNAL.read_text().splitlines()]
+    assert [(r['kind'], r['result']) for r in j] == [('return_check', 'unsupported')] * F.RETEST_ERRORS + \
+        [('hold_retest', 'unsupported')], j
+
+
 def test_failed_rebind_retried_ok_next_pass_does_not_fail_that_pass():
     # 23 Nov 08:08: a rebind timed out while the Gateway was busy and did not land; the next pass rebound the job
     # fine but still exited 1 for the ledger's second pass, a failure streak for a problem that pass had fixed.
