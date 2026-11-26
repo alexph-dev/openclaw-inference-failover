@@ -3590,6 +3590,35 @@ def test_gateway_restart_interrupt_in_the_stored_entry_is_continued():
     assert c['run'] == IRUN and 'Gateway restart' in c['error'], c
 
 
+def test_log_dir_prefers_newest_between_state_logs_and_tmp_dirs():
+    with tempfile.TemporaryDirectory(prefix='ocf-logdir-') as tmp:
+        root = pathlib.Path(tmp)
+        oc_dir = root / 'state'
+        state_logs = oc_dir / 'logs'
+        tmp_logs = root / 'tmp-openclaw'
+        state_logs.mkdir(parents=True)
+        tmp_logs.mkdir(parents=True)
+        old_tmp = tmp_logs / 'openclaw-2026-11-22.log'
+        new_state = state_logs / 'openclaw-2026-11-26.log'
+        old_tmp.write_text('{}\n')
+        new_state.write_text('{}\n')
+        os.utime(old_tmp, (1700000000, 1700000000))
+        os.utime(new_state, (1700000500, 1700000500))
+        cfg_path = str(root / 'openclaw.json')
+        open(cfg_path, 'w').write('{}')
+        env_clean = {k: v for k, v in os.environ.items() if k != 'OCF_LOG_DIR'}
+        with patch.dict(os.environ, env_clean, clear=True), \
+                patch.object(F, 'OC_DIR', oc_dir), \
+                patch.object(F, 'CONFIG', cfg_path), \
+                patch.object(F, 'LOG_TMP_DIRS', (str(tmp_logs),)):
+            F._CACHE.pop('log_dir', None)
+            assert F.log_dir() == str(state_logs)
+            os.utime(old_tmp, (1700001000, 1700001000))
+            F._CACHE.pop('log_dir', None)
+            assert F.log_dir() == str(tmp_logs)
+            F._CACHE.pop('log_dir', None)
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:

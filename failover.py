@@ -305,8 +305,8 @@ def cached(f):
 
 @cached
 def log_dir():
-    """Directory of the Gateway's daily logs: logging.file in the config if set, else the per-user temp directory
-    (/tmp/openclaw or /tmp/openclaw-<uid>) that holds the newest openclaw-*.log."""
+    """Directory of the Gateway's daily logs: logging.file in the config if set, else the default log directory
+    ($OPENCLAW_STATE_DIR/logs, /tmp/openclaw, or /tmp/openclaw-<uid>) that holds the newest openclaw-*.log."""
     if os.environ.get('OCF_LOG_DIR'):
         return os.environ['OCF_LOG_DIR']
     try:
@@ -315,7 +315,7 @@ def log_dir():
             return os.path.dirname(os.path.expanduser(f))
     except Exception:
         pass
-    dirs = [d.format(uid=os.getuid()) for d in LOG_TMP_DIRS]
+    dirs = [str(OC_DIR / 'logs')] + [d.format(uid=os.getuid()) for d in LOG_TMP_DIRS]
     best, t = dirs[0], -1
     for d in dirs:
         for f in glob.glob(os.path.join(d, LOG_GLOB)):
