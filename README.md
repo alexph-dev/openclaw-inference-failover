@@ -62,7 +62,15 @@ limits). After those come the entries of
   nothing to a chat itself: the continuation prompt asks the agent to open its reply with one line, in the chat's own
   language, saying the chat moved to another model, and to reconcile completed actions and uncertain side effects
   before doing more work, rather than replaying the request. Every limit event the script drops is journaled
-  (`event_drop`) with the reason.
+  (`event_drop`) with the reason. A turn older than 60 minutes is not continued.
+- **Turns killed by infrastructure.** A human chat turn whose run was ended by a Gateway restart or shutdown, or by
+  `Plugin <name> was reloaded or disabled`, is continued once on the chat's current model and account, when no run
+  is active, the person's latest message has no reply after it, and nobody wrote again or stopped it. The signals are
+  the stored entry's `lastRunError` and the transcript's `run-failed-before-reply` notice (read with `chat.history`);
+  message-tool chats also log the errored run. The 60 minutes count from the later of the failure and the Gateway
+  being ready again (`gateway startup outcomes:`), so Gateway downtime does not count. The prompt says a Gateway
+  restart cut the turn off and asks the agent not to repeat completed actions; it adds no model line. Journal:
+  `turn_continue` with `reason: infra`; a failed continuation is reported like any other.
 - **Account preference.** A nonempty explicit saved order supplies the preference for configured models and models used by
   watched jobs, chats and parked homes of that provider.
   It takes priority over settings and computed usage until cleared. Without a saved override, the optional settings
