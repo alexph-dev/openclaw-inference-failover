@@ -37,10 +37,15 @@ whole account: a probe that answers ok for one model says nothing about another 
   holds  a model@account is held until the time its provider named. A provider may end a limit early, so a hold with
          more than an hour left is re-tested at most hourly with one real request of that model on that account
          (openclaw infer model run --local --model provider/model@account); an answer clears the hold.
-  turns  a human chat turn whose run died on a limit (the limit was the run's last word in the log) is continued on a
-         live model@account, unless the user already wrote again or a person stopped it. The continuation prompt asks
-         the agent to open its reply with one line, in the chat's own language, saying the chat moved to another model.
-         A turn that merely timed out is not continued.
+  turns  a human chat turn is continued in two cases, unless the user already wrote again or a person stopped it,
+         and only within 60 min (FRESH_MS):
+         limit  its run died on a limit (the limit was the run's last word in the log): continued on a live
+                model@account. The prompt asks the agent to open its reply with one line, in the chat's own language,
+                saying the chat moved to another model. A turn that merely timed out is not continued.
+         infra  infrastructure killed its run (a Gateway restart or shutdown, or 'Plugin X was reloaded or
+                disabled'), no run is active and the person's latest message has no reply after it: continued once
+                on the chat's current model and account. The 60 min count from the later of the failure and the
+                Gateway being ready again. The prompt says a Gateway restart cut the turn off; no model line.
   check  every 30 min it compares the last 24 h of limit failures with what it did.
   problems  anything it cannot fix fails the run (exit 1, reason on stderr) on two passes in a row, then stays quiet
          while it is open, and fails again only if it is still open after 6 h (a missing OpenClaw surface: after
@@ -122,8 +127,15 @@ PROBE_ARGS = lambda provider, agent: {'provider': provider, 'agentId': agent}   
 DESCRIBE_ARGS = lambda key: {'key': key}                            # sessions.describe params
 PATCH_ARGS = lambda key, ref: {'key': key, 'model': ref}            # sessions.patch params
 ABORT_ARGS = lambda key, run: {'key': key, 'runId': run}            # sessions.abort params
+RPC_HISTORY = 'chat.history'                                        # a session's transcript, oldest first: {messages: [...]}
+HISTORY_ARGS = lambda key: {'sessionKey': key, 'limit': 150}        # NO_REPLY answers are not in it
+H_MESSAGES, H_ROLE, H_META, H_PROVENANCE = 'messages', 'role', '__openclaw', 'provenance'   # provenance: inter-session input
+H_CUSTOM, H_FAILED, H_RUN_ERROR = 'customType', 'run-failed-before-reply', 'openclawRunError'  # {runId, summary}
+H_SENDER_KIND = ('senderIdentity', 'senderKind')                    # 'human' on channel messages; absent in WebChat
+H_SEND_TOOL = 'message'                                             # the tool that delivers to the chat
 S_ROOT = 'session'                                                  # sessions.describe wrapper
 S_ACTIVE, S_LAST_RUN = 'hasActiveRun', 'lastRunId'                  # run state of a session (its status word is not read)
+S_RUN_ERROR, S_ENDED = 'lastRunError', 'endedAt'                    # how and when the last run ended
 S_DELIVERY, S_TO = 'deliveryContext', 'lastTo'
 S_ID = 'sessionId'                                                  # persisted session id
 S_WRITER, S_LIFECYCLE, S_ACTIVE_IDS = 'activeWriterRunId', 'lifecycleRunId', 'activeRunIds'
@@ -182,6 +194,13 @@ KEY_RE = re.compile(r'sessionKey[=:\s\\"]+(agent:[^"\\\s,]+)')         # session
 HAND_STOP_RE = re.compile(r'\b(?:chat\.abort requested|sessions\.abort requested: actor=(?!cli\b))')
                                                                     # a person pressed stop (Control UI logs sessions.abort,
                                                                     # actor=openclaw-control-ui). actor=cli is this script.
+# Infrastructure kills (2026.11.3 wording): a run ended by the Gateway or a plugin reload, not by the model. Found in
+# a stored entry's lastRunError (status 'interrupted' or 'failed') and in the run-failed-before-reply notice of the
+# transcript. A message-tool chat's run that ended errored or aborted is logged with NATIVE_OUTCOME (runId, sessionKey).
+INFRA_RE = re.compile(r'Run interrupted by (?:a )?Gateway restart|Gateway is shutting down|'
+                      r'Plugin \S+ was reloaded or disabled|Plugin tools changed during automation setup')
+INFRA_RUN_STATUS = ('errored', 'aborted')                           # runStatus of a NATIVE_OUTCOME worth a transcript look
+GATEWAY_READY = 'gateway startup outcomes:'                         # logged when a (re)started Gateway runs channels and cron
 ANCHORS = ('transient same-model retry', 'Model request failed', EV_END)   # self-check anchors
 ANCHOR_DIRS = ('dist', 'node_modules/@openclaw/ai/dist')            # where the anchors live in the package
 # Session keys
@@ -224,8 +243,13 @@ LOCAL = lambda fmt: time.strftime(fmt, time.localtime())
 WINDOW_MS = 90 * 60_000        # run history looked at
 PROBE_EVERY_MS = 5 * 60_000    # accounts are asked at least this often while any job or pinned chat uses them
 CHECK_EVERY_MS = 30 * 60_000   # cadence of the 24 h check inside --apply passes
-FRESH_MS = 20 * 60_000         # a failed chat turn older than this when first seen is not continued
+FRESH_MS = 60 * 60_000         # a failed chat turn older than this is not continued (owner, 26 Nov 2026). An
+                               # infrastructure kill counts from the later of the failure and the Gateway being ready
+                               # again: this job is down with the Gateway, so that downtime does not count
 WAIT_MS = 2 * 3600_000         # a failed chat turn waits this long for any live account, then is a problem
+READY_WITHIN_MS = 3600_000     # a Gateway start this soon after the kill counts as its restart; later ones do not move
+                               # the window
+INFRA_KEEP_MS = 24 * 3600_000  # a decided infrastructure kill is remembered this long (longer than any window)
 STRICT = frozenset(k.strip() for k in os.environ.get('OCF_STRICT_CHATS', '').split(',') if k.strip())
 CHAT_BANNED_MODELS = tuple(p.strip() for p in os.environ.get(
     'OCF_CHAT_BANNED_MODELS', 'openai/*-sol,openai/gpt-6-luna,openai/gpt-6.1-terra').split(',') if p.strip())
@@ -507,9 +531,19 @@ def native_limit_terminal(rec):
             'no_continue': True, 'key': key}
 
 
+def infra_line(rec, ev):
+    """A log record that infra_pass needs: a message-tool chat's run that ended errored or aborted, or a Gateway start."""
+    one, t = rec.get(L1), ts_ms(rec)
+    if rec.get(L2) == NATIVE_OUTCOME and isinstance(one, dict) and one.get(L_STATUS) in INFRA_RUN_STATUS \
+            and one.get(L_RUN) and isinstance(one.get('sessionKey'), str):
+        ev['ended'][one[L_RUN]] = [one['sessionKey'], t]
+    elif isinstance(one, str) and one.startswith(GATEWAY_READY):
+        ev['ready'].append(t)
+
+
 def scan_logs(state):
     """New complete log lines since the last pass -> stalls, failed turns, run->session keys, providers seen limited."""
-    ev = {'stalls': [], 'failed': {}, 'run_key': {}, 'providers': set()}
+    ev = {'stalls': [], 'failed': {}, 'run_key': {}, 'providers': set(), 'ended': {}, 'ready': []}
     offs = state.setdefault('offsets', {})
     files = log_files()
     for f in files:
@@ -521,13 +555,14 @@ def scan_logs(state):
         chunk = chunk[:chunk.rfind(b'\n') + 1]       # a half-written last line is read next pass
         offs[f] = start + len(chunk)
         for raw in chunk.split(b'\n'):
-            if not any(x.encode() in raw for x in LIMITED + (ANCHORS[1], NATIVE_OUTCOME)):
+            if not any(x.encode() in raw for x in LIMITED + (ANCHORS[1], NATIVE_OUTCOME, GATEWAY_READY)):
                 continue
             try:
                 rec = json.loads(raw)
             except Exception:
                 continue
             one, two, t = rec.get(L1), rec.get(L2), ts_ms(rec)
+            infra_line(rec, ev)
             if two == NATIVE_OUTCOME:
                 native = native_limit_terminal(rec)
                 if native:
@@ -1924,14 +1959,20 @@ def has_chat(key, s):
     return bool(LOCAL_CHAT_RE.match(key) or GROUP_RE.match(key) or dc.get('to') or s.get(S_TO))
 
 
-def continue_turn(key, model, moved, run_id=''):
+def continue_turn(key, model, moved, run_id='', infra=False):
     """Starts the continuation as its own user unit; returns (result, unit). No --reply-to: an explicit target drops
     the session's topic/thread, the session's own stored route keeps it. When the model changed, the agent itself
-    opens its reply with one line in the chat's language (this script sends nothing to a chat)."""
+    opens its reply with one line in the chat's language (this script sends nothing to a chat). infra: the turn was
+    killed by a Gateway restart or a plugin reload; it continues on the chat's own model, with no model line."""
     tell = ('Start your reply with one short line, in the language this chat uses, saying that the AI account hit its '
             'usage limit and this chat now runs on %s; then answer. If nothing is unanswered, reply exactly NO_REPLY and '
             'nothing else, without that line.' % model) if moved else 'If nothing is unanswered, reply exactly NO_REPLY. Do not mention this note.'
-    msg = ('[Inference failover, automatic] The turn with run ID %s in this chat was interrupted by a provider usage '
+    msg = ('[Inference failover, automatic] The previous turn in this chat (run ID %s) was cut off by a Gateway '
+           'restart before it answered. Check the transcript, then finish the person\'s latest request. Do not repeat '
+           'actions that already completed (sends, payments, writes); verify uncertain side effects before retrying '
+           'them. Reply in this chat as usual. Respect intentional stops and any newer instruction. %s' % (run_id, tell)) \
+        if infra else \
+          ('[Inference failover, automatic] The turn with run ID %s in this chat was interrupted by a provider usage '
            'limit. This session now runs on %s. Review the transcript and reconcile completed tool actions and delivery '
            'receipts with current state before acting. Continue only the unfinished part of that interrupted '
            'request, in the usual language and format of this chat. Do not replay the entire request or repeat '
@@ -1972,6 +2013,153 @@ def continued_check(state, out):
             prob(out, 'continue:' + unit, 'chat %s: the continued turn failed (journalctl --user -u %s)' % (key[-40:], unit))
         if FAKE is None and APPLY:
             run(['systemctl', '--user', 'reset-failed', unit], 15)
+
+
+def history(key):
+    """The session's recent transcript, oldest first, or None when the Gateway cannot be asked (retried next pass)."""
+    if FAKE is not None:
+        return FAKE.get('history', {}).get(key, [])
+    d, err = gw(RPC_HISTORY, HISTORY_ARGS(key), 60)
+    msgs = (d or {}).get(H_MESSAGES)
+    return [m for m in msgs if isinstance(m, dict)] if isinstance(msgs, list) else None
+
+
+def human_message(m):
+    """A person's message: no inter-session provenance, and a sender kind of 'human' when one is recorded."""
+    return m.get(H_ROLE) == 'user' and not m.get(H_PROVENANCE) and \
+        (dig(m, (H_META,) + H_SENDER_KIND) or 'human') == 'human'
+
+
+def reply_message(m):
+    """An answer the chat saw: a final assistant text other than NO_REPLY, or a send through the message tool.
+    Inter-session input mirrored as an assistant message is no answer."""
+    if m.get(H_ROLE) != 'assistant' or m.get(H_PROVENANCE):
+        return False
+    c = m.get('content')
+    blocks = [{'type': 'text', 'text': c}] if isinstance(c, str) else [b for b in c or [] if isinstance(b, dict)]
+    if any(b.get('type') == 'toolCall' and b.get('name') == H_SEND_TOOL for b in blocks):
+        return True
+    return m.get('stopReason') != 'toolUse' and any(
+        b.get('type') == 'text' and (b.get('text') or '').strip() not in ('', 'NO_REPLY') for b in blocks)
+
+
+def infra_turn(msgs, run_id, e):
+    """(why not, infrastructure error) for the turn run_id handled. The error comes from the run's
+    run-failed-before-reply notice, else from the entry when run_id is its last run; None: no infrastructure kill.
+    The turn is the person's latest message before the run's notice (or its last message); it qualifies when no person
+    wrote after the run failed and nothing answered that message."""
+    run_of = lambda m: (m.get(H_RUN_ERROR) or {}).get('runId') or (m.get(H_META) or {}).get('runId')
+    notice = [i for i, m in enumerate(msgs) if m.get(H_CUSTOM) == H_FAILED and run_of(m) == run_id]
+    traces = [i for i, m in enumerate(msgs) if run_of(m) == run_id]
+    error = None
+    if notice:
+        m = msgs[notice[-1]]
+        text = (m.get(H_RUN_ERROR) or {}).get('summary') or m.get('content')
+        error = text if isinstance(text, str) and INFRA_RE.search(text) else None
+    if error is None and e.get(S_LAST_RUN) == run_id and isinstance(e.get(S_RUN_ERROR), str) \
+            and INFRA_RE.search(e[S_RUN_ERROR]):
+        error = e[S_RUN_ERROR]
+    if error is None:
+        return '', None
+    end = notice[-1] if notice else traces[-1] if traces else len(msgs) if e.get(S_LAST_RUN) == run_id else None
+    if end is None:
+        return 'the run is not in the transcript', error
+    if any(human_message(m) for m in msgs[end + 1:]):
+        return 'a person wrote again', error
+    asked = [i for i, m in enumerate(msgs[:end]) if human_message(m)]
+    if not asked:
+        return 'no person\'s message before it in the transcript', error
+    if any(reply_message(m) for m in msgs[asked[-1] + 1:]):
+        return 'it was answered', error
+    return '', error
+
+
+def infra_candidates(state, entries):
+    """Recent runs of human chats that may have been killed by infrastructure: {run: (key, failed at)}. Message-tool
+    chats log every errored or aborted run (NATIVE_OUTCOME, kept in state['infra_runs'] by scan_logs); other chats show
+    it in their stored entry."""
+    found = {r: tuple(c) for r, c in state.get('infra_runs', {}).items()}
+    for key, e in entries.items():
+        if e.get(S_LAST_RUN) and isinstance(e.get(S_ENDED), (int, float)) and isinstance(e.get(S_RUN_ERROR), str) \
+                and INFRA_RE.search(e[S_RUN_ERROR]):
+            found.setdefault(e[S_LAST_RUN], (key, int(e[S_ENDED])))
+    return found
+
+
+def infra_log(state, ev):
+    """Keeps the log records infra_pass needs for INFRA_KEEP_MS. The first pass of this version reads them from the
+    whole log files once, because earlier passes already read past them."""
+    if 'infra_runs' not in state:
+        ev = dict(ev, ended=dict(ev['ended']), ready=list(ev['ready']))
+        for f in log_files():
+            with open(f, 'rb') as fh:
+                for raw in fh:
+                    if NATIVE_OUTCOME.encode() in raw or GATEWAY_READY.encode() in raw:
+                        try:
+                            infra_line(json.loads(raw), ev)
+                        except ValueError:
+                            pass
+    runs, ready = state.setdefault('infra_runs', {}), state.setdefault('gateway_ready', [])
+    runs.update(ev['ended'])
+    ready[:] = sorted(set(ready) | set(ev['ready']))
+    for r in [r for r, (_, t) in runs.items() if NOW() - t > INFRA_KEEP_MS]:
+        runs.pop(r)
+    ready[:] = [t for t in ready if NOW() - t <= INFRA_KEEP_MS]
+
+
+def infra_pass(state, entries, out):
+    """Human chat turns killed by infrastructure (a Gateway restart or shutdown, a plugin reload) are continued once,
+    on the chat's current model and account. The FRESH_MS window counts from the later of the failure and the first
+    Gateway start after it, so time the Gateway (and with it this job) was down does not count. A run already owned by
+    the limit logic is left to it. Each decided run is remembered in state['infra']: at most one continuation per run."""
+    done = state.setdefault('infra', {})
+    for r in [r for r, v in done.items() if NOW() - v.get('at', 0) > INFRA_KEEP_MS]:
+        done.pop(r)
+    found = {r: c for r, c in infra_candidates(state, entries).items()
+             if r not in done and r not in state.get('pending', {}) and r not in state.get('handled', {})
+             and CHAT_RE.match(c[0])}
+    starts = state.get('gateway_ready', [])
+    for r, (key, t) in found.items():
+        if late() or not fits(60 + 20):
+            break
+        ready = next((x for x in starts if t <= x <= t + READY_WITHIN_MS), t)
+        if NOW() - ready > FRESH_MS:
+            continue                       # too old: never continued, and too cheap a test to remember
+        decide = lambda why, **kw: done.update({r: dict({'t': t, 'at': NOW(), 'why': why}, **kw)})
+        try:
+            s = session(key)
+        except RuntimeError:
+            continue                       # Gateway busy: next pass
+        e, queued = entry(key)
+        if not s or not human_chat(key, s, e):
+            decide('not a human chat' if s else 'the session no longer exists')
+            continue
+        if s.get(S_ACTIVE):
+            continue                       # a run is working on the chat: look again once it is over
+        msgs = history(key)
+        if msgs is None:
+            continue
+        why, error = infra_turn(msgs, r, e)
+        if error is None:
+            decide('not an infrastructure kill')
+            continue
+        why = why or ('the user already wrote' if queued else '') or \
+            ('a person stopped it' if stopped_by_hand(r, t) else '') or ('' if has_chat(key, s) else 'no chat')
+        if why:
+            decide(why)
+            journal('event_drop', session=key, run=r, event='infra', why=why)
+            continue
+        res, unit = continue_turn(key, None, False, r, infra=True)
+        if unit:
+            state.setdefault('continued', {})[unit] = key
+        if res not in ('started', 'dry-run'):
+            prob(out, 'continue:' + r, 'chat %s: could not start the continued turn: %s' % (key[-40:], res[:120]))
+            journal('turn_continue', session=key, run=r, reason='infra', error=error[:160], result=res)
+            continue                       # the unit name is fixed per run: a retry never runs twice
+        decide('continued', unit=unit)
+        save(state)
+        journal('turn_continue', session=key, run=r, reason='infra', error=error[:160], ready=ready, result=res)
+        out['continued'].append((key[-40:], 'infra'))
 
 
 def stopped_continuation(unit):
@@ -2845,6 +3033,7 @@ def main():
             prob(out, 'partial', 'the job list has more than one page (%d jobs shown); jobs beyond it are not watched'
                  % len(jobs))
         ev = scan_logs(state)
+        infra_log(state, ev)
         for ref, n in streak.items():
             if n >= 2:         # held for an hour after the last failure, so jobs do not bounce straight back
                 health.hold(PROF(ref), NOW() + HOLD_MS, MODEL(ref))
@@ -2864,6 +3053,7 @@ def main():
             state['probed_at'] = NOW()
             state['retry'] = bool(out['deferred'] or out['no_target'] or health.failed)
         stalls_and_chats(state, health, jobs, out)
+        infra_pass(state, entries, out)
         findings = chat_policy_findings(state, conf)
         chat_policy_problems(state, findings, report=APPLY)
         if not APPLY:

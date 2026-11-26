@@ -3471,6 +3471,125 @@ def test_chat_policy_reports_busy_chat_once_and_closes_after_repair():
     assert len([r for r in kinds(j, 'problem') if r['key'] == 'chat_policy:' + K]) == 1
 
 
+
+# Infrastructure kills. Shape of the live case of 26 Nov 2026 (Listings topic): a person's message arrived while a
+# Codex run worked; the run failed before it replied with 'Plugin openai was reloaded or disabled'; an inter-session
+# message then started a newer run that answered NO_REPLY (hidden from chat.history); the Gateway restarted and was
+# ready again 16 min after the failure. Text is paraphrased, ids are synthetic.
+IRUN, ILATER = '00000000-0000-4000-8000-0000000000c1', '00000000-0000-4000-8000-0000000000c2'
+PLUGIN_ERR = 'Plugin openai was reloaded or disabled; use its current tools.'
+
+
+def infra_history(after=()):
+    meta = lambda run: {'runId': run}
+    return [
+        {'role': 'assistant', 'content': [{'type': 'text', 'text': 'Earlier answer.'}], 'stopReason': 'stop',
+         'model': 'delivery-mirror'},
+        {'role': 'user', 'content': 'Keep the deposit for this house, please.',
+         '__openclaw': {'senderIsOwner': True, 'senderIdentity': {'senderKind': 'human'}}},
+        {'role': 'custom', 'customType': F.H_FAILED, 'content': "Your request couldn't be completed: " + PLUGIN_ERR,
+         'openclawRunError': {'runId': IRUN, 'summary': "Your request couldn't be completed: " + PLUGIN_ERR},
+         '__openclaw': meta(IRUN)},
+        {'role': 'assistant', 'content': '[Inter-session message] a status note from another topic',
+         'provenance': {'kind': 'inter_session'}, '__openclaw': dict(meta(ILATER), senderIsOwner=False)},
+        {'role': 'assistant', 'content': [{'type': 'toolCall', 'name': 'bash', 'arguments': {}}], 'stopReason': 'toolUse',
+         '__openclaw': meta(ILATER)},
+        {'role': 'toolResult', 'content': [{'type': 'text', 'text': 'ok'}], '__openclaw': meta(ILATER)},
+    ] + list(after)
+
+
+def infra_setup(failed_ago=21 * 60, ready_ago=5 * 60, key=K, history=None, active=False, extra_log=()):
+    out = line({'runId': IRUN, 'sessionKey': key, 'provider': 'openai', 'model': 'gpt-6-astra', 'outcome': 'mute',
+                'runStatus': 'errored'}, F.NATIVE_OUTCOME, ago=failed_ago)
+    ready = line('gateway startup outcomes: internal-hooks=loaded', ago=ready_ago)
+    d = setup(log=[out, ready] + list(extra_log), probe=ALL_OK,
+              sessions={key: {'key': key, 'hasActiveRun': active, 'lastRunId': ILATER}},
+              entries={key: {'lastRunId': ILATER, 'status': 'done', 'lastInteractionAt': ms() - 20 * 60_000}})
+    fake(d, history={key: infra_history() if history is None else history})
+    return d
+
+
+def test_turn_killed_by_a_plugin_reload_is_continued_once_on_its_own_model():
+    d = infra_setup()
+    rc, err, j = go(d)
+    c, = kinds(j, 'turn_continue')
+    assert (c['session'], c['run'], c['reason'], c['result']) == (K, IRUN, 'infra', 'started'), j
+    assert PLUGIN_ERR in c['error'] and not kinds(j, 'chat_move'), j
+    assert json.loads((d / 'st/state.json').read_text())['infra'][IRUN]['why'] == 'continued'
+    assert len(kinds(go(d)[2], 'turn_continue')) == 1                 # a second pass: no duplicate
+    assert rc == 0, err
+
+
+def test_infra_continuation_prompt_names_the_restart_and_no_model_line():
+    calls = []
+    with patch.object(F, 'APPLY', True), patch.object(F, 'FAKE', None), \
+            patch.object(F, 'run', lambda argv, timeout=120: calls.append(argv) or (0, '', '')):
+        res, unit = F.continue_turn(K, None, False, IRUN, infra=True)
+    msg = calls[0][calls[0].index('--message') + 1]
+    assert res == 'started' and unit and '--deliver' in calls[0] and '--session-key' in calls[0], calls
+    assert 'cut off by a Gateway restart before it answered' in msg and IRUN in msg, msg
+    assert 'usage limit' not in msg and 'now runs on' not in msg, msg
+
+
+def test_infra_kill_left_alone_when_a_person_wrote_again():
+    d = infra_setup(history=infra_history([{'role': 'user', 'content': 'Never mind.'}]))
+    j = go(d)[2]
+    drop, = [x for x in kinds(j, 'event_drop') if x.get('event') == 'infra']
+    assert drop['why'] == 'a person wrote again' and not kinds(j, 'turn_continue'), j
+
+
+def test_infra_kill_left_alone_after_a_stop():
+    d = infra_setup(history=infra_history([{'role': 'user', 'content': '/stop'}]))
+    assert not kinds(go(d)[2], 'turn_continue')
+    stop = line('chat.abort requested runId=%s' % IRUN, ago=20 * 60)
+    d = infra_setup(extra_log=[stop])
+    j = go(d)[2]
+    assert [x['why'] for x in kinds(j, 'event_drop')] == ['a person stopped it'] and not kinds(j, 'turn_continue'), j
+
+
+def test_infra_kill_waits_while_a_run_is_active():
+    d = infra_setup(active=True)
+    j = go(d)[2]
+    assert not kinds(j, 'turn_continue') and not kinds(j, 'event_drop'), j
+    assert IRUN not in json.loads((d / 'st/state.json').read_text()).get('infra', {})   # looked at again later
+
+
+def test_infra_kill_of_a_cron_run_is_never_continued():
+    ck = 'agent:main:cron:00000000-0000-4000-8000-00000000000a:run:00000000-0000-4000-8000-0000000000f1'
+    j = go(infra_setup(key=ck))[2]
+    assert not kinds(j, 'turn_continue'), j
+
+
+def test_infra_kill_answered_or_not_infra_is_not_continued():
+    answered = infra_history([{'role': 'assistant', 'content': [{'type': 'text', 'text': 'Done.'}], 'stopReason': 'stop'}])
+    assert not kinds(go(infra_setup(history=answered))[2], 'turn_continue')
+    limit = infra_history()
+    limit[2] = dict(limit[2], openclawRunError={'runId': IRUN, 'summary': 'The AI service needs a short break.'})
+    assert not kinds(go(infra_setup(history=limit))[2], 'turn_continue')
+
+
+def test_infra_window_counts_from_gateway_ready_not_from_the_failure():
+    # Failed 66 min ago, but the Gateway was down until 10 min ago: inside the window.
+    assert kinds(go(infra_setup(failed_ago=66 * 60, ready_ago=10 * 60))[2], 'turn_continue')
+    # Just over 60 min after ready: too old.
+    assert not kinds(go(infra_setup(failed_ago=80 * 60, ready_ago=61 * 60))[2], 'turn_continue')
+    # No restart after the failure: the failure itself starts the window.
+    assert not kinds(go(infra_setup(failed_ago=61 * 60, ready_ago=2 * 3600))[2], 'turn_continue')
+
+
+def test_gateway_restart_interrupt_in_the_stored_entry_is_continued():
+    # WebChat has no message-tool receipt: the stored entry names the interrupted last run.
+    main = 'agent:main:main'
+    d = setup(probe=ALL_OK, sessions={main: {'key': main, 'hasActiveRun': False, 'lastRunId': IRUN}},
+              entries={main: {'lastRunId': IRUN, 'status': 'interrupted', 'endedAt': ms() - 5 * 60_000,
+                              'lastRunError': 'Run interrupted by a Gateway restart.'}})
+    fake(d, history={main: [{'role': 'user', 'content': 'Check the report.', '__openclaw': {'senderIsOwner': True}},
+                            {'role': 'assistant', 'content': [{'type': 'toolCall', 'name': 'bash'}], 'stopReason': 'toolUse',
+                             '__openclaw': {'runId': IRUN}}]})
+    c, = kinds(go(d)[2], 'turn_continue')
+    assert c['run'] == IRUN and 'Gateway restart' in c['error'], c
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:
