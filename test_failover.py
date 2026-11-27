@@ -473,6 +473,62 @@ def test_stalled_one_shot_job_is_moved_but_never_aborted():
     assert binding(d, STALL_JOB) == OPUS + '@' + PB
 
 
+def sleeping_cron_log(*later):
+    # As OpenClaw 2026.11.3 logs it: the attempt ends on the 429, a cleanup line of the same attempt follows within a
+    # second or two, then the run sleeps out the provider's wait. Nothing else names the run while it sleeps.
+    return stall_log() + [line({'event': 'embedded_run_agent_end', 'runId': '26cafcf4', 'isError': True,
+                                'failoverReason': 'rate_limit', 'provider': 'anthropic', 'model': 'claude-opus-5-5'},
+                               'embedded run agent end', ago=41),
+                          line({'runId': '26cafcf4', 'failurePhase': 'bridge'}, 'Code Mode execution failed', ago=38)] + list(later)
+
+
+def test_cron_run_sleeping_between_attempts_is_aborted_though_its_session_is_not_active():
+    # A cron run's session reports no active run while it sleeps out a same-model retry: OpenClaw clears the attempt's
+    # run handle before the sleep. Only a later log line of the run means it woke up or ended.
+    for sched in (('cron', 20 * 3600), ('every', 3600)):
+        d = setup({STALL_JOB: (OPUS, PA, 'trusted')}, log=sleeping_cron_log(),
+                  probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'ok'}},
+                  sessions={STALL_KEY: {'key': STALL_KEY, 'hasActiveRun': False}}, sched={STALL_JOB: sched})
+        rc, err, j = go(d)
+        a, = kinds(j, 'cron_stall_abort')
+        assert (a['run'], a['result']) == ('26cafcf4', 'ok') and not kinds(j, 'event_drop'), (err, j)
+        assert binding(d, STALL_JOB) == OPUS + '@' + PB
+        assert len(kinds(go(d, True)[2], 'cron_stall_abort')) == 1        # handled once
+
+
+def test_cron_run_that_woke_up_or_ended_after_the_stall_is_left_alone():
+    later = (line('lane task error: lane=cron-nested error="aborted" runId=26cafcf4', ago=10),   # it ended
+             line('[model-fetch] response status=200 runId="26cafcf4"', ago=10))               # it woke up
+    for x in later:
+        for active in (False, True):
+            d = setup({STALL_JOB: (OPUS, PA, 'trusted')}, log=sleeping_cron_log(x),
+                      probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'ok'}},
+                      sessions={STALL_KEY: {'key': STALL_KEY, 'hasActiveRun': active}}, sched={STALL_JOB: ('cron', 3600)})
+            rc, err, j = go(d)
+            drop, = kinds(j, 'event_drop')
+            assert drop['why'] == 'the cron run woke up or ended' and not kinds(j, 'cron_stall_abort'), j
+
+
+def test_sleeping_one_shot_cron_run_is_left_even_when_its_session_is_not_active():
+    d = setup({STALL_JOB: (OPUS, PA, 'trusted')}, log=sleeping_cron_log(),
+              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'ok'}},
+              sessions={STALL_KEY: {'key': STALL_KEY, 'hasActiveRun': False}}, sched={STALL_JOB: ('at', 0)})
+    rc, err, j = go(d)
+    assert not kinds(j, 'cron_stall_abort') and len(kinds(j, 'cron_stall_left')) == 1 and not kinds(j, 'event_drop'), j
+
+
+def test_cron_stall_abort_that_stops_nothing_is_reported():
+    # sessions.abort answers ok but names no aborted run: the run still sleeps. That is a problem, not an abort.
+    d = setup({STALL_JOB: (OPUS, PA, 'trusted')}, log=sleeping_cron_log(),
+              probe={'anthropic': {PB: 'ok', PA: 'rate_limit', PC: 'ok'}},
+              sessions={STALL_KEY: {'key': STALL_KEY, 'hasActiveRun': False}}, sched={STALL_JOB: ('cron', 3600)})
+    fake(d, abort_answer={'ok': True, 'abortedRunId': None, 'status': 'no-active-run'})
+    rc, err, j = go(d)
+    a, = kinds(j, 'cron_stall_abort')
+    assert a['result'] == 'no-active-run' and rc == 1 and 'found no active run' in err, (rc, err, j)
+    assert binding(d, STALL_JOB) == OPUS + '@' + PB                     # the job still moves for its next run
+
+
 def test_failed_continuation_is_reported():
     d = setup(probe={'anthropic': {PB: 'ok'}})
     (d / 'st').mkdir()
