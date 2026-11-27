@@ -3048,6 +3048,27 @@ def test_a_runtime_bound_model_check_is_a_named_blocker_never_a_proof():
         assert (res, until) == ('unsupported', None) and 'runtime-bound' in why, (res, why)
 
 
+@offline
+def test_exclusive_offline_ownership_refusal_is_unsupported_not_repeated_retest_error():
+    # OpenClaw 2026.11.10 refuses `infer model run --local` whenever a live Gateway owns the state root.
+    ref = 'anthropic/example-model@anthropic:example'
+    msg = ('Cannot admit infer model run for agent model credentials in state root /tmp/example: '
+           'This operation requires exclusive offline state ownership. Omit --local to run it through the Gateway.')
+    env = {'OCF_FAKE_CALLS': str(F.SDIR / 'calls')}
+    with patch.object(F, 'FAKE', {'retest': {ref: {'rc': 1, 'err': msg}}}), patch.dict(os.environ, env):
+        res, until, why = F.retest_one(ref)
+    assert (res, until) == ('unsupported', None) and 'while Gateway owns state' in why, (res, why)
+    state = {'selfcheck': {'version': '2026.11.10'}, 'problems': {F.RETEST_PREFIX + ref: {'raised': 1, 'left': 1, 'text': 'old'}}}
+    out = {'problems': []}
+    with patch.object(F, 'FAKE', {'retest': {ref: {'rc': 1, 'err': msg}}}), patch.dict(os.environ, env), \
+            patch.object(F, 'APPLY', True), patch.object(F, 'load_state', return_value={}), patch.object(F, 'save'):
+        res2, _, _ = F.exact_check(state, ref, out)
+    assert res2 == 'unsupported'
+    assert F.RETEST_PREFIX + ref not in state['problems']
+    assert 'while Gateway owns state' in state['problems'][F.RUNTIME_CHECK_PREFIX + ref]['text']
+    assert state['problems'][F.RUNTIME_CHECK_PREFIX + ref]['once'] is True
+
+
 def runtime_problems(d):
     env = dict(os.environ, OCF_STATE=str(d / 'st'), OCF_SETTINGS=str(d / 'settings.json'),
                OCF_CONFIG=str(d / 'cfg.json'), OCF_FAKE=str(d / 'fake.json'))

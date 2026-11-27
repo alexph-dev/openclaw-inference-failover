@@ -103,6 +103,10 @@ RETRY_AFTER_RE = re.compile(r'Retry-After:\s*(\d+)\s*seconds', re.I)   # the pro
 # pair cannot be proven here: not an answer, not a limit. Compatibility anchors, not self-check items.
 RETEST_RUNTIME_ONLY = ('Models served by an agent runtime come from that runtime and its linked account',
                        'served by the Codex app-server agent runtime, not the local simple-completion transport')
+# OpenClaw 2026.11.10 refuses isolated --local model checks while a live Gateway owns the state root, and its
+# Gateway path drops @profile pinning (openclaw/openclaw#206121). Treat the admission refusal like RETEST_RUNTIME_ONLY:
+# never a proof and never a limit, re-checked after UNSUPPORTED_RETRY_MS or on the next OpenClaw version.
+RETEST_OFFLINE_ONLY = ('This operation requires exclusive offline state ownership',)
 # JSON fields of the CLI answers ('a.b' = nested)
 JOBS_LIST, RUNS_LIST = 'jobs', 'entries'                            # top-level lists of cron list / cron runs
 LIST_MORE = 'hasMore'                                               # true when the job list did not fit one page
@@ -1040,6 +1044,8 @@ def retest_one(ref):
     both = '%s\n%s' % (msg, err or '')
     if any(t in '%s\n%s' % (both, out or '') for t in RETEST_RUNTIME_ONLY):
         return 'unsupported', None, ('no isolated check of a runtime-bound model on one account: ' + msg)[:300]
+    if any(t in '%s\n%s' % (both, out or '') for t in RETEST_OFFLINE_ONLY):
+        return 'unsupported', None, ('no isolated local check while Gateway owns state: ' + msg)[:300]
     if LIMIT_RE.search(both) or re.search(r'status=429\b|^429\b', both, re.M):
         w = RETRY_AFTER_RE.search(both)
         return 'limit', (NOW() + int(w.group(1)) * 1000) if w else None, msg[:300]
@@ -1085,7 +1091,9 @@ def exact_check(state, ref, out):
         for prefix in (RETEST_PREFIX, RETURN_CHECK_PREFIX):
             problems.pop(prefix + ref, None)
         if key not in problems:
-            text = 'OpenClaw cannot check the runtime-bound model on this account: ' + ref
+            text = ('OpenClaw refuses isolated local check while Gateway owns state: '
+                    if 'while Gateway owns state' in why
+                    else 'OpenClaw cannot check the runtime-bound model on this account: ') + ref
             problems[key] = {'raised': now, 'left': 1, 'once': True, 'text': text}
             journal('problem', key=key, text=text)
         checkpoint = load_state()
