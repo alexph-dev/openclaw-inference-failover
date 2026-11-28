@@ -2,7 +2,7 @@
 """openclaw-inference-failover: moves OpenClaw work off AI accounts that hit a provider usage limit.
 
 Run once a minute by an OpenClaw command job. Usage holds apply to one model on one account (model@account).
-OpenClaw auth cooldowns apply to the provider account and can end early when a fresh probe answers ok.
+OpenClaw auth cooldowns apply to the provider account and can end early in models status or when a fresh probe answers ok.
   jobs   a cron job whose model@account is held or probed out moves to the same model on the next live account
          of auth.order, else to the first live entry of agents.defaults.model.fallbacks. The targets of a provider are
          the accounts its non-empty stored order lists, ahead of config auth.order; a provider without either has all its
@@ -932,7 +932,8 @@ class Health:
         # model they were seen on only, until the time the provider named. A probe answer never clears a hold; a real
         # request of that model on that account does (retest_holds), since a provider may reset a limit early.
         self.conf, self.limited, self.cache, self.failed = conf, limited if limited is not None else {}, {}, []
-        self.cooldowns = cooldowns if cooldowns is not None else {}    # {profile: auth cooldown expiry}
+        self.cooldowns = cooldowns if cooldowns is not None else {}    # persisted {profile: auth cooldown expiry}
+        self.confirmed_cooldowns = set()     # profiles listed as cooling in this pass's models status
         self.probe_errors = set()   # generic connection failures, including under an empty auth order
         self.models_snapshot, self.models_read, self.models_error = None, False, None
         self.saved, self.saved_err = None, None    # the agent's saved accounts, read once per pass when first needed
@@ -988,6 +989,7 @@ class Health:
             for p, status in res.items():
                 if status == PROBE_OK:
                     self.cooldowns.pop(p, None)
+                    self.confirmed_cooldowns.discard(p)
             if any(s != PROBE_OK and s not in LIMITED for s in res.values()):
                 self.models_status()      # resolve ambiguous or auth-related answers even with a non-empty order
             journal('probe', provider=provider, result=res, cooldowns={p: self.cooldowns[p] for p in res if self.cooling(p)})
@@ -998,7 +1000,7 @@ class Health:
         return MS_COOLDOWN if self.cooling(profile) else status
 
     def cooling(self, profile):
-        return self.cooldowns.get(profile, 0) > NOW()
+        return profile in self.confirmed_cooldowns and self.cooldowns[profile] > NOW()
 
     def held(self, profile, model):
         return self.limited.get('%s@%s' % (model, profile), 0) > NOW()
@@ -1040,12 +1042,19 @@ class Health:
             return None
         try:
             self.models_snapshot = cli_json(CLI_MODELS(default_agent()), timeout)
-            for p, until in profile_cooldowns(self.models_snapshot).items():
-                if self.cache.get(p.split(':')[0], {}).get(p) != PROBE_OK:
-                    self.cooldowns[p] = until
         except (Shape, Unreachable) as e:
             self.models_error = quiet_error(e)
             journal('models_status_failed', error=self.models_error)
+            return None
+        cooldown_snapshot = profile_cooldowns(self.models_snapshot)
+        if cooldown_snapshot is not None:
+            providers, active = cooldown_snapshot
+            for p in [p for p in self.cooldowns if p.split(':')[0] in providers and p not in active]:
+                self.cooldowns.pop(p)
+            for p, until in active.items():
+                if self.cache.get(p.split(':')[0], {}).get(p) != PROBE_OK:
+                    self.cooldowns[p] = until
+                    self.confirmed_cooldowns.add(p)
         return self.models_snapshot
 
     def saved_store(self):
@@ -1120,9 +1129,9 @@ class Health:
     def unknown(self):
         """True when a probe failed or timed out for a target account (accounts()): 'nothing alive' is then unproven.
         auth, no_model and format are definite answers (that account cannot be used), so an expired token does not hide
-        'nothing alive'. A known cooldown is also definite. Without a non-empty order, an excluded account's unknown
-        answer is expected, but a connection failure is still unknown. A saved account read skipped for time leaves
-        any saved-only targets unproven."""
+        'nothing alive'. A cooldown confirmed this pass is also definite. Without a non-empty order, an excluded
+        account's unknown answer is expected, but a connection failure is still unknown. A saved account read skipped
+        for time leaves any saved-only targets unproven."""
         if self.saved_skipped:
             return True
         def open_(prov):
@@ -1369,13 +1378,36 @@ def cli_json(argv, timeout=75, fresh=False):
 
 
 def profile_cooldowns(data):
+    """Return covered providers and active cooldowns if the cooldown metadata has the expected shape.
+
+    Saved-profile discovery can still use its own fields when cooldown metadata is unavailable.
+    """
+    overview = dig(data, MS_COUNTS)
     rows = dig(data, MS_UNUSABLE)
+    if not isinstance(overview, list) or not isinstance(rows, list):
+        return None
+    if not all(isinstance(row, dict) and isinstance(row.get(MS_PROVIDER), str) and row[MS_PROVIDER]
+               for row in overview):
+        return None
+    providers = {row[MS_PROVIDER] for row in overview}
+    active = {}
     now = NOW()
-    return {p: until for row in (rows if isinstance(rows, list) else ()) if isinstance(row, dict)
-            and row.get(MS_KIND) == MS_COOLDOWN
-            and isinstance(p := row.get(MS_ID), str) and ':' in p
-            and row.get(MS_PROVIDER, p.split(':')[0]) == p.split(':')[0]
-            and type(until := row.get(MS_UNTIL)) is int and until > now}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(p := row.get(MS_ID), str):
+            return None
+        provider, sep, name = p.partition(':')
+        kind = row.get(MS_KIND)
+        if not (provider and sep and name and isinstance(kind, str) and kind
+                and row.get(MS_PROVIDER, provider) == provider):
+            return None
+        providers.add(provider)
+        if kind == MS_COOLDOWN:
+            until = row.get(MS_UNTIL)
+            if type(until) is not int:
+                return None
+            if until > now:
+                active[p] = until
+    return providers, active
 
 
 def saved_profiles(timeout=MS_TIMEOUT_S, data=None):
@@ -3194,7 +3226,8 @@ def main():
         if APPLY:
             note_prefer(state, conf)
         had_cooldowns = bool(cooldowns)
-        for p in [p for p in cooldowns if not health.cooling(p)]:
+        now = NOW()
+        for p in [p for p, until in cooldowns.items() if until <= now]:
             cooldowns.pop(p)
         for k in [k for k, u in limited.items() if u <= NOW() or '/' not in k.split('@', 1)[0]]:
             state.get('problems', {}).pop(RUNTIME_CHECK_PREFIX + k, None)

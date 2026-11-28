@@ -13,11 +13,12 @@ fixed, and delete the whole script when all of them are.
 ## What it does
 
 A usage hold applies to one model on one account (model@account). An OpenClaw auth cooldown applies to the provider
-account for any reason, including a failed credential refresh. A cooldown makes an ambiguous probe a definite
-unavailable result until its reported expiry or a fresh successful probe. Connection failures without cooldown
-evidence leave the account unproven. The targets of a provider are the accounts its non-empty
-stored auth order names, or config `auth.order` when no saved override exists. Stored order takes precedence without
-a manual settings or config copy. A provider without either non-empty list has all its
+account for any reason, including a failed credential refresh. An unexpired cooldown confirmed by the current pass
+makes an ambiguous probe a definite unavailable result. A fresh successful probe clears the cooldown, as does a new
+status snapshot that covers the provider and no longer lists the account in cooldown. On failed or skipped status
+reads, unexpired entries stay cached and connection failures leave the account unproven. The targets of a provider
+are the accounts its non-empty stored auth order names, or config `auth.order` when no saved override exists.
+Stored order takes precedence without a manual settings or config copy. A provider without either non-empty list has all its
 subscription accounts, declared in config or saved in the agent's auth store (see "Targets" under Requirements and
 limits). After those come the entries of
 `agents.defaults.model.fallbacks`.

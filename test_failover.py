@@ -3785,24 +3785,73 @@ def test_saved_order_change_probes_on_the_next_pass_and_moves_only_the_out_pin()
     assert not kinds(journal, 'chat_recover') and not requests(d)
 
 
-def test_cooldown_remains_definite_until_expiry_or_a_fresh_ok():
+@offline
+def test_snapshot_reconciles_cached_cooldowns_before_an_unknown_probe():
+    a, b, c = ASTRA_ACCOUNTS
+    until = ms() + 43_200_000
+    stale = {a: until, b: until, c: until, PB: until}
+    snapshot = cooldown_status((a, b), until)
+    snapshot['auth']['unusableProfiles'][1]['kind'] = 'disabled'
+    conf = {'order': {'openai': [a, b, c], 'anthropic': [PB]}}
+    probe = {'openai': dict.fromkeys(ASTRA_ACCOUNTS, COOLDOWN_UNKNOWN), 'anthropic': {PB: COOLDOWN_UNKNOWN}}
+    with patch.object(F, 'FAKE', {'probe': probe}), patch.object(F, 'cli_json', return_value=snapshot) as cli:
+        health = F.Health(conf, cooldowns=dict(stale))
+        health.models_status()  # saved-account discovery can read the snapshot before the provider probe
+        assert health.dead(a, ASTRA)
+        assert health.status(b) == health.status(c) == F.PROBE_UNKNOWN
+        assert not health.dead(b, ASTRA) and not health.dead(c, ASTRA) and health.unknown()
+        assert health.cooldowns == {a: until, PB: until}
+        assert health.status(PB) == F.PROBE_UNKNOWN and not health.dead(PB, OPUS)
+
+        cli.return_value = cooldown_status(ASTRA_ACCOUNTS, until)
+        health = F.Health({'order': {'openai': [a, b, c]}}, cooldowns=dict(stale))
+        assert all(health.dead(p, ASTRA) for p in ASTRA_ACCOUNTS) and not health.unknown()
+
+
+@offline
+def test_unavailable_cooldown_snapshot_keeps_cache_and_probe_uncertainty():
+    until = ms() + 600_000
+    conf = {'order': {'openai': [OA]}}
+    probe = {'openai': {OA: COOLDOWN_UNKNOWN}}
+    malformed = cooldown_status((OA,), until)
+    malformed['auth']['unusableProfiles'][0]['until'] = 'invalid'
+    cases = ((None, F.Unreachable('rc=1'), True, False), (malformed, None, True, False),
+             (None, None, False, False), (None, None, True, True))
+    for snapshot, error, fits, skip in cases:
+        with patch.multiple(F, FAKE={'probe': probe}, fits=lambda _: fits), \
+                patch.object(F, 'cli_json', return_value=snapshot, side_effect=error) as cli:
+            health = F.Health(conf, cooldowns={OA: until})
+            if skip:
+                health.no_probe = True
+                health.cache['openai'] = {OA: F.PROBE_UNKNOWN}
+                health.models_status()
+            assert health.status(OA) == F.PROBE_UNKNOWN
+            assert not health.dead(OA, ASTRA) and health.unknown() and health.cooldowns == {OA: until}
+            assert cli.called == (fits and not skip)
+
+
+def test_cooldown_requires_current_evidence_and_clears_on_expiry_or_a_fresh_ok():
     a, b, c = ASTRA_ACCOUNTS
     probe = {'openai': dict.fromkeys(ASTRA_ACCOUNTS, COOLDOWN_UNKNOWN), 'anthropic': DEAD, 'xai': XAI_OUT}
     d = setup({'job': (ASTRA, a, 'trusted')}, probe=probe)
     until = ms() + 600_000
-    fake(d, models_status=cooldown_status((a, b), until))
+    cached = dict.fromkeys(ASTRA_ACCOUNTS, until)
+    prefer(d, {}, state={'cooldowns': cached})
+    fake(d, models_status_rc=1)
+    rc, err, _ = go(d)
+    assert rc == 0 and not err and state_of(d)['cooldowns'] == cached
+
+    fake(d, models_status_rc=0, models_status=cooldown_status((a, b), until))
     rc, err, _ = go(d)
     assert rc == 0 and not err   # a genuine connection failure for C still leaves the outage unproven
+    assert state_of(d)['cooldowns'] == dict.fromkeys((a, b), until)
     fake(d, models_status=cooldown_status(ASTRA_ACCOUNTS, until))
     rc, err, _ = go(d)
     assert rc == 1 and 'no live account' in err
-    fake(d, models_status_rc=1)
-    rc, err, _ = go(d)
-    assert rc == 1 and 'no live account' in err and state_of(d)['cooldowns'][a] == until
 
-    fake(d, models_status_rc=0, probe=dict(probe, openai=dict(probe['openai'], **{c: 'ok'})))
-    rc, err, _ = go(d)   # the CLI still lists C, but its fresh provider probe takes precedence
-    assert rc == 0 and not err and binding(d, 'job') == ASTRA + '@' + c
+    fake(d, probe=dict(probe, openai=dict(probe['openai'], **{c: 'ok'})))
+    go(d)   # the CLI still lists C, but its fresh provider probe takes precedence
+    assert binding(d, 'job') == ASTRA + '@' + c
     assert c not in state_of(d)['cooldowns']
 
     elapsed = ms() - 1000
