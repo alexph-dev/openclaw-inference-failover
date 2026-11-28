@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """openclaw-inference-failover: moves OpenClaw work off AI accounts that hit a provider usage limit.
 
-Run once a minute by an OpenClaw command job. A limit is always one model on one account (model@account), never a
-whole account: a probe that answers ok for one model says nothing about another model on that account.
+Run once a minute by an OpenClaw command job. Usage holds apply to one model on one account (model@account).
+OpenClaw auth cooldowns apply to the provider account and can end early in models status or when a fresh probe answers ok.
   jobs   a cron job whose model@account is held or probed out moves to the same model on the next live account
          of auth.order, else to the first live entry of agents.defaults.model.fallbacks. The targets of a provider are
          the accounts its non-empty stored order lists, ahead of config auth.order; a provider without either has all its
@@ -26,7 +26,7 @@ whole account: a probe that answers ok for one model says nothing about another 
          computed from them: accounts with room for it first, earliest reset first (owner's rule: fill what resets
          soonest), then the full ones, back soonest first. Else the named order. Never claims a free reset.
   chats  a pinned human chat (a model or account the user chose, or this script set) is moved the same way on the same
-         passes, whatever its runs did.
+         passes, whatever its runs did. Parked chats return to their own model on the first live account in order.
   chat policy  each pass repairs banned current or home models to the configured primary. Applies to strict chats too.
   strict chats  session keys listed in OCF_STRICT_CHATS (comma-separated) fail over only to
          another account of their own model. While no account of it is live the chat is left alone, and a turn that
@@ -127,6 +127,8 @@ RPC_DESCRIBE = 'sessions.describe'                                  # one sessio
 RPC_PATCH = 'sessions.patch'                                        # set a chat's model@account
 RPC_ABORT = 'sessions.abort'                                        # abort a stalled run
 PROBE_RESULTS, PROBE_PROFILE, PROBE_STATUS = 'results', 'profileId', 'status'
+PROBE_ERROR, PROBE_OK, PROBE_UNKNOWN = 'error', 'ok', 'unknown'
+PROBE_FAILED_TEXT = 'The connection check failed.'
 PROBE_ARGS = lambda provider, agent: {'provider': provider, 'agentId': agent}   # models.probe params
 DESCRIBE_ARGS = lambda key: {'key': key}                            # sessions.describe params
 PATCH_ARGS = lambda key, ref: {'key': key, 'model': ref}            # sessions.patch params
@@ -169,6 +171,8 @@ MS_COUNTS, MS_COUNT_FIELD = ('auth', 'providers'), 'profiles'      # per provide
 MS_COUNT_TYPES = {'oauth': 'oauth', 'token': 'token', 'api_key': 'apiKey'}   # type -> count field
 MS_STATE = 'status'                                                 # per profile: ok, expiring, static, expired, missing
 MS_USABLE = ('ok', 'expiring', 'static')                            # credential states OpenClaw can use
+MS_UNUSABLE = ('auth', 'unusableProfiles')
+MS_KIND, MS_UNTIL, MS_COOLDOWN = 'kind', 'until', 'cooldown'          # per-profile auth cooldown, absolute epoch ms
 MS_TIMEOUT_S = 60                                                    # the command reads local files; ~8 s seen
 # Config file
 CFG_MODEL = ('agents', 'defaults', 'model')                         # {primary, fallbacks}
@@ -185,6 +189,7 @@ LOG_GLOB = 'openclaw-*.log'                                         # daily log 
 LOG_TMP_DIRS = ('/tmp/openclaw', '/tmp/openclaw-{uid}')             # default log directories
 L1, L2, L_META, L_DATE = '1', '2', '_meta', 'date'
 L_HTTP, L_BODY, L_PROV, L_MODEL = 'status', 'body', 'provider', 'model'   # fields of a failed model request / run end
+L_KEY, L_CODE, L_ERR_TEXT, L_MESSAGE = 'sessionKey', 'code', 'error', 'message'
 EV_AUTH_LIMIT = 'auth_profile_failure_state_updated'              # native-runtime account bookkeeping
 NATIVE_OUTCOME = 'recorded message-tool-only run outcome'           # terminal delivery receipt
 EV_END = 'embedded_run_agent_end'                                   # a run ended: {runId, isError, failoverReason, provider, model}
@@ -194,6 +199,7 @@ LIMITED = ('rate_limit', 'billing')                                 # failoverRe
 RETRY_RE = re.compile(r'transient same-model retry \d+/\d+ for (\S+) reason=rate_limit: delayMs=(\d+) '
                       r'runId="([^"]+)" sessionId="([^"]*)"')      # a run sleeping out a same-model rate-limit wait
 REQ_RE = re.compile(r'Model request failed sessionKey="([^"]+)" runId="([^"]+)"')   # a failed model request -> session
+RUN_ID_RE = re.compile(r'\brunId[=:]\s*["\']?([^"\'\s,|]+)')
 KEY_RE = re.compile(r'sessionKey[=:\s\\"]+(agent:[^"\\\s,]+)')         # session key inside any log line
 HAND_STOP_RE = re.compile(r'\b(?:chat\.abort requested|sessions\.abort requested: actor=(?!cli\b))')
                                                                     # a person pressed stop (Control UI logs sessions.abort,
@@ -205,7 +211,8 @@ INFRA_RE = re.compile(r'Run interrupted by (?:a )?Gateway restart|Gateway is shu
                       r'Plugin \S+ was reloaded or disabled|Plugin tools changed during automation setup')
 INFRA_RUN_STATUS = ('errored', 'aborted')                           # runStatus of a NATIVE_OUTCOME worth a transcript look
 GATEWAY_READY = 'gateway startup outcomes:'                         # logged when a (re)started Gateway runs channels and cron
-ANCHORS = ('transient same-model retry', 'Model request failed', EV_END)   # self-check anchors
+EMBEDDED_FAILED = 'Embedded agent failed before reply'
+ANCHORS = ('transient same-model retry', 'Model request failed', EV_END, EMBEDDED_FAILED)   # self-check anchors
 ANCHOR_DIRS = ('dist', 'node_modules/@openclaw/ai/dist')            # where the anchors live in the package
 # Session keys
 CHAT_RE = re.compile(r'^agent:[^:]+:(?:main$|dashboard:[^:]+$|(?!a2a:|cron:|subagent:|worker:)[^:]+:(?:group|direct|channel):)')  # human keys; metadata is checked too
@@ -224,9 +231,23 @@ ROUTE_ERROR_TEXTS = ("The selected runtime signs in through its own CLI login an
 LIMIT_RE = re.compile(r"incompatible with its recorded inference account and route|rate_limit_error|"
                       r"exceed your account's rate limit|needs a short break|asking us to slow down|"
                       r"insufficient_quota", re.I)
-ERROR_TEXTS = (ROUTE_ERR, 'needs a short break', 'asking us to slow down', 'rate_limit_error', 'insufficient_quota')
-#   ^ the parts of LIMIT_RE that OpenClaw itself contains; "exceed your account's rate limit" is provider wording
 MODEL_NOT_ALLOWED = 'model not allowed:'                            # permanent model-selection refusal, not a limit
+COOLDOWN_CODE = 'auth_profile_cooldown'
+PROFILE_UNAVAILABLE = 'is temporarily unavailable for'
+PREPARED_UNAVAILABLE = 'Prepared auth profiles are temporarily unavailable'
+# The lifecycle terminal backstop maps the cooldown code to the same stored notice as a rate limit.
+COOLDOWN_TERMINAL_NOTICE = 'The AI service needs a short break. Please try again in a few minutes.'
+COOLDOWN_NOTICE_RE = re.compile(r'(?:⚠️?\s*)?' + re.escape(COOLDOWN_TERMINAL_NOTICE))
+COOLDOWN_TEXTS = (COOLDOWN_CODE, PROFILE_UNAVAILABLE, PREPARED_UNAVAILABLE)
+COOLDOWN_MODEL_RE = re.compile(r'(?:Auth profile "[^"\r\n]+" ' + PROFILE_UNAVAILABLE + '|' +
+                              PREPARED_UNAVAILABLE + r' for)\s+([^/\s]+/[^\s"|]+)', re.I)
+COOLDOWN_RE = re.compile(r'\b(?:' + COOLDOWN_CODE + r'|Auth profile "[^"\r\n]+" ' + PROFILE_UNAVAILABLE +
+                         '|' + PREPARED_UNAVAILABLE + r')\b', re.I)
+COOLDOWN_REFUSALS = (MODEL_NOT_ALLOWED.rstrip(':'), ROUTE_ERR, *ROUTE_ERROR_TEXTS,
+                     'That account was recorded for runtime', 'was signed in again or replaced',
+                     'was removed or signed out')
+ERROR_TEXTS = (ROUTE_ERR, 'needs a short break', 'asking us to slow down', 'rate_limit_error', 'insufficient_quota',
+               PROBE_FAILED_TEXT, COOLDOWN_TERMINAL_NOTICE, *COOLDOWN_TEXTS)
 RETRYABLE_RE = re.compile(r'[\"\']?retryable[\"\']?\s*:\s*true\b', re.I)
 # =====================================================================================================================
 
@@ -545,6 +566,30 @@ def infra_line(rec, ev):
         ev['ready'].append(t)
 
 
+def cooldown_error(text):
+    return isinstance(text, str) and COOLDOWN_RE.search(text) and not any(
+        refusal.lower() in text.lower() for refusal in COOLDOWN_REFUSALS)
+
+
+def cooldown_log_failure(rec):
+    """The pre-reply message alone has no run identity. Use an explicit log identity when available."""
+    one, two = rec.get(L1), rec.get(L2)
+    data = one if isinstance(one, dict) else {}
+    text = ' '.join(v for v in (one, two, data.get(L_CODE), data.get(L_ERR_TEXT), data.get(L_MESSAGE),
+                                data.get(L_REASON)) if isinstance(v, str))
+    if (data.get(L_EVENT) == EV_END and not data.get(L_ERROR)) or not cooldown_error(text):
+        return None
+    model_match, run_match, key_match = COOLDOWN_MODEL_RE.search(text), RUN_ID_RE.search(text), KEY_RE.search(text)
+    model = model_match.group(1).rstrip('.') if model_match else None
+    if not model and data.get(L_PROV) and data.get(L_MODEL):
+        model = '%s/%s' % (data[L_PROV], data[L_MODEL])
+    run = data.get(L_RUN) or (run_match.group(1) if run_match else None)
+    key = data.get(L_KEY) or (key_match.group(1) if key_match else None)
+    if isinstance(two, str) and REQ_RE.search(two):
+        run = None                        # a model request can fail while its run continues on another account
+    return run, key, model
+
+
 def scan_logs(state):
     """New complete log lines since the last pass -> stalls, failed turns, run->session keys, providers seen limited."""
     ev = {'stalls': [], 'failed': {}, 'run_key': {}, 'providers': set(), 'ended': {}, 'ready': []}
@@ -559,7 +604,7 @@ def scan_logs(state):
         chunk = chunk[:chunk.rfind(b'\n') + 1]       # a half-written last line is read next pass
         offs[f] = start + len(chunk)
         for raw in chunk.split(b'\n'):
-            if not any(x.encode() in raw for x in LIMITED + (ANCHORS[1], NATIVE_OUTCOME, GATEWAY_READY)):
+            if not any(x.encode() in raw for x in LIMITED + COOLDOWN_TEXTS + (ANCHORS[1], NATIVE_OUTCOME, GATEWAY_READY)):
                 continue
             try:
                 rec = json.loads(raw)
@@ -578,6 +623,15 @@ def scan_logs(state):
                 ev['run_key'][m.group(2)] = m.group(1)
                 if one.get(L_HTTP) == 429 or LIMITED[0] in json.dumps(one.get(L_BODY) or ''):
                     ev['providers'].add(one.get(L_PROV))
+            cooldown = cooldown_log_failure(rec)
+            if cooldown:
+                run, key, model = cooldown
+                if model:
+                    ev['providers'].add(model.split('/')[0])
+                if run and not ev['failed'].get(run, {}).get('no_continue'):
+                    ev['failed'][run] = {'t': t, 'model': model, 'cooldown': True, 'key': key}
+                    if key:
+                        ev['run_key'][run] = key
             if isinstance(one, str):
                 r = RETRY_RE.search(one)
                 if r and int(r.group(2)) >= STALL_MS:
@@ -586,13 +640,36 @@ def scan_logs(state):
                                          'key': k.group(1) if k else None, 'session': r.group(4)})
                     ev['providers'].add(r.group(1).split('/')[0])
             elif isinstance(one, dict) and one.get(L_EVENT) == EV_END and one.get(L_ERROR) \
-                    and one.get(L_REASON) in LIMITED:
+                    and one.get(L_REASON) in LIMITED and not ev['failed'].get(one.get(L_RUN), {}).get('cooldown'):
                 ev['failed'][one.get(L_RUN)] = {'t': t, 'model': '%s/%s' % (one.get(L_PROV), one.get(L_MODEL))}
                 ev['providers'].add(one.get(L_PROV))
     for k in [k for k in offs if k not in files]:
         offs.pop(k)
     ev['providers'].discard(None)
     return ev
+
+
+def stored_cooldown_failures(state, ev, health, entries):
+    """Use the session's exact terminal run. The generic stored notice needs corroborating account cooldown."""
+    now = NOW()
+    for key, e in entries.items():
+        run, t, error = e.get(S_LAST_RUN), e.get(S_ENDED), e.get(S_RUN_ERROR)
+        if not run or not isinstance(t, (int, float)) or not max(state.get('started', 0), now - FRESH_MS) <= t <= now:
+            continue
+        if run in state.get('handled', {}) or run in state.get('pending', {}) or run in ev['failed']:
+            continue
+        if not isinstance(error, str) or not human_chat(key, None, e):
+            continue
+        model, account = chat_ref(health.conf, e)
+        if not cooldown_error(error) and (not COOLDOWN_NOTICE_RE.fullmatch(error.strip())
+                or not account or health.status(account) != MS_COOLDOWN):
+            continue
+        match = COOLDOWN_MODEL_RE.search(error)
+        if match and match.group(1).rstrip('.') != model:
+            continue                      # the stored selection is already on a different model
+        ev['failed'][run] = {'t': t, 'model': model, 'cooldown': True, 'key': key}
+        ev['run_key'][run] = key
+        ev['providers'].add(model.split('/')[0])
 
 
 def cfg():
@@ -849,12 +926,16 @@ class Health:
     """Account status per provider from models.probe, asked at most once per pass. A probe tests one model of the
     provider, so 'ok' means the account answers, not that every model on it has quota left."""
 
-    def __init__(self, conf, limited=None):
+    def __init__(self, conf, limited=None, cooldowns=None):
         # limited: {'model@account': until_ms}, kept in state. The probe tests one model per provider and forgets
         # between passes, so limits seen in real runs (stall delay, failed turns, job receipts) are held here, for the
         # model they were seen on only, until the time the provider named. A probe answer never clears a hold; a real
         # request of that model on that account does (retest_holds), since a provider may reset a limit early.
         self.conf, self.limited, self.cache, self.failed = conf, limited if limited is not None else {}, {}, []
+        self.cooldowns = cooldowns if cooldowns is not None else {}    # persisted {profile: auth cooldown expiry}
+        self.confirmed_cooldowns = set()     # profiles listed as cooling in this pass's models status
+        self.probe_errors = set()   # generic connection failures, including under an empty auth order
+        self.models_snapshot, self.models_read, self.models_error = None, False, None
         self.saved, self.saved_err = None, None    # the agent's saved accounts, read once per pass when first needed
         self.saved_state, self.saved_skipped = {}, False   # {profile: credential status}; read skipped for time
         self.no_probe = False                # True: a provider not asked yet this pass answers nothing, unasked
@@ -890,21 +971,36 @@ class Health:
                 return {}                    # unasked, not unavailable; never cache a budget deferral
             if FAKE is not None:
                 time.sleep(FAKE.get('slow_probe', 0))
-                res = dict(FAKE.get('probe', {}).get(provider, {}))
+                rows = [dict({PROBE_PROFILE: p}, **(v if isinstance(v, dict) else {PROBE_STATUS: v}))
+                        for p, v in FAKE.get('probe', {}).get(provider, {}).items()]
             else:
                 # Bounded read-only discovery needs its full RPC share; the outer CLI timeout still enforces it.
                 allowance = 0 if self.probe_pending is not None else 5
                 d, err = gw(RPC_PROBE, PROBE_ARGS(provider, default_agent()), timeout, cli_allowance=allowance)
-                res = {r[PROBE_PROFILE]: r.get(PROBE_STATUS) for r in (d or {}).get(PROBE_RESULTS, []) if r.get(PROBE_PROFILE)}
+                rows = (d or {}).get(PROBE_RESULTS, [])
                 if d is None:
                     self.failed.append(provider)
                     journal('probe_failed', provider=provider, error=err)
-            self.cache[provider] = res
-            journal('probe', provider=provider, result=res)
+            rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get(PROBE_PROFILE), str)
+                    and r[PROBE_PROFILE].split(':')[0] == provider]
+            res = self.cache[provider] = {r[PROBE_PROFILE]: r.get(PROBE_STATUS) for r in rows}
+            self.probe_errors.update(r[PROBE_PROFILE] for r in rows
+                                     if r.get(PROBE_STATUS) == PROBE_UNKNOWN and r.get(PROBE_ERROR) == PROBE_FAILED_TEXT)
+            for p, status in res.items():
+                if status == PROBE_OK:
+                    self.cooldowns.pop(p, None)
+                    self.confirmed_cooldowns.discard(p)
+            if any(s != PROBE_OK and s not in LIMITED for s in res.values()):
+                self.models_status()      # resolve ambiguous or auth-related answers even with a non-empty order
+            journal('probe', provider=provider, result=res, cooldowns={p: self.cooldowns[p] for p in res if self.cooling(p)})
         return self.cache[provider]
 
     def status(self, profile):
-        return self.probe(profile.split(':')[0]).get(profile)
+        status = self.probe(profile.split(':')[0]).get(profile)
+        return MS_COOLDOWN if self.cooling(profile) else status
+
+    def cooling(self, profile):
+        return profile in self.confirmed_cooldowns and self.cooldowns[profile] > NOW()
 
     def held(self, profile, model):
         return self.limited.get('%s@%s' % (model, profile), 0) > NOW()
@@ -919,12 +1015,13 @@ class Health:
         # counts as usable when the saved store says the credential itself is usable (the probe checks nothing else
         # there), and a real limit on the account comes back as a hold from its runs.
         s = self.status(profile)
-        usable = s == 'ok' or (s == 'unknown' and self.empty_order(profile.split(':')[0])
-                               and self.saved_state.get(profile) in MS_USABLE)
+        usable = s == PROBE_OK or (s == PROBE_UNKNOWN and profile not in self.probe_errors
+                                   and self.empty_order(profile.split(':')[0])
+                                   and self.saved_state.get(profile) in MS_USABLE)
         return usable and not self.held(profile, model)
 
     def dead(self, profile, model):
-        return self.held(profile, model) or self.status(profile) in LIMITED
+        return self.held(profile, model) or self.status(profile) in (*LIMITED, MS_COOLDOWN)
 
     def ordered(self, provider):
         """True when a non-empty effective order lists the provider's targets."""
@@ -935,6 +1032,31 @@ class Health:
         order = self.conf.get('order') or {}
         return provider in order and not order[provider]
 
+    def models_status(self):
+        """Share the bounded status read between cooldown lookup and saved account discovery."""
+        if self.models_read or self.no_probe:
+            return self.models_snapshot
+        self.models_read = True
+        timeout = self.discovery_timeout(None, MS_TIMEOUT_S)
+        if timeout <= 0 or not fits(timeout):
+            return None
+        try:
+            self.models_snapshot = cli_json(CLI_MODELS(default_agent()), timeout)
+        except (Shape, Unreachable) as e:
+            self.models_error = quiet_error(e)
+            journal('models_status_failed', error=self.models_error)
+            return None
+        cooldown_snapshot = profile_cooldowns(self.models_snapshot)
+        if cooldown_snapshot is not None:
+            providers, active = cooldown_snapshot
+            for p in [p for p in self.cooldowns if p.split(':')[0] in providers and p not in active]:
+                self.cooldowns.pop(p)
+            for p, until in active.items():
+                if self.cache.get(p.split(':')[0], {}).get(p) != PROBE_OK:
+                    self.cooldowns[p] = until
+                    self.confirmed_cooldowns.add(p)
+        return self.models_snapshot
+
     def saved_store(self):
         """[(profile id, provider, type)] of the agent's saved accounts, read at most once per pass. A failed read is
         journaled and raised as a problem by finish(); the targets are then the config profiles only. Under no_probe a
@@ -943,19 +1065,23 @@ class Health:
             return []
         if self.saved is None:
             self.saved = []
-            timeout = self.discovery_timeout(None, MS_TIMEOUT_S)
-            if timeout <= 0 or not fits(timeout):   # config profiles serve this once; the next pass reads it
+            snapshot = self.models_status()
+            if self.models_error:
+                self.saved_err = self.models_error
+                journal('saved_profiles_failed', error=self.saved_err)
+            elif snapshot is None:   # config profiles serve this once; the next pass reads it
                 journal('saved_profiles_skipped', why='no time left in this pass')
                 self.saved_skipped = True
-                return self.saved
-            try:
-                self.saved, bad, self.saved_state = saved_profiles(timeout)
+            else:
+                try:
+                    self.saved, bad, self.saved_state = saved_profiles(data=snapshot)
+                except Shape as e:
+                    self.saved_err = quiet_error(e)
+                    bad = []
                 if bad:
                     self.saved_err = 'saved types disagree with the store for %s' % ', '.join(bad)
+                if self.saved_err:
                     journal('saved_profiles_failed', error=self.saved_err)
-            except (Shape, Unreachable) as e:
-                self.saved_err = quiet_error(e)
-                journal('saved_profiles_failed', error=self.saved_err)
         return self.saved
 
     def accounts(self, provider):
@@ -965,7 +1091,7 @@ class Health:
         account of the provider: its oauth and token profiles in auth.profiles (config order) and in the agent's saved
         auth store (models status order), each once, oauth first. A profile declared in config keeps its config mode.
         OpenClaw breaks ties by last use; this script prefers no account, so that order stands. models status is asked
-        only here, so a pass whose providers all have a non-empty effective order never runs it."""
+        for saved-only inventory here and for ambiguous probe results in probe()."""
         order = (self.conf.get('order') or {}).get(provider)
         if self.ordered(provider):
             return list(order)
@@ -1003,16 +1129,16 @@ class Health:
     def unknown(self):
         """True when a probe failed or timed out for a target account (accounts()): 'nothing alive' is then unproven.
         auth, no_model and format are definite answers (that account cannot be used), so an expired token does not hide
-        'nothing alive'. An account that is not a target is never chosen, so its answer does not matter. For a provider
-        without a non-empty effective order, 'unknown' counts as a definite answer. A failed models status read does
-        not count: the config profiles are then the targets. A read skipped
-        because the pass ran out of time does: saved-only accounts were not looked at."""
+        'nothing alive'. A cooldown confirmed this pass is also definite. Without a non-empty order, an excluded
+        account's unknown answer is expected, but a connection failure is still unknown. A saved account read skipped
+        for time leaves any saved-only targets unproven."""
         if self.saved_skipped:
             return True
         def open_(prov):
-            return ('timeout', 'unknown', None) if self.ordered(prov) else ('timeout', None)
-        return bool(self.failed) or any(s in open_(prov) for prov, r in list(self.cache.items())
-                                        for p, s in r.items() if p in self.accounts(prov))
+            return ('timeout', PROBE_UNKNOWN, None) if self.ordered(prov) else ('timeout', None)
+        return bool(self.failed) or any((s in open_(prov) or p in self.probe_errors) and not self.cooling(p)
+                                        for prov, r in list(self.cache.items()) for p, s in r.items()
+                                        if p in self.accounts(prov))
 
 
 def retest_one(ref):
@@ -1251,14 +1377,47 @@ def cli_json(argv, timeout=75, fresh=False):
     return _CACHE[k]
 
 
-def saved_profiles(timeout=MS_TIMEOUT_S):
+def profile_cooldowns(data):
+    """Return covered providers and active cooldowns if the cooldown metadata has the expected shape.
+
+    Saved-profile discovery can still use its own fields when cooldown metadata is unavailable.
+    """
+    overview = dig(data, MS_COUNTS)
+    rows = dig(data, MS_UNUSABLE)
+    if not isinstance(overview, list) or not isinstance(rows, list):
+        return None
+    if not all(isinstance(row, dict) and isinstance(row.get(MS_PROVIDER), str) and row[MS_PROVIDER]
+               for row in overview):
+        return None
+    providers = {row[MS_PROVIDER] for row in overview}
+    active = {}
+    now = NOW()
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(p := row.get(MS_ID), str):
+            return None
+        provider, sep, name = p.partition(':')
+        kind = row.get(MS_KIND)
+        if not (provider and sep and name and isinstance(kind, str) and kind
+                and row.get(MS_PROVIDER, provider) == provider):
+            return None
+        providers.add(provider)
+        if kind == MS_COOLDOWN:
+            until = row.get(MS_UNTIL)
+            if type(until) is not int:
+                return None
+            if until > now:
+                active[p] = until
+    return providers, active
+
+
+def saved_profiles(timeout=MS_TIMEOUT_S, data=None):
     """[(profile id, provider, type)] of every account in the default agent's auth store, saved-only ones included.
     Reads id, provider and type only: a profile's label shows a masked key or an email.
     Returns (rows, providers whose rows were dropped). A plugin's runtime credential can override the reported type for
     a whole provider (e.g. an API key in the environment), so a provider's rows are kept only when their types match
     the raw store counts in auth.providers[].profiles; a row whose id prefix is not its provider is skipped, because
     the probe of that account would ask another provider."""
-    d = cli_json(CLI_MODELS(default_agent()), timeout)
+    d = cli_json(CLI_MODELS(default_agent()), timeout) if data is None else data
     rows = dig(d, MS_PROFILES)
     if not isinstance(rows, list) or not all(isinstance(r, dict) and all(isinstance(r.get(k), str) for k in
                                                                          (MS_ID, MS_PROVIDER, MS_TYPE)) for r in rows):
@@ -1521,7 +1680,11 @@ def load_jobs(state):
         for e in cron_errors():
             j, at = jobs.get(e.get(RUN_F['job'])), e.get(RUN_F['at']) or e.get(RUN_F['at_alt']) or 0
             if j is not None and at > now - WINDOW_MS:
-                j['errors'].append((at, bool(LIMIT_RE.search(e.get(RUN_F['error']) or ''))))
+                error = e.get(RUN_F['error']) or ''
+                # Auth cooldowns prompt a probe independently of model-specific quota streaks.
+                if at >= j['since'] and at == j['last_at'] and cooldown_error(error):
+                    j['cooldown'] = True
+                j['errors'].append((at, bool(not COOLDOWN_RE.search(error) and LIMIT_RE.search(error))))
         for j in jobs.values():
             j['errors'] = sorted(j['errors'], reverse=True)[:j['streak_n'] if j['last'] == 'error' else 0]
     return jobs, streaks(jobs)
@@ -1956,7 +2119,7 @@ def died_on_limit(run_id, t):
         if one.get(L_STATUS) == L_DONE:
             return False
         if ts_ms(rec) > t + 2000 and (one.get(L_MILESTONE) or (one.get(L_EVENT) == EV_END
-                                                                 and one.get(L_REASON) not in LIMITED)):
+                and one.get(L_REASON) not in LIMITED and not cooldown_log_failure(rec))):
             return False
     return True
 
@@ -1967,25 +2130,27 @@ def has_chat(key, s):
     return bool(LOCAL_CHAT_RE.match(key) or GROUP_RE.match(key) or dc.get('to') or s.get(S_TO))
 
 
-def continue_turn(key, model, moved, run_id='', infra=False):
+def continue_turn(key, model, moved, run_id='', infra=False, cooldown=False):
     """Starts the continuation as its own user unit; returns (result, unit). No --reply-to: an explicit target drops
     the session's topic/thread, the session's own stored route keeps it. When the model changed, the agent itself
     opens its reply with one line in the chat's language (this script sends nothing to a chat). infra: the turn was
     killed by a Gateway restart or a plugin reload; it continues on the chat's own model, with no model line."""
-    tell = ('Start your reply with one short line, in the language this chat uses, saying that the AI account hit its '
-            'usage limit and this chat now runs on %s; then answer. If nothing is unanswered, reply exactly NO_REPLY and '
-            'nothing else, without that line.' % model) if moved else 'If nothing is unanswered, reply exactly NO_REPLY. Do not mention this note.'
+    change = 'the AI account was temporarily unavailable' if cooldown else 'the AI account hit its usage limit'
+    cause = 'an AI account cooldown' if cooldown else 'a provider usage limit'
+    tell = ('Start your reply with one short line, in the language this chat uses, saying that %s and this chat now '
+            'runs on %s; then answer. If nothing is unanswered, reply exactly NO_REPLY and nothing else, without '
+            'that line.' % (change, model)) if moved else 'If nothing is unanswered, reply exactly NO_REPLY. Do not mention this note.'
     msg = ('[Inference failover, automatic] The previous turn in this chat (run ID %s) was cut off by a Gateway '
            'restart before it answered. Check the transcript, then finish the person\'s latest request. Do not repeat '
            'actions that already completed (sends, payments, writes); verify uncertain side effects before retrying '
            'them. Reply in this chat as usual. Respect intentional stops and any newer instruction. %s' % (run_id, tell)) \
         if infra else \
-          ('[Inference failover, automatic] The turn with run ID %s in this chat was interrupted by a provider usage '
-           'limit. This session now runs on %s. Review the transcript and reconcile completed tool actions and delivery '
+          ('[Inference failover, automatic] The turn with run ID %s in this chat was interrupted by %s. '
+           'This session now runs on %s. Review the transcript and reconcile completed tool actions and delivery '
            'receipts with current state before acting. Continue only the unfinished part of that interrupted '
            'request, in the usual language and format of this chat. Do not replay the entire request or repeat '
            'completed actions, sends, payments or writes. Verify uncertain side effects before retrying them. '
-           'Respect intentional stops and any newer user instruction. %s' % (run_id, model, tell))
+           'Respect intentional stops and any newer user instruction. %s' % (run_id, cause, model, tell))
     if not APPLY or FAKE is not None:
         return ('dry-run' if not APPLY else 'started'), None
     unit = 'ocf-continue-' + hashlib.sha256((key + ':' + run_id).encode()).hexdigest()[:24]
@@ -2335,8 +2500,10 @@ def chats_home(state, health, conf, out):
         if '%s@%s' % chat_ref(conf, e) != h['parked']:
             home.pop(key)                  # the user chose something else since: that choice stands
             continue
-        tgt = health.target(h['model'], chain=False) if ripe(h) else None
-        if not tgt:
+        # An ok probe exercises this provider account. It proves the auth route is usable for this return;
+        # model-specific quota holds still apply through target(), independently of the provider probe.
+        tgt = health.target(h['model'], chain=False)
+        if not tgt or (not ripe(h) and health.status(PROF(tgt)) != PROBE_OK):
             continue
         fresh = session(key) or {}
         fresh_e, queued = entry(key)
@@ -2351,6 +2518,7 @@ def chats_home(state, health, conf, out):
             out['chats'].append((key[-40:], tgt))
         elif not home_rejected(state, 'chat_home', key, tgt, err):
             prob(out, 'chat_return:' + key, 'chat %s: could not move back to %s: %s' % (key[-40:], tgt, err[:120]))
+        save(state)
 
 
 def own(state, key, ref, e):
@@ -2595,9 +2763,13 @@ def recover_chat(state, health, key, s, run_id, p, out):
              % (key[-40:], len(hits) + 1))
         return dropped('it died on a limit again after %d continuations within an hour' % len(hits))
     # Native holds use exact logged profile hashes; the current selection may already be another account.
-    if p.get('profile') and not p.get('no_continue'):
+    if p.get('profile') and not (p.get('no_continue') or p.get('cooldown')):
         health.hold(p['profile'], p['until'] if p['kind'] == 'stall' else NOW() + HOLD_MS, p['model'])
     plan = chat_plan(state, health, key, e, unknown_dead=True)
+    if p.get('cooldown') and not plan['needed']:
+        model, account = chat_ref(health.conf, e)
+        if not health.alive(account, model):
+            return False                  # the failed account's current health still needs proof
     if plan['needed'] and not plan['tgt']:
         if not plan['strict'] and not plan.get('policy'):
             out['no_target'].append((key[-40:], plan['own']))
@@ -2657,7 +2829,8 @@ def recover_chat(state, health, key, s, run_id, p, out):
     elif not has_chat(key, s):
         res['continue'] = 'no chat'
     else:
-        res['continue'], unit = continue_turn(key, MODEL(now).split('/')[-1], MODEL(now) != p['model'], run_id)
+        res['continue'], unit = continue_turn(key, MODEL(now).split('/')[-1], MODEL(now) != p['model'], run_id,
+                                             cooldown=p.get('cooldown', False))
         if unit:
             state.setdefault('continued', {})[unit] = key
         if res['continue'] not in ('started', 'dry-run'):
@@ -2711,7 +2884,15 @@ def note_events(state, ev, jobs, health):
     for r, f in ev['failed'].items():
         if (pend.get(r) or {}).get('kind') != 'stall' and NOW() - f['t'] < FRESH_MS:
             old = pend.get(r) or {}
-            p = pend[r] = {'kind': 'failed', 't': f['t'], 'until': f['t'] + WAIT_MS, 'model': f['model']}
+            key = f.get('key') or key_of(rk, r)
+            model = f['model']
+            if not model and key and CHAT_RE.match(key):
+                model = chat_ref(health.conf, entry(key)[0])[0]
+            if not model:
+                continue
+            p = pend[r] = {'kind': 'failed', 't': f['t'], 'until': f['t'] + WAIT_MS, 'model': model}
+            if f.get('cooldown'):
+                p['cooldown'] = True
             if f.get('no_continue'):
                 p['no_continue'] = True
                 matches = [a for a in health.accounts(f['model'].split('/')[0])
@@ -2719,7 +2900,7 @@ def note_events(state, ev, jobs, health):
                            in f.get('profile_hashes', []) or a in f.get('profile_hashes', [])]
                 for account in matches:
                     health.hold(account, f['t'] + HOLD_MS, f['model'])
-            new.append((p, key_of(rk, r), old))
+            new.append((p, key, old))
     for p, key, old in new:
         if old.get('ref'):                 # the same run seen again: it was on the route noted the first time
             p.update({k: old[k] for k in ('ref', 'profile', 'session') if k in old})
@@ -2785,6 +2966,8 @@ def stalls_and_chats(state, health, jobs, out):
         elif sub:
             sub_stall(state, health, key, s, r, p, out)
         elif recover_chat(state, health, key, s, r, p, out):
+            if p.get('cooldown'):
+                handled.setdefault(r, {'t': NOW()})
             pend.pop(r, None)
     for d in (handled, rk):
         for k in list(d)[:-300]:
@@ -3019,9 +3202,10 @@ def main():
     if conf.get('usage_err'):
         prob(out, 'settings-usage', conf['usage_err'])
     limited = state.setdefault('limited', {})
+    cooldowns = state.setdefault('cooldowns', {})
     for k in ('rerun', 'rerun_wanted', 'run_req'):
         state.pop(k, None)     # an older version's rerun bookkeeping
-    ev, streak, health = {'providers': set()}, {}, Health(conf, limited)
+    ev, streak, health = {'providers': set()}, {}, Health(conf, limited, cooldowns)
     no_target_unknown = None
     orders_ready = False
     part = None                # the part running now that does not run every pass: a cut-off there keeps its own clock
@@ -3036,8 +3220,15 @@ def main():
         models.extend(h['model'] for field in ('home', 'chat_home') for h in (state.get(field) or {}).values())
         conf = with_stored_orders(conf, models)
         health.conf, orders_ready = conf, True
+        old_order = {m: v[0] for m, v in state.get('prefer_eff', {}).items() if v[1] == 'stored'}
+        new_order = {m: conf['prefer'][m] for m, src in conf['prefer_from'].items() if src == 'stored'}
+        stored_order_changed = old_order != new_order
         if APPLY:
             note_prefer(state, conf)
+        had_cooldowns = bool(cooldowns)
+        now = NOW()
+        for p in [p for p, until in cooldowns.items() if until <= now]:
+            cooldowns.pop(p)
         for k in [k for k, u in limited.items() if u <= NOW() or '/' not in k.split('@', 1)[0]]:
             state.get('problems', {}).pop(RUNTIME_CHECK_PREFIX + k, None)
             state.get('verified', {}).pop(k, None)   # a proof before a limit says nothing about after it
@@ -3049,6 +3240,7 @@ def main():
             prob(out, 'partial', 'the job list has more than one page (%d jobs shown); jobs beyond it are not watched'
                  % len(jobs))
         ev = scan_logs(state)
+        stored_cooldown_failures(state, ev, health, entries)
         infra_log(state, ev)
         for ref, n in streak.items():
             if n >= 2:         # held for an hour after the last failure, so jobs do not bounce straight back
@@ -3057,7 +3249,9 @@ def main():
         # Ask the accounts when there is a fresh limit signal, an unfinished pass, or every 5 min while work uses them.
         _VERIFY['busy'] = bool(ev['providers'] or any(NOW() - p.get('t', 0) < 600_000            # fresh limits first:
                                                       for p in (state.get('pending') or {}).values()))   # no return checks now
-        probe_due = bool(ev['providers'] or streak or state.get('retry') or state.get('unsure')
+        probe_due = bool(ev['providers'] or streak or any(j.get('cooldown') for j in jobs.values() if j['enabled'])
+                         or stored_order_changed or had_cooldowns or state.get('chat_home')
+                         or state.get('retry') or state.get('unsure')
                          or NOW() - state.get('probed_at', 0) >= PROBE_EVERY_MS)
         if probe_due:
             jobs_pass(conf, jobs, health, state, t0, out)
