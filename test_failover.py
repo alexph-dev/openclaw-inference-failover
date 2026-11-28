@@ -2592,7 +2592,8 @@ def test_chats_return_only_where_no_person_chose_the_account():
     ob = OPUS + '@' + PB
     mine = lambda n: {'ref': ob, 'session': 's-' + keys[n][-1]}
     prefer(d, state={'owned': {keys[n_]: mine(n_) for n_ in ('ours', 'busy', 'changed', 'new_session')},
-                     'chat_home': {keys['parked']: {'model': FABLE, 'parked': ob, 'at': ms(), 'wait': 3600_000}}})
+                     'chat_home': {keys['parked']: {'model': FABLE, 'parked': ob}},
+                     'limited': {FABLE + '@' + p: ms() + 30 * 60_000 for p in (PA, PB, PC)}})
     fake(d, retest={OPUS + '@' + PA: RT_OK})
     rc, err, j = go(d, False, '--adopt', keys['adopted'])
     assert rc == 0 and kinds(j, 'chat_adopt')[0]['ref'] == ob, (err, j)
@@ -3694,6 +3695,151 @@ def test_log_dir_prefers_newest_between_state_logs_and_tmp_dirs():
             F._CACHE.pop('log_dir', None)
             assert F.log_dir() == str(tmp_logs)
             F._CACHE.pop('log_dir', None)
+
+
+ASTRA = 'openai/gpt-6.2-astra'
+ASTRA_ACCOUNTS = (OA, 'openai:b', 'openai:default')
+COOLDOWN_UNKNOWN = {'status': 'unknown', 'error': 'The connection check failed.'}
+PREPARED_COOLDOWN = 'Prepared auth profiles are temporarily unavailable for ' + ASTRA + '.'
+
+
+def cooldown_status(accounts, until):
+    answer = models_status([(p, 'oauth') for p in ASTRA_ACCOUNTS])
+    answer['auth']['unusableProfiles'] = [
+        {'profileId': p, 'provider': 'openai', 'kind': 'cooldown', 'until': until,
+         'remainingMs': until - ms(), 'reason': 'auth' if p == ASTRA_ACCOUNTS[-1] else 'rate_limit'} for p in accounts
+    ]
+    return answer
+
+
+def astra_pin(account=OA, source='user'):
+    return dict(PIN, providerOverride='openai', modelOverride=ASTRA.split('/')[1],
+                authProfileOverride=account, authProfileOverrideSource=source)
+
+
+def test_auth_cooldown_unknown_fails_over_continues_and_returns_on_the_next_pass():
+    a, b, c = ASTRA_ACCOUNTS
+    user, auto, strict = ('agent:main:dashboard:' + name for name in ('user-fixture', 'auto-fixture', 'strict-fixture'))
+    entries = {user: astra_pin(a), auto: astra_pin(a, 'auto'), strict: astra_pin(a)}
+    entries[auto]['modelOverrideSource'] = 'auto'
+    # The embedded runner logs only the failure text. The stored terminal notice names the run but masks its cause.
+    embedded = 'Embedded agent failed before reply: Auth profile "%s" is temporarily unavailable for %s.' % (b, ASTRA)
+    entries[user].update(lastRunId='run-user', endedAt=ms() - 40_000, lastRunError=F.COOLDOWN_TERMINAL_NOTICE)
+    logs = [line(embedded), line({
+        'runId': 'run-auto', 'sessionKey': auto, 'provider': 'openai', 'model': ASTRA.split('/')[1],
+        'message': 'Auth profile "%s" is temporarily unavailable for %s.' % (a, ASTRA),
+        'code': 'auth_profile_cooldown',
+    })]
+    entries[strict].update(lastRunId='run-strict', endedAt=ms() - 40_000, lastRunError=PREPARED_COOLDOWN)
+    probe = {'openai': dict.fromkeys(ASTRA_ACCOUNTS, COOLDOWN_UNKNOWN), 'anthropic': {PB: 'ok'}, 'xai': XAI_OUT}
+    d = setup({'job': (ASTRA, a, 'trusted')}, [('job', 'error', PREPARED_COOLDOWN, 40)],
+              probe=probe, entries=entries, log=logs)
+    until = ms() + 43_200_000
+    answer = cooldown_status(ASTRA_ACCOUNTS, until)
+    answer['auth']['unusableProfiles'][-1]['classification'] = 'wham_token_expired'
+    fake(d, models_status=answer, saved_orders={'main': {'openai': [c, b, a]}})
+    prefer(d, {}, state={'parks': {k: {'n': 1, 't': ms()} for k in (user, auto)}})
+    env = {'OCF_FAKE_VERSION': '2026.11.10', 'OCF_LOCAL_MODEL_CHECKS': '0', 'OCF_STRICT_CHATS': strict}
+
+    rc, err, journal = go(d, env=env)
+    assert rc == 0 and not err, (err, journal)
+    opened, = [p for p in kinds(journal, 'probe') if p['provider'] == 'openai']
+    assert opened['result'] == dict.fromkeys(ASTRA_ACCOUNTS, 'unknown'), opened
+    assert opened['cooldowns'] == dict.fromkeys(ASTRA_ACCOUNTS, until), opened
+    assert {(m['session'], m['to']) for m in kinds(journal, 'chat_move')} == {(user, OPUS + '@' + PB), (auto, OPUS + '@' + PB)}
+    assert {(r['session'], r['to'], r['continue']) for r in kinds(journal, 'chat_recover')} == {
+        (user, OPUS + '@' + PB, 'started'), (auto, OPUS + '@' + PB, 'started')}
+    assert binding(d, 'job') == OPUS + '@' + PB
+    state = state_of(d)
+    assert not state['limited'] and all(state['chat_home'][k]['wait'] == F.HOLD_MS for k in (user, auto)), state
+
+    probe['openai'][c] = {'status': 'ok', 'latencyMs': 4000}
+    fake(d, probe=probe, models_status=cooldown_status((a, b), until))
+    rc, err, journal = go(d, env=env)  # regular next pass, within the old return wait
+    assert rc == 0 and not err and not requests(d), (err, journal)
+    returned = {(r['session'], r['to'], r['result']) for r in kinds(journal, 'chat_return')}
+    assert returned == {(user, ASTRA + '@' + c, 'ok'), (auto, ASTRA + '@' + c, 'ok')}, returned
+    recovered = kinds(journal, 'chat_recover')
+    assert len(recovered) == 3 and (recovered[-1]['session'], recovered[-1]['to'], recovered[-1]['continue']) == (
+        strict, ASTRA + '@' + c, 'started'), recovered
+    assert binding(d, 'job') == ASTRA + '@' + c
+    assert state_of(d)['cooldowns'] == dict.fromkeys((a, b), until) and not state_of(d)['chat_home']
+    assert all(e['modelOverride'] == ASTRA.split('/')[1] and e['authProfileOverride'] == c
+               for e in json.loads((d / 'fake.json').read_text())['entries'].values())
+
+
+def test_saved_order_change_probes_on_the_next_pass_and_moves_only_the_out_pin():
+    a, b, c = ASTRA_ACCOUNTS
+    out_pin, live_pin = 'agent:main:dashboard:out-fixture', 'agent:main:dashboard:live-fixture'
+    d = setup(probe={'openai': dict.fromkeys(ASTRA_ACCOUNTS, 'ok')},
+              entries={out_pin: astra_pin(a, 'auto'), live_pin: astra_pin(b)})
+    fake(d, saved_orders={'main': {'openai': [a, b, c]}})
+    assert not kinds(go(d)[2], 'chat_move')
+    fake(d, saved_orders={'main': {'openai': [c, b, a]}}, models_status=cooldown_status((a,), ms() + 600_000),
+         probe={'openai': {a: COOLDOWN_UNKNOWN, b: 'ok', c: 'ok'}})
+    rc, err, journal = go(d)
+    moved, = kinds(journal, 'chat_move')
+    assert rc == 0 and (moved['session'], moved['to']) == (out_pin, ASTRA + '@' + c), (err, journal)
+    assert kinds(journal, 'prefer_order')[-1]['order'] == [c, b, a]
+    assert kinds(journal, 'prefer_order')[-1]['source'] == 'stored'
+    assert not kinds(journal, 'chat_recover') and not requests(d)
+
+
+def test_cooldown_remains_definite_until_expiry_or_a_fresh_ok():
+    a, b, c = ASTRA_ACCOUNTS
+    probe = {'openai': dict.fromkeys(ASTRA_ACCOUNTS, COOLDOWN_UNKNOWN), 'anthropic': DEAD, 'xai': XAI_OUT}
+    d = setup({'job': (ASTRA, a, 'trusted')}, probe=probe)
+    until = ms() + 600_000
+    fake(d, models_status=cooldown_status((a, b), until))
+    rc, err, _ = go(d)
+    assert rc == 0 and not err   # a genuine connection failure for C still leaves the outage unproven
+    fake(d, models_status=cooldown_status(ASTRA_ACCOUNTS, until))
+    rc, err, _ = go(d)
+    assert rc == 1 and 'no live account' in err
+    fake(d, models_status_rc=1)
+    rc, err, _ = go(d)
+    assert rc == 1 and 'no live account' in err and state_of(d)['cooldowns'][a] == until
+
+    fake(d, models_status_rc=0, probe=dict(probe, openai=dict(probe['openai'], **{c: 'ok'})))
+    rc, err, _ = go(d)   # the CLI still lists C, but its fresh provider probe takes precedence
+    assert rc == 0 and not err and binding(d, 'job') == ASTRA + '@' + c
+    assert c not in state_of(d)['cooldowns']
+
+    elapsed = ms() - 1000
+    fake(d, probe=probe, models_status=cooldown_status(ASTRA_ACCOUNTS, elapsed))
+    patch_state(d, cooldowns=dict.fromkeys(ASTRA_ACCOUNTS, elapsed))
+    rc, err, _ = go(d)
+    assert rc == 0 and not err and not state_of(d)['cooldowns']
+
+
+def test_cooldown_receipts_prompt_probes_and_refusals_do_not():
+    a, b, c = ASTRA_ACCOUNTS
+    key = 'agent:main:dashboard:receipt-fixture'
+    for error, is_outage in ((PREPARED_COOLDOWN, True),
+                             ('Model not allowed: ' + ASTRA + ' | auth_profile_cooldown', False),
+                             (ERR + ' | auth_profile_cooldown', False),
+                             ('Embedded agent failed before reply: invalid request', False)):
+        d = setup({'job': (ASTRA, a, 'trusted')}, [('job', 'error', error, 40)],
+                  probe={'openai': {a: COOLDOWN_UNKNOWN, b: 'ok', c: 'ok'}},
+                  entries={key: dict(astra_pin(), lastRunId='run-fixture', lastRunError=error, endedAt=ms() - 40_000)})
+        if is_outage:   # only the cron receipt carries the outage signal in this case
+            fake(d, entries={key: astra_pin()})
+        fake(d, models_status=cooldown_status((a,), ms() + 600_000))
+        prefer(d, {}, state={'probed_at': ms()})
+        rc, err, journal = go(d)
+        assert rc == 0 and not err and not kinds(journal, 'chat_recover'), (err, journal)
+        assert bool(kinds(journal, 'probe')) == is_outage
+        assert binding(d, 'job') == ASTRA + '@' + (c if is_outage else a)
+        assert not state_of(d)['limited']
+
+
+def test_selfcheck_requires_the_cooldown_error_and_log_anchors():
+    d = setup()
+    removed = (*F.COOLDOWN_TEXTS, F.EMBEDDED_FAILED)
+    pkg_strings(d / 'pkg', tuple(a for a in F.ANCHORS + F.ERROR_TEXTS if a not in removed) +
+                (F.RPC_PROBE, F.RPC_DESCRIBE, F.RPC_PATCH, F.RPC_ABORT))
+    rc, err, journal = go(d)
+    assert rc == 1 and all(a in err for a in removed), (err, journal)
 
 
 if __name__ == '__main__':

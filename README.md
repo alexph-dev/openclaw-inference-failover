@@ -12,8 +12,10 @@ fixed, and delete the whole script when all of them are.
 
 ## What it does
 
-A limit is always one model on one account (model@account), never a whole account: a probe that answers ok for one
-model says nothing about another model on that account. The targets of a provider are the accounts its non-empty
+A usage hold applies to one model on one account (model@account). An OpenClaw auth cooldown applies to the provider
+account for any reason, including a failed credential refresh. A cooldown makes an ambiguous probe a definite
+unavailable result until its reported expiry or a fresh successful probe. Connection failures without cooldown
+evidence leave the account unproven. The targets of a provider are the accounts its non-empty
 stored auth order names, or config `auth.order` when no saved override exists. Stored order takes precedence without
 a manual settings or config copy. A provider without either non-empty list has all its
 subscription accounts, declared in config or saved in the agent's auth store (see "Targets" under Requirements and
@@ -38,7 +40,10 @@ limits). After those come the entries of
   Disabled one-shot (`at`) and legacy account-mode jobs are left alone.
 - **Pinned chats.** A chat whose model or account was chosen by hand (OpenClaw applies no fallbacks to it), or that the
   script parked on a fallback model, is moved the same way, on the same passes, whenever its model@account is held or
-  probed out. What its runs did is not consulted. A chat with a run in progress is moved once that run is over.
+  probed out. A chat with a run in progress is moved once that run is over. Parked chats are checked each pass and
+  return to their own model on its first live account in the current order. A successful probe runs a model on
+  the same provider account, which is sufficient evidence that the account can authenticate and serve a request.
+  The original model's usage hold still applies. A saved-order change triggers a probe on the next pass.
 - **Human chat model policy.** Every pass checks the current model and saved return model of each human chat,
   including inherited topic selections. A match moves the chat to the configured primary on its first live,
   unheld account and clears the saved return. Active runs and queued input wait. Set `OCF_CHAT_BANNED_MODELS`
@@ -56,10 +61,11 @@ limits). After those come the entries of
   active run), and an abort that stops no run is raised as a problem. A
   subagent's stalled run is aborted too, so its parent sees it end as killed now instead of days later; it is not
   moved or continued, because the parent chose its model.
-- **Turns that died on a limit.** A human chat turn whose run died on a limit is continued on a live model@account
+- **Turns that died on a limit or auth cooldown.** A human chat turn whose run died on either is continued on a live model@account
   (the chat is moved first by the same rule, also when OpenClaw chose its account), unless the user already wrote
-  again or a person stopped the run (a Control UI stop or `chat.abort`). One log test decides a limit death: the limit
-  was the run's last word in the Gateway log; the session's status word is not read. A turn that merely timed out is
+  again or a person stopped the run (a Control UI stop or `chat.abort`). Recovery checks that the run did not go on
+  or complete after the failure. A cooldown before the first model request can also be identified by the session's
+  persisted terminal error and run ID. A turn that merely timed out is
   not continued. Human main/dashboard sessions are included even without an external delivery route. The script sends
   nothing to a chat itself: the continuation prompt asks the agent to open its reply with one line, in the chat's own
   language, saying the chat moved to another model, and to reconcile completed actions and uncertain side effects
@@ -143,6 +149,7 @@ limits). After those come the entries of
 | Continuing a chat | documented CLI: `openclaw agent --session-key ...` (`--deliver` only for external chats) |
 | Whether a failed continuation was only stopped | the unit's own output (`journalctl --user -u <unit> -t openclaw`): a last line `aborted` is a stop, not a failure |
 | Account status | Gateway RPC `models.probe` |
+| Provider account cooldowns and expiry | documented CLI: `openclaw models status --json --agent <id>`, `auth.unusableProfiles` |
 | Whether a held model@account answers again | documented CLI: `openclaw infer model run --local --model provider/model@account --prompt ... --json` |
 | Session state; moving and aborting a chat run | Gateway RPC `sessions.describe`, `sessions.patch`, `sessions.abort` |
 | Model, fallbacks, account order and declared accounts (the targets) | config file (`~/.openclaw/openclaw.json`) |
@@ -227,8 +234,8 @@ Requirements and limits:
   whatever the probe reports about it and however it is billed. Without one (no key, or an empty list) the targets are
   every subscription account of the provider: its `oauth` and `token` profiles in `auth.profiles` (config order) and
   in the agent's saved auth store (`openclaw models status --json`, field `auth.oauth.profiles`), each once, `oauth`
-  first. `models status` is run at most once per pass and only when such a provider is needed; only the profile id,
-  provider and type are read, never the labels (they show masked keys and emails). If it fails, the config profiles
+  first. One `models status` read per pass serves both saved-profile discovery and cooldown lookup for ambiguous
+  or auth-related probe results. Selection uses profile IDs, provider, type and availability. If the read fails, the config profiles
   are the targets and the failure is reported as a problem. A provider whose saved types disagree with the store's
   per-type counts (a plugin credential can override the reported type) or a row whose id names another provider is
   left out the same way. OpenClaw breaks ties by last use; without a preference this script prefers no account, so that order stands. An
